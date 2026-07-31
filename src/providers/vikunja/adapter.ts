@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { Artifact, FailureKind, RepositoryRef, Task, TaskBlocker, TaskComment, TaskId } from "../../domain/model.ts";
 import type {
   ActiveExecution,
@@ -14,7 +15,7 @@ import type {
   TaskRefreshResult,
 } from "../provider.ts";
 import { ProviderClaimConflict } from "../provider.ts";
-import { VikunjaApiError, VikunjaClient } from "./client.ts";
+import { VikunjaApiError, VikunjaClient, VikunjaPaginationLimitError } from "./client.ts";
 import type { VikunjaClientOptions } from "./client.ts";
 
 const STATE_PREFIX = "<!-- ensemble-provider-state:v1\n";
@@ -41,6 +42,9 @@ export interface VikunjaProviderOptions extends VikunjaClientOptions {
   readonly statusLabels?: Partial<VikunjaStatusLabels>;
   readonly executionId?: () => string;
   readonly now?: () => Date;
+  readonly inventoryMaxProjects?: number;
+  readonly inventoryMaxTasks?: number;
+  readonly inventoryConcurrency?: number;
 }
 
 interface VikunjaUser {
@@ -98,6 +102,7 @@ interface ProviderEvent {
   readonly createdAt: string;
   readonly record?: ExecutionRecord;
   readonly artifacts?: readonly Artifact[];
+  readonly comments?: readonly string[];
 }
 
 interface ParsedEvent {
@@ -126,6 +131,9 @@ export class VikunjaProvider implements ProviderAdapter {
   readonly statusLabels: VikunjaStatusLabels;
   readonly #executionId: () => string;
   readonly #now: () => Date;
+  readonly #inventoryMaxProjects: number;
+  readonly #inventoryMaxTasks: number;
+  readonly #inventoryConcurrency: number;
   #labelIds?: ReadonlyMap<string, number>;
 
   constructor(options: VikunjaProviderOptions) {
@@ -139,12 +147,16 @@ export class VikunjaProvider implements ProviderAdapter {
     assertDistinctStatuses(this.statusLabels);
     this.#executionId = options.executionId ?? randomUUID;
     this.#now = options.now ?? (() => new Date());
+    this.#inventoryMaxProjects = positiveInteger(options.inventoryMaxProjects ?? 100, "inventoryMaxProjects");
+    this.#inventoryMaxTasks = positiveInteger(options.inventoryMaxTasks ?? 2_000, "inventoryMaxTasks");
+    this.#inventoryConcurrency = positiveInteger(options.inventoryConcurrency ?? 4, "inventoryConcurrency");
   }
 
   async validateConfiguration(): Promise<void> {
     const project = await this.client.request<VikunjaProject>("GET", `projects/${this.projectId}`);
     if (requiredNumber(project.id, "project id") !== this.projectId) throw new Error("Vikunja returned a different project");
-    if (project.is_archived) throw new Error(`Vikunja project is archived: ${requiredString(project.title, "project title")}`);
+    requiredString(project.title, "project title");
+    if (typeof project.is_archived !== "boolean") throw new Error("Invalid Vikunja project archive state");
     const views = await this.client.request<unknown>("GET", `projects/${this.projectId}/views`);
     if (!Array.isArray(views)) throw new Error("Vikunja project views response is not an array");
     const selected = views.map(validateView).find((view) => view.id === this.viewId);
@@ -155,33 +167,74 @@ export class VikunjaProvider implements ProviderAdapter {
 
   async discoverTasks(query: TaskQuery): Promise<readonly Task[]> {
     if (query.scope !== "workflow_candidates") throw new Error(`Unsupported task query scope: ${String(query.scope)}`);
-    const raw = await this.client.paginate<VikunjaTask>(`projects/${this.projectId}/views/${this.viewId}/tasks`, {
-      sort_by: "priority", order_by: "desc", expand: "buckets",
-    });
-    return raw.map((task) => this.#normalizeTask(task)).filter((task) =>
-      task.status === "running" || (task.dispatchable === true && (task.status === "ready" || task.status === "failed")));
+    const projectPageLimit = Math.ceil(this.#inventoryMaxProjects / this.client.perPage);
+    const projects = [...await this.client.paginate<VikunjaProject>("projects", { is_archived: true }, {
+      maxPages: projectPageLimit, maxItems: this.#inventoryMaxProjects,
+    })].map(validateProject).sort((left, right) => left.id - right.id);
+    const configuredProject = projects.find((project) => project.id === this.projectId);
+    if (!configuredProject) throw new Error(`Vikunja configured project is not visible: ${this.projectId}`);
+    const activeProjects = projects.filter((project) => !project.is_archived);
+
+    const inventory: VikunjaTask[] = [];
+    for (const project of activeProjects) {
+      const remaining = this.#inventoryMaxTasks - inventory.length;
+      if (remaining <= 0) throw new VikunjaPaginationLimitError("project task inventory", "items");
+      const tasks = await this.client.paginate<VikunjaTask>(`projects/${project.id}/tasks`, { expand: "buckets" }, {
+        maxPages: Math.ceil(remaining / this.client.perPage), maxItems: remaining,
+      });
+      inventory.push(...tasks);
+    }
+
+    const ordinary = configuredProject.is_archived ? [] : await this.client.paginate<VikunjaTask>(
+      `projects/${this.projectId}/views/${this.viewId}/tasks`,
+      { sort_by: "priority", order_by: "desc", expand: "buckets" },
+      { maxPages: Math.ceil(this.#inventoryMaxTasks / this.client.perPage), maxItems: this.#inventoryMaxTasks },
+    );
+    const projectById = new Map(projects.map((project) => [project.id, project]));
+    const candidates = new Map<string, Task>();
+    for (const raw of ordinary) {
+      const normalized = this.#normalizeTask(raw, Boolean(projectById.get(requiredNumber(raw.project_id, "task project id"))?.is_archived));
+      if (normalized.dispatchable && (normalized.status === "ready" || normalized.status === "failed")) candidates.set(normalized.id, normalized);
+    }
+    const active = await mapBounded(
+      inventory.filter((task) => !task.done).sort((left, right) => requiredNumber(left.id, "task id") - requiredNumber(right.id, "task id")),
+      this.#inventoryConcurrency,
+      async (raw) => ({ raw, state: await this.getExecutionState(String(requiredNumber(raw.id, "task id"))) }),
+    );
+    for (const { raw, state } of active) {
+      if (!state.active) continue;
+      const project = projectById.get(requiredNumber(raw.project_id, "task project id"));
+      const normalized = this.#normalizeTask(raw, project?.is_archived ?? true, true);
+      candidates.set(normalized.id, normalized);
+    }
+    return Object.freeze([...candidates.values()].sort(compareTasks));
   }
 
   async refreshTasks(ids: readonly TaskId[]): Promise<ReadonlyMap<TaskId, TaskRefreshResult>> {
     const results = new Map<TaskId, TaskRefreshResult>();
-    await Promise.all(ids.map(async (id) => {
+    await mapBounded([...ids].sort(), this.#inventoryConcurrency, async (id) => {
       try {
-        results.set(id, { kind: "current", task: await this.getTask(id) });
+        const raw = await this.client.request<VikunjaTask>("GET", `tasks/${taskNumber(id)}?expand=buckets`);
+        const projectId = requiredNumber(raw.project_id, "task project id");
+        const project = validateProject(await this.client.request<VikunjaProject>("GET", `projects/${projectId}`));
+        results.set(id, project.is_archived ? { kind: "missing" } : { kind: "current", task: this.#normalizeTask(raw, false) });
       } catch (error) {
         if (error instanceof VikunjaApiError && error.status === 404) results.set(id, { kind: "missing" });
         else results.set(id, { kind: "unreadable", error: errorMessage(error) });
       }
-    }));
+    });
     return new Map([...results].sort(([left], [right]) => left.localeCompare(right)));
   }
 
   async getTask(id: TaskId): Promise<Task> {
-    return this.#normalizeTask(await this.client.request<VikunjaTask>("GET", `tasks/${taskNumber(id)}?expand=buckets`));
+    const raw = await this.client.request<VikunjaTask>("GET", `tasks/${taskNumber(id)}?expand=buckets`);
+    const project = validateProject(await this.client.request<VikunjaProject>("GET", `projects/${requiredNumber(raw.project_id, "task project id")}`));
+    return this.#normalizeTask(raw, project.is_archived);
   }
 
   async getComments(id: TaskId): Promise<readonly TaskComment[]> {
     const comments = await this.#comments(id);
-    return comments.flatMap((comment): TaskComment[] => {
+    const ordinary = comments.flatMap((comment): TaskComment[] => {
       const body = requiredString(comment.comment, "comment");
       if (body.startsWith(STATE_PREFIX)) return [];
       return [{
@@ -191,11 +244,22 @@ export class VikunjaProvider implements ProviderAdapter {
         createdAt: requiredDate(comment.created, "comment created"),
       }];
     });
+    const folded = foldEvents(parseEvents(comments));
+    const terminal = [...folded.terminals.values()].flatMap((event): TaskComment[] =>
+      (event.comments ?? []).map((body, index) => Object.freeze({
+        id: `${event.executionId}:comment:${index}`, body,
+        createdAt: requiredDate(event.record?.finishedAt, "terminal comment created"),
+      })));
+    return Object.freeze([...ordinary, ...terminal].sort(compareComments));
   }
 
   async getArtifacts(id: TaskId): Promise<readonly Artifact[]> {
     const events = parseEvents(await this.#comments(id));
-    const artifacts = events.flatMap(({ event }) => event.artifacts ?? []);
+    const folded = foldEvents(events);
+    const artifacts = [
+      ...events.filter(({ event }) => event.kind === "artifact").flatMap(({ event }) => event.artifacts ?? []),
+      ...[...folded.terminals.values()].flatMap((event) => event.artifacts ?? []),
+    ];
     return Object.freeze(artifacts.map((artifact) => Object.freeze({ ...artifact })));
   }
 
@@ -304,29 +368,28 @@ export class VikunjaProvider implements ProviderAdapter {
 
   async #finish(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, kind: "complete" | "fail" | "cancel" | "block", completion: ExecutionCompletion): Promise<void> {
     const before = parseEvents(await this.#comments(id));
-    const existing = before.find(({ event }) => event.executionId === executionId && isTerminal(event.kind));
+    const foldedBefore = foldEvents(before);
+    const existing = foldedBefore.terminals.get(executionId);
     if (!existing) {
-      const state = stateFromEvents(before);
+      const state = foldedBefore.state;
       if (!state.active || state.active.id !== executionId) throw new Error(`Execution is not active: ${executionId}`);
       assertLeaseGuard(id, state.active, lease);
       await this.#appendEvent(id, {
         protocol: "ensemble-provider-state/v1", kind, executionId, role: completion.record.role,
         createdAt: completion.record.finishedAt, record: completion.record, artifacts: completion.artifacts,
+        comments: completion.comments,
         ownerId: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt, observedAt: lease.observedAt,
       });
-      const durable = stateFromEvents(parseEvents(await this.#comments(id)));
-      const recorded = durable.history.find((record) => record.id === executionId);
-      if (!recorded || !sameRecord(recorded, completion.record)) {
-        if (durable.active) throw new ProviderClaimConflict(id, durable.active);
+      const durable = foldEvents(parseEvents(await this.#comments(id)));
+      const recorded = durable.terminals.get(executionId);
+      if (!recorded || !sameTerminalPayload(recorded, completion)) {
+        if (durable.state.active) throw new ProviderClaimConflict(id, durable.state.active);
         throw new Error(`Vikunja terminal event ${executionId} was not durable`);
       }
-    } else if (!existing.event.record || !sameRecord(validateRecord(existing.event.record), completion.record)) {
+    } else if (!existing.record || !sameRecord(validateRecord(existing.record), completion.record)
+      || (existing.comments !== undefined && !sameStrings(existing.comments, completion.comments))
+      || (existing.artifacts !== undefined && !sameArtifacts(existing.artifacts, completion.artifacts))) {
       throw new Error(`Conflicting execution record: ${executionId}`);
-    }
-    const comments = await this.#comments(id);
-    for (const [index, body] of completion.comments.entries()) {
-      const marker = `${SIDE_EFFECT_PREFIX}${executionId}:${index} -->`;
-      if (!comments.some((comment) => comment.comment?.includes(marker))) await this.#createRawComment(id, `${marker}\n${body}`);
     }
     await this.updateStatus(id, completion.status);
   }
@@ -359,16 +422,18 @@ export class VikunjaProvider implements ProviderAdapter {
     return resolved;
   }
 
-  #normalizeTask(raw: VikunjaTask): Task {
+  #normalizeTask(raw: VikunjaTask, projectArchived = false, active = false): Task {
     const id = String(requiredNumber(raw.id, "task id"));
-    if (raw.project_id !== undefined && raw.project_id !== this.projectId) throw new Error(`Task ${id} belongs to unexpected project ${raw.project_id}`);
+    const projectId = requiredNumber(raw.project_id, "task project id");
     const labels = (raw.labels ?? []).map((label) => requiredString(label.title, "label title"));
     const assignees = (raw.assignees ?? []).map((user) => requiredString(user.username, "assignee username"));
     const blockers = normalizeBlockers(raw.related_tasks?.blocked ?? []);
-    const status = portableStatus(Boolean(raw.done), labels, this.statusLabels);
+    const providerStatus = portableStatus(Boolean(raw.done), labels, this.statusLabels);
+    const status = active && providerStatus === "unmanaged" ? "running" : providerStatus;
     const hasAssignee = this.requiredAssignee === undefined || assignees.includes(this.requiredAssignee);
     const hasLabels = this.requiredLabels.every((label) => labels.includes(label));
-    const dispatchable = !raw.done && hasAssignee && hasLabels && blockers.every((blocker) => blocker.resolved);
+    const dispatchable = !raw.done && !projectArchived && projectId === this.projectId
+      && hasAssignee && hasLabels && blockers.every((blocker) => blocker.resolved);
     return Object.freeze({
       id,
       title: requiredString(raw.title, "task title"),
@@ -381,13 +446,23 @@ export class VikunjaProvider implements ProviderAdapter {
       priority: raw.priority === undefined ? undefined : -raw.priority,
       blockers: Object.freeze(blockers),
       repository: this.repository,
-      metadata: Object.freeze({ provider: "vikunja", identifier: raw.identifier ?? id, projectId: this.projectId }),
+      metadata: Object.freeze({ provider: "vikunja", identifier: raw.identifier ?? id, projectId }),
     });
   }
 }
 
+interface FoldedEvents {
+  readonly state: ProviderExecutionState;
+  readonly terminals: ReadonlyMap<string, ProviderEvent>;
+}
+
 function stateFromEvents(events: readonly ParsedEvent[]): ProviderExecutionState {
+  return foldEvents(events).state;
+}
+
+function foldEvents(events: readonly ParsedEvent[]): FoldedEvents {
   const terminalByExecution = new Map<string, ExecutionRecord>();
+  const terminalEvents = new Map<string, ProviderEvent>();
   let active: ActiveExecution | undefined;
   for (const parsed of events) {
     const { event } = parsed;
@@ -426,7 +501,10 @@ function stateFromEvents(events: readonly ParsedEvent[]): ProviderExecutionState
     if (!event.record) continue;
     const record = validateRecord(event.record);
     if (!active || active.id !== event.executionId) {
-      if (!event.ownerId && !terminalByExecution.has(event.executionId)) terminalByExecution.set(event.executionId, record);
+      if (!event.ownerId && !terminalByExecution.has(event.executionId)) {
+        terminalByExecution.set(event.executionId, record);
+        terminalEvents.set(event.executionId, event);
+      }
       continue;
     }
     if (active.ownerId) {
@@ -434,15 +512,19 @@ function stateFromEvents(events: readonly ParsedEvent[]): ProviderExecutionState
         || active.ownerId !== event.ownerId || active.leaseExpiresAt !== event.leaseExpiresAt
         || Date.parse(event.leaseExpiresAt) <= Date.parse(event.observedAt)) continue;
     }
-    if (!terminalByExecution.has(event.executionId)) terminalByExecution.set(event.executionId, record);
+    if (!terminalByExecution.has(event.executionId)) {
+      terminalByExecution.set(event.executionId, record);
+      terminalEvents.set(event.executionId, event);
+    }
     active = undefined;
   }
   const history = [...terminalByExecution.values()].sort(compareRecords);
-  return Object.freeze({
+  const state = Object.freeze({
     active,
     history: Object.freeze(history.map(freezeExecutionRecord)),
     nextRole: history.at(-1)?.nextRole,
   });
+  return Object.freeze({ state, terminals: terminalEvents });
 }
 
 function parseEvents(comments: readonly VikunjaComment[]): readonly ParsedEvent[] {
@@ -479,6 +561,8 @@ function validateEvent(value: unknown): ProviderEvent {
   if (event.artifacts !== undefined && (!Array.isArray(event.artifacts) || event.artifacts.some((artifact) => !artifact || typeof artifact.type !== "string" || typeof artifact.url !== "string"))) {
     throw new Error("Invalid Ensemble event artifacts");
   }
+  if (event.comments !== undefined && (!Array.isArray(event.comments)
+    || event.comments.some((comment) => typeof comment !== "string"))) throw new Error("Invalid Ensemble event comments");
   return event as ProviderEvent;
 }
 
@@ -520,6 +604,15 @@ function validateView(value: unknown): Required<Pick<VikunjaView, "id" | "title"
     id: requiredNumber(view.id, "view id"),
     title: requiredString(view.title, "view title"),
     view_kind: requiredString(view.view_kind, "view kind"),
+  };
+}
+
+function validateProject(value: VikunjaProject): Required<Pick<VikunjaProject, "id" | "title" | "is_archived">> {
+  if (!value || typeof value !== "object" || typeof value.is_archived !== "boolean") throw new Error("Invalid Vikunja project");
+  return {
+    id: positiveInteger(requiredNumber(value.id, "project id"), "project id"),
+    title: requiredString(value.title, "project title"),
+    is_archived: value.is_archived,
   };
 }
 
@@ -609,6 +702,52 @@ function sameRecord(left: ExecutionRecord, right: ExecutionRecord): boolean {
     && left.summary === right.summary && left.nextRole === right.nextRole && left.finishedAt === right.finishedAt
     && JSON.stringify(left.failure) === JSON.stringify(right.failure)
     && JSON.stringify(left.blockingRequest) === JSON.stringify(right.blockingRequest);
+}
+
+function sameTerminalPayload(event: ProviderEvent, completion: ExecutionCompletion): boolean {
+  return event.record !== undefined && sameRecord(validateRecord(event.record), completion.record)
+    && sameStrings(event.comments ?? [], completion.comments)
+    && sameArtifacts(event.artifacts ?? [], completion.artifacts);
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameArtifacts(left: readonly Artifact[], right: readonly Artifact[]): boolean {
+  return isDeepStrictEqual(left, right);
+}
+
+function compareTasks(left: Task, right: Task): number {
+  if (left.priority !== undefined || right.priority !== undefined) {
+    if (left.priority === undefined) return 1;
+    if (right.priority === undefined) return -1;
+    if (left.priority !== right.priority) return left.priority - right.priority;
+  }
+  return left.id.localeCompare(right.id);
+}
+
+function compareComments(left: TaskComment, right: TaskComment): number {
+  return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
+}
+
+async function mapBounded<T, TResult>(
+  values: readonly T[],
+  concurrency: number,
+  work: (value: T) => Promise<TResult>,
+): Promise<readonly TResult[]> {
+  const results = new Array<TResult>(values.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= values.length) return;
+      results[index] = await work(values[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function compareRecords(left: ExecutionRecord, right: ExecutionRecord): number {
