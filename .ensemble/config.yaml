@@ -1,0 +1,11 @@
+runtime:
+  name: codex
+  config:
+    sandbox: workspace-write
+initialRole: planner
+terminalOutcomes: [approved, completed]
+statuses:
+  runnable: [todo, in_progress]
+  running: in_progress
+  completed: done
+  failed: failed

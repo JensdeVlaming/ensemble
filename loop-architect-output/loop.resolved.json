@@ -1,0 +1,432 @@
+{
+  "$schema": "https://github.com/ksimback/looper/schema/loop.resolved.v1.json",
+  "compiled_at": "2026-07-31T08:35:37+00:00",
+  "council": [
+    {
+      "cli": "codex",
+      "id": "architecture-reviewer",
+      "invoke": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--sandbox",
+        "read-only",
+        "--add-dir",
+        ".."
+      ],
+      "local": false,
+      "model": "default",
+      "role": "reviewer",
+      "scope": [
+        "plan",
+        "delivery"
+      ],
+      "timeout_sec": 900
+    },
+    {
+      "cli": "codex",
+      "id": "spec-judge",
+      "invoke": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--sandbox",
+        "read-only",
+        "--add-dir",
+        ".."
+      ],
+      "local": false,
+      "model": "default",
+      "role": "judge",
+      "scope": [
+        "plan",
+        "delivery"
+      ],
+      "timeout_sec": 900
+    }
+  ],
+  "council_by_id": {
+    "architecture-reviewer": {
+      "cli": "codex",
+      "id": "architecture-reviewer",
+      "invoke": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--sandbox",
+        "read-only",
+        "--add-dir",
+        ".."
+      ],
+      "local": false,
+      "model": "default",
+      "role": "reviewer",
+      "scope": [
+        "plan",
+        "delivery"
+      ],
+      "timeout_sec": 900
+    },
+    "spec-judge": {
+      "cli": "codex",
+      "id": "spec-judge",
+      "invoke": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--sandbox",
+        "read-only",
+        "--add-dir",
+        ".."
+      ],
+      "local": false,
+      "model": "default",
+      "role": "judge",
+      "scope": [
+        "plan",
+        "delivery"
+      ],
+      "timeout_sec": 900
+    }
+  },
+  "criteria_by_id": {
+    "delivery-change-traceability": {
+      "id": "delivery-change-traceability",
+      "rubric": "At least one material implementation or test improvement must exist relative to loop-workspace/context.md. Every changed behavior must trace to an assessment finding and approved plan item. Reject unrelated rewrites, excluded features, duplicated provider state, runtime leakage, or changes made only to satisfy superficial checks.\n",
+      "type": "judge"
+    },
+    "delivery-spec-compliance": {
+      "id": "delivery-spec-compliance",
+      "rubric": "Inspect SPEC.md, loop-workspace/context.md as the pre-change baseline, the current ../src and ../tests trees, the approved plan, and loop-workspace/compliance-report.md. The implementation must satisfy the material specification invariants: deterministic scheduling, provider-owned recoverable workflow state, runtime/provider independence, execution-engine-owned workspace lifecycle, common structured runtime events/results, repository-defined execution, and Codex encapsulation. Every compliance claim must cite observable code or test evidence. Any material mismatch or unsupported claim is blocking.\n",
+      "type": "judge"
+    },
+    "delivery-test-quality": {
+      "id": "delivery-test-quality",
+      "rubric": "Tests must cover each changed architectural behavior and its meaningful failure or restart path where applicable. Passing commands alone are not sufficient if their assertions do not exercise the claimed invariant. Flaky, network-dependent, or implementation-trivial tests are blocking.\n",
+      "type": "judge"
+    },
+    "plan-boundary-safety": {
+      "id": "plan-boundary-safety",
+      "rubric": "The plan must keep provider-specific behavior behind ProviderAdapter, runtime-specific behavior behind Runtime, workspace/repository lifecycle inside the execution boundary, and durable workflow state in the task provider. It must not add production provider adapters, deployment infrastructure, UI, hidden durable orchestrator state, or unrelated features. Any proposed coupling or scope expansion is blocking.\n",
+      "type": "judge"
+    },
+    "plan-spec-traceability": {
+      "id": "plan-spec-traceability",
+      "rubric": "Inspect loop-workspace/architecture-assessment.md and plan.md. Every material requirement in SPEC.md must map to concrete current evidence, a specific implementation change, or an explicit out-of-scope reason consistent with the goal. The plan must identify affected boundaries, tests, failure/recovery behavior, migration risk, and an objective done state. Missing requirements, vague actions, or unsupported compliance claims are blocking issues.\n",
+      "type": "judge"
+    },
+    "required-artifacts": {
+      "check": [
+        "python3",
+        "-c",
+        "from pathlib import Path; paths = [Path('loop-workspace/architecture-assessment.md'), Path('loop-workspace/plan.md'), Path('loop-workspace/compliance-report.md')]; raise SystemExit(0 if all(path.is_file() and path.stat().st_size > 0 for path in paths) else 1)"
+      ],
+      "expect": "exit_zero",
+      "id": "required-artifacts",
+      "timeout_sec": 30,
+      "type": "programmatic"
+    },
+    "strict-typescript": {
+      "check": [
+        "npm",
+        "--prefix",
+        "..",
+        "run",
+        "check"
+      ],
+      "expect": "exit_zero",
+      "id": "strict-typescript",
+      "timeout_sec": 600,
+      "type": "programmatic"
+    },
+    "unit-and-integration-tests": {
+      "check": [
+        "npm",
+        "--prefix",
+        "..",
+        "test"
+      ],
+      "expect": "exit_zero",
+      "id": "unit-and-integration-tests",
+      "timeout_sec": 600,
+      "type": "programmatic"
+    }
+  },
+  "execution": {
+    "isolation": "current_workspace",
+    "mode": "in_session",
+    "side_effects": {
+      "allowed_writes": [
+        "../src/**",
+        "../tests/**",
+        "../README.md",
+        "../package.json",
+        "../package-lock.json",
+        "../tsconfig.json",
+        "../.ensemble/**",
+        "./loop-workspace/**"
+      ],
+      "commits_pushes_prs_deployments": "forbidden_without_explicit_user_approval",
+      "duplicate_action_check": true,
+      "excluded_work": [
+        "production provider adapters",
+        "deployment infrastructure",
+        "UI",
+        "unrelated features"
+      ],
+      "requires_approval": true
+    }
+  },
+  "gates": {
+    "delivery_gate": {
+      "criteria": [
+        "unit-and-integration-tests",
+        "strict-typescript",
+        "required-artifacts",
+        "delivery-spec-compliance",
+        "delivery-change-traceability",
+        "delivery-test-quality"
+      ],
+      "max_revisions": 4,
+      "members": [
+        "architecture-reviewer",
+        "spec-judge"
+      ],
+      "verdict_policy": "revise_until_clean",
+      "verdict_source": "spec-judge",
+      "when": "after_each_delivery"
+    },
+    "plan_gate": {
+      "criteria": [
+        "plan-spec-traceability",
+        "plan-boundary-safety"
+      ],
+      "max_revisions": 3,
+      "members": [
+        "architecture-reviewer",
+        "spec-judge"
+      ],
+      "verdict_policy": "revise_until_clean",
+      "verdict_source": "spec-judge",
+      "when": "after_plan"
+    }
+  },
+  "goal": {
+    "context_sources": [
+      {
+        "file": "../SPEC.md"
+      },
+      {
+        "file": "../AGENTS.md"
+      },
+      {
+        "file": "../README.md"
+      },
+      {
+        "file": "../package.json"
+      },
+      {
+        "file": "../tsconfig.json"
+      },
+      {
+        "cmd": [
+          "rg",
+          "-n",
+          ".",
+          "../src",
+          "../tests"
+        ],
+        "timeout_sec": 60
+      }
+    ],
+    "definition_of_done": "loop-workspace/architecture-assessment.md maps every material SPEC.md requirement to current evidence or a concrete gap; loop-workspace/plan.md contains an architecture-judge-approved implementation plan; the required in-scope refactor and focused tests are implemented in the Ensemble repository; npm test and npm run check pass; and loop-workspace/compliance-report.md provides requirement-by-requirement evidence with no unresolved in-scope blockers or TBDs.\n",
+    "statement": "Review and refactor Ensemble's implementation to conform to ../SPEC.md. Produce an architecture assessment, an approved implementation plan, focused code changes, tests, and a final compliance report. Preserve provider, runtime, repository, and workspace replaceability. Exclude production provider adapters, deployment infrastructure, UI, and features not required by the specification.\n",
+    "verification": [
+      {
+        "check": [
+          "npm",
+          "--prefix",
+          "..",
+          "test"
+        ],
+        "expect": "exit_zero",
+        "id": "unit-and-integration-tests",
+        "timeout_sec": 600,
+        "type": "programmatic"
+      },
+      {
+        "check": [
+          "npm",
+          "--prefix",
+          "..",
+          "run",
+          "check"
+        ],
+        "expect": "exit_zero",
+        "id": "strict-typescript",
+        "timeout_sec": 600,
+        "type": "programmatic"
+      },
+      {
+        "check": [
+          "python3",
+          "-c",
+          "from pathlib import Path; paths = [Path('loop-workspace/architecture-assessment.md'), Path('loop-workspace/plan.md'), Path('loop-workspace/compliance-report.md')]; raise SystemExit(0 if all(path.is_file() and path.stat().st_size > 0 for path in paths) else 1)"
+        ],
+        "expect": "exit_zero",
+        "id": "required-artifacts",
+        "timeout_sec": 30,
+        "type": "programmatic"
+      },
+      {
+        "id": "plan-spec-traceability",
+        "rubric": "Inspect loop-workspace/architecture-assessment.md and plan.md. Every material requirement in SPEC.md must map to concrete current evidence, a specific implementation change, or an explicit out-of-scope reason consistent with the goal. The plan must identify affected boundaries, tests, failure/recovery behavior, migration risk, and an objective done state. Missing requirements, vague actions, or unsupported compliance claims are blocking issues.\n",
+        "type": "judge"
+      },
+      {
+        "id": "plan-boundary-safety",
+        "rubric": "The plan must keep provider-specific behavior behind ProviderAdapter, runtime-specific behavior behind Runtime, workspace/repository lifecycle inside the execution boundary, and durable workflow state in the task provider. It must not add production provider adapters, deployment infrastructure, UI, hidden durable orchestrator state, or unrelated features. Any proposed coupling or scope expansion is blocking.\n",
+        "type": "judge"
+      },
+      {
+        "id": "delivery-spec-compliance",
+        "rubric": "Inspect SPEC.md, loop-workspace/context.md as the pre-change baseline, the current ../src and ../tests trees, the approved plan, and loop-workspace/compliance-report.md. The implementation must satisfy the material specification invariants: deterministic scheduling, provider-owned recoverable workflow state, runtime/provider independence, execution-engine-owned workspace lifecycle, common structured runtime events/results, repository-defined execution, and Codex encapsulation. Every compliance claim must cite observable code or test evidence. Any material mismatch or unsupported claim is blocking.\n",
+        "type": "judge"
+      },
+      {
+        "id": "delivery-change-traceability",
+        "rubric": "At least one material implementation or test improvement must exist relative to loop-workspace/context.md. Every changed behavior must trace to an assessment finding and approved plan item. Reject unrelated rewrites, excluded features, duplicated provider state, runtime leakage, or changes made only to satisfy superficial checks.\n",
+        "type": "judge"
+      },
+      {
+        "id": "delivery-test-quality",
+        "rubric": "Tests must cover each changed architectural behavior and its meaningful failure or restart path where applicable. Passing commands alone are not sufficient if their assertions do not exercise the claimed invariant. Flaky, network-dependent, or implementation-trivial tests are blocking.\n",
+        "type": "judge"
+      }
+    ]
+  },
+  "host": {
+    "cli": "codex",
+    "invoke": [
+      "codex",
+      "exec",
+      "--skip-git-repo-check",
+      "--ignore-user-config",
+      "--sandbox",
+      "workspace-write",
+      "--add-dir",
+      ".."
+    ],
+    "model": "default",
+    "timeout_sec": 1200
+  },
+  "loop_control": {
+    "budget": {
+      "tokens": 800000,
+      "wall_clock_min": 90
+    },
+    "human_checkpoints": [
+      "repeated no-progress or the same blocker twice",
+      "any proposed scope expansion beyond SPEC.md",
+      "any external side effect such as commit, push, PR, deployment, or message",
+      "any need to read or transmit a redacted path"
+    ],
+    "max_iterations": 8,
+    "no_progress": {
+      "action": "human_checkpoint",
+      "max_stalled_iterations": 2,
+      "signals": [
+        "the same blocking issue repeats without new evidence",
+        "source and test behavior have no material change",
+        "verifier output and compliance evidence are unchanged"
+      ]
+    },
+    "stop_conditions": [
+      "plan and delivery gates both pass clean",
+      "max_iterations or a gate revision cap is reached",
+      "no-progress threshold is reached pending human direction",
+      "wall-clock or advisory token budget is reached",
+      "the user requests a stop"
+    ]
+  },
+  "meta": {
+    "created": "2026-07-31",
+    "description": "Review and refactor Ensemble against SPEC.md with separate architecture review and structured specification-judge gates.\n",
+    "name": "ensemble-spec-architecture-refactor"
+  },
+  "observability": {
+    "checkpoint_granularity": "gate",
+    "run_log": "run-log.md",
+    "state_file": "state.json"
+  },
+  "privacy": {
+    "egress": [
+      {
+        "consent": "required",
+        "redact": [
+          ".env",
+          ".env.*",
+          ".npmrc",
+          ".codex/**",
+          ".git/**",
+          "node_modules/**",
+          "secrets/**",
+          "**/*.key",
+          "**/*.pem",
+          "**/*.p12"
+        ],
+        "sends": [
+          "architecture assessment",
+          "implementation plan",
+          "source and tests on demand",
+          "delivery artifacts",
+          "compliance report"
+        ],
+        "to": "architecture-reviewer"
+      },
+      {
+        "consent": "required",
+        "redact": [
+          ".env",
+          ".env.*",
+          ".npmrc",
+          ".codex/**",
+          ".git/**",
+          "node_modules/**",
+          "secrets/**",
+          "**/*.key",
+          "**/*.pem",
+          "**/*.p12"
+        ],
+        "sends": [
+          "architecture assessment",
+          "implementation plan",
+          "source and tests on demand",
+          "delivery artifacts",
+          "compliance report",
+          "verification results"
+        ],
+        "to": "spec-judge"
+      }
+    ]
+  },
+  "source": "/Users/jensdevlaming/Documents/Personal/ensemble/loop-architect-output/loop.yaml",
+  "version": 1,
+  "workspace": {
+    "dir": "./loop-workspace",
+    "layout": [
+      "context.md",
+      "architecture-assessment.md",
+      "plan.md",
+      "delivery-{n}.md",
+      "compliance-report.md",
+      "review-{n}.md",
+      "state.json",
+      "run-log.md"
+    ]
+  }
+}

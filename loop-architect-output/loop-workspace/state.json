@@ -1,0 +1,30 @@
+{
+  "status": "complete",
+  "iteration": 3,
+  "lastGate": {
+    "name": "delivery",
+    "verdict": "pass",
+    "reviewer": "clean",
+    "judgeConfidence": 0.98
+  },
+  "startedAt": "2026-07-31T08:37:12Z",
+  "updatedAt": "2026-07-31T09:20:00Z",
+  "deliveryRevision": 1,
+  "consent": {
+    "architecture-reviewer": {
+      "granted": true,
+      "basis": "User explicitly requested execution after the disclosed flow preview."
+    },
+    "spec-judge": {
+      "granted": true,
+      "basis": "User explicitly requested execution after the disclosed flow preview."
+    }
+  },
+  "planRevision": 2,
+  "blockers": [],
+  "budgets": {
+    "maxIterations": 8,
+    "wallClockMinutes": 90,
+    "advisoryTokens": 800000
+  }
+}

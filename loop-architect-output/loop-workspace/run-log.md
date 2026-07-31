@@ -1,0 +1,31 @@
+# Run log
+
+- 2026-07-31T08:37:12Z `run_start` In-session execution selected; current-workspace isolation and configured write boundaries apply.
+- 2026-07-31T08:37:12Z `consent` First-send consent recorded for `architecture-reviewer` and `spec-judge` from the user's explicit run request after disclosure.
+- 2026-07-31T08:37:12Z `context` Read `SPEC.md`, `AGENTS.md`, `README.md`, package configuration, all source modules, and all tests.
+- 2026-07-31T08:37:12Z `programmatic_check` Baseline `npm test` passed: 13 tests, 0 failures.
+- 2026-07-31T08:37:12Z `programmatic_check` Baseline `npm run check` passed strict TypeScript compilation.
+- 2026-07-31T08:37:12Z `plan_draft` Architecture assessment and implementation plan drafted; plan gate pending.
+- 2026-07-31T08:40:50Z `reviewer_notes` `architecture-reviewer` returned four blocking plan issues; preserved in `review-plan-1.md`.
+- 2026-07-31T08:42:30Z `judge_verdict` `spec-judge` returned `revise` at confidence 0.96 with the same four blockers; preserved in `judge-plan-1.md`.
+- 2026-07-31T08:43:30Z `plan_revision` Revision 1 defines per-role failure caps, unconditional active recovery, semantic provider candidate discovery, and callback-scoped engine ownership.
+- 2026-07-31T08:44:20Z `judge_verdict` Plan revision 1 passed `spec-judge` at confidence 0.97; preserved in `judge-plan-2.md`.
+- 2026-07-31T08:44:36Z `reviewer_notes` `architecture-reviewer` found one remaining zero-cap/initial-attempt ambiguity; preserved in `review-plan-2.md`.
+- 2026-07-31T08:45:10Z `plan_revision` Revision 2 separates initial eligibility from failed-work retry caps and incorporates deterministic ordering and recovery clarifications.
+- 2026-07-31T08:46:10Z `reviewer_notes` Plan revision 2 returned no architecture-reviewer blockers; preserved in `review-plan-3.md`.
+- 2026-07-31T08:46:20Z `judge_verdict` Plan revision 2 passed `spec-judge` at confidence 0.97; preserved in `judge-plan-3.md`.
+- 2026-07-31T08:46:30Z `plan_gate` Plan approved; implementation started.
+- 2026-07-31T08:47:00Z `official_evidence` Current Codex manual verified `codex exec --json`, `--output-schema`, session IDs, and `codex exec resume <SESSION_ID>`.
+- 2026-07-31T09:00:00Z `implementation` Iteration 1 implemented typed provider state, callback-scoped engine ownership, deterministic per-role retry, semantic candidate discovery, and concrete Codex CLI transport.
+- 2026-07-31T09:01:00Z `tests` Added focused architecture and fake-process transport coverage; suite now has 26 passing tests.
+- 2026-07-31T09:02:00Z `delivery_artifact` README and requirement-by-requirement compliance report completed; delivery gate pending.
+- 2026-07-31T09:04:00Z `user_feedback` Delivery gate paused for iteration 2: reorganize the flat source tree around replaceable domain, provider, orchestration, execution, and runtime boundaries while preserving the public API.
+- 2026-07-31T09:07:00Z `implementation` Source tree split into domain, provider contract/per-adapter, orchestration, execution, and common/per-runtime directories; `src/index.ts` preserves public imports.
+- 2026-07-31T09:07:30Z `programmatic_check` Post-layout `npm test` passed 26/26 and `npm run check` passed.
+- 2026-07-31T09:11:30Z `delivery_gate` Iteration 2 reviewer and judge requested revision; notes preserved in `review-delivery-1.md` and `judge-delivery-1.md`.
+- 2026-07-31T09:12:00Z `delivery_revision` Iteration 3 started for failure precedence, runtime state/configuration, candidate filtering, and missing assertion coverage.
+- 2026-07-31T09:15:00Z `implementation` Added bounded cancellation drain, WeakMap Codex sessions, validated repository model argv, and direct reference-adapter candidate filtering.
+- 2026-07-31T09:15:30Z `tests` Added reconstructed-Scheduler retry, in-callback second-use, provider-state ordering/copy/field validation, and cancellation-time error precedence assertions.
+- 2026-07-31T09:16:00Z `programmatic_check` Iteration 3 `npm test` passed 26/26 and `npm run check` passed; delivery gate pending.
+- 2026-07-31T09:19:00Z `delivery_gate` Architecture reviewer returned no blockers; spec judge passed all delivery rubrics at confidence 0.98. Preserved in `review-delivery-2.md` and `judge-delivery-2.md`.
+- 2026-07-31T09:20:00Z `completion_audit` Required artifacts are non-empty, no TBD/TODO/FIXME remains in delivery scope, source layout is boundary-aligned, and no excluded or externally mutating action occurred. Loop complete.
