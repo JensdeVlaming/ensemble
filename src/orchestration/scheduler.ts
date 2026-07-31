@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { ExecutionCancelledError } from "../execution/engine.ts";
 import type { ConfiguredExecution, RunningExecution, TaskExecutionService } from "../execution/engine.ts";
+import { ConfigurationReloadError } from "../execution/repository.ts";
+import type { ConfigurationReloadStatus } from "../execution/repository.ts";
 import { ProviderClaimConflict } from "../providers/provider.ts";
 import type {
   ActiveExecution,
@@ -25,6 +27,19 @@ export interface ScheduleReport {
 
 export interface SchedulerTickReport {
   readonly dispatchedTaskIds: readonly string[];
+}
+
+export interface SchedulerOperationalPolicy {
+  readonly pollIntervalMs: number;
+  readonly drainTimeoutMs: number;
+  readonly cancellationTimeoutMs: number;
+}
+
+export interface SchedulerConfigurationReloadReport {
+  readonly status: ConfigurationReloadStatus;
+  readonly revision: string;
+  readonly operationalPolicy: SchedulerOperationalPolicy;
+  readonly diagnostic?: string;
 }
 
 export interface SchedulerStartupReport {
@@ -141,6 +156,26 @@ export class Scheduler {
     this.#now = options.now ?? (() => new Date());
     this.#leasePolicy = validateLeasePolicy(options.lease);
     this.#timers = options.timers ?? nodeSchedulerTimers;
+  }
+
+  async reloadConfiguration(): Promise<SchedulerConfigurationReloadReport> {
+    try {
+      const reload = await this.executions.reloadConfiguration();
+      const configuration = reload.configuration;
+      return Object.freeze({
+        status: reload.status,
+        revision: reload.revision,
+        operationalPolicy: Object.freeze({
+          pollIntervalMs: configuration.service.pollIntervalMs,
+          drainTimeoutMs: configuration.shutdown.drainTimeoutMs,
+          cancellationTimeoutMs: configuration.timeouts.cancellationMs,
+        }),
+        ...(reload.diagnostic === undefined ? {} : { diagnostic: reload.diagnostic }),
+      });
+    } catch (error) {
+      if (error instanceof ConfigurationReloadError) throw error;
+      throw new ConfigurationReloadError("Configuration reload failed");
+    }
   }
 
   async startup(): Promise<SchedulerStartupReport> {

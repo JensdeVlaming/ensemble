@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { isScalar, parseAllDocuments, visit } from "yaml";
@@ -6,18 +7,189 @@ import type {
   RepositoryConfiguration,
   RepositoryRef,
   RoleDefinition,
+  Task,
   WorkspaceHook,
   WorkspaceHooks,
 } from "../domain/model.ts";
 
+export interface LoadedRepositoryConfiguration {
+  readonly revision: string;
+  readonly configuration: RepositoryConfiguration;
+}
+
 export interface RepositoryConfigSource {
   load(repository: RepositoryRef, repositoryPath: string): Promise<RepositoryConfiguration>;
+  loadRevision?(repository: RepositoryRef, repositoryPath: string): Promise<LoadedRepositoryConfiguration>;
+}
+
+export interface ConfigurationResolver {
+  resolve(task: Task): Promise<RepositoryConfiguration>;
+}
+
+export type ConfigurationReloadStatus = "installed" | "unchanged" | "retained";
+
+export interface ConfigurationReloadResult {
+  readonly status: ConfigurationReloadStatus;
+  readonly revision: string;
+  readonly configuration: RepositoryConfiguration;
+  readonly diagnostic?: string;
+}
+
+export interface ReloadableConfigurationResolver extends ConfigurationResolver {
+  reload(): Promise<ConfigurationReloadResult>;
+}
+
+export interface RepositoryRevisionReader {
+  read(path: string): Promise<string>;
+  list(path: string): Promise<readonly string[]>;
+}
+
+export interface RepositoryConfigurationManagerOptions {
+  readonly redact?: (message: string) => string;
+  readonly maxDiagnosticLength?: number;
+}
+
+export class ConfigurationReloadError extends Error {
+  readonly diagnostic: string;
+
+  constructor(diagnostic: string) {
+    super(diagnostic);
+    this.name = "ConfigurationReloadError";
+    this.diagnostic = diagnostic;
+  }
+}
+
+export class HostSecretResolver {
+  readonly #environment: Readonly<Record<string, string | undefined>>;
+  readonly #values = new Set<string>();
+
+  constructor(environment: Readonly<Record<string, string | undefined>> = process.env) {
+    this.#environment = environment;
+  }
+
+  resolve(reference: string, path: string): string {
+    const match = /^\$([A-Z_][A-Z0-9_]*)$/u.exec(reference);
+    if (!match) throw new Error(`Expected an environment secret reference at ${path}`);
+    const name = match[1]!;
+    const value = this.#environment[name];
+    if (value === undefined || value.trim().length === 0) {
+      throw new Error(`Missing or empty environment secret ${name} at ${path}`);
+    }
+    this.#values.add(value);
+    return value;
+  }
+
+  redact(message: string): string {
+    let redacted = message;
+    for (const value of [...this.#values].sort((left, right) => right.length - left.length)) {
+      redacted = redacted.replaceAll(value, "[REDACTED]");
+    }
+    return redacted;
+  }
+}
+
+export class RepositoryConfigurationManager implements ReloadableConfigurationResolver {
+  readonly source: RepositoryConfigSource;
+  readonly repository: RepositoryRef;
+  readonly repositoryPath: string;
+  readonly #redact: (message: string) => string;
+  readonly #maxDiagnosticLength: number;
+  #current?: LoadedRepositoryConfiguration;
+  #reloading?: Promise<ConfigurationReloadResult>;
+
+  constructor(
+    source: RepositoryConfigSource,
+    repository: RepositoryRef,
+    repositoryPath: string,
+    options: RepositoryConfigurationManagerOptions = {},
+  ) {
+    if (!repository.id.trim()) throw new Error("Repository ID is required for configuration reload");
+    if (!repositoryPath.trim()) throw new Error("Repository configuration path is required");
+    const maximum = options.maxDiagnosticLength ?? 1_024;
+    if (!Number.isSafeInteger(maximum) || maximum < 32) {
+      throw new Error("Configuration diagnostic length must be a safe integer of at least 32");
+    }
+    this.source = source;
+    this.repository = Object.freeze({ ...repository });
+    this.repositoryPath = repositoryPath;
+    this.#redact = options.redact ?? ((message) => message);
+    this.#maxDiagnosticLength = maximum;
+  }
+
+  reload(): Promise<ConfigurationReloadResult> {
+    if (this.#reloading) return this.#reloading;
+    const reloading = this.#performReload();
+    this.#reloading = reloading;
+    void reloading.finally(() => {
+      if (this.#reloading === reloading) this.#reloading = undefined;
+    }).catch(() => undefined);
+    return reloading;
+  }
+
+  async resolve(task: Task): Promise<RepositoryConfiguration> {
+    if (task.repository.id !== this.repository.id || task.repository.url !== this.repository.url) {
+      throw new Error(`Configuration manager does not own repository ${task.repository.id}`);
+    }
+    if (!this.#current) throw new ConfigurationReloadError("Repository has no valid configuration revision");
+    return this.#current.configuration;
+  }
+
+  async #performReload(): Promise<ConfigurationReloadResult> {
+    try {
+      const loaded = this.source.loadRevision
+        ? await this.source.loadRevision(this.repository, this.repositoryPath)
+        : await loadWithoutRevision(this.source, this.repository, this.repositoryPath);
+      if (typeof loaded.revision !== "string" || loaded.revision.trim().length === 0) {
+        throw new Error("Configuration source returned an invalid revision identifier");
+      }
+      const configuration = deepFreeze(loaded.configuration);
+      if (configuration.repository.id !== this.repository.id || configuration.repository.url !== this.repository.url) {
+        throw new Error("Configuration source returned a different repository");
+      }
+      if (this.#current?.revision === loaded.revision) {
+        return Object.freeze({
+          status: "unchanged" as const,
+          revision: this.#current.revision,
+          configuration: this.#current.configuration,
+        });
+      }
+      this.#current = Object.freeze({ revision: loaded.revision, configuration });
+      return Object.freeze({ status: "installed" as const, revision: loaded.revision, configuration });
+    } catch (error) {
+      const diagnostic = this.#safeDiagnostic(error);
+      if (!this.#current) throw new ConfigurationReloadError(diagnostic);
+      return Object.freeze({
+        status: "retained" as const,
+        revision: this.#current.revision,
+        configuration: this.#current.configuration,
+        diagnostic,
+      });
+    }
+  }
+
+  #safeDiagnostic(error: unknown): string {
+    const raw = error instanceof Error ? error.message : String(error);
+    let redacted: string;
+    try {
+      redacted = this.#redact(raw);
+    } catch {
+      redacted = "Configuration reload failed during diagnostic redaction";
+    }
+    if (redacted.length <= this.#maxDiagnosticLength) return redacted;
+    return `${redacted.slice(0, this.#maxDiagnosticLength - 1)}…`;
+  }
 }
 
 type ConfigObject = Record<string, unknown>;
 
 const MAX_YAML_ALIASES = 100;
+const DEFAULT_SNAPSHOT_READS = 3;
 const unsafeConfigKeys = new Set(["__proto__", "constructor", "prototype", "<<"]);
+
+const nodeRevisionReader: RepositoryRevisionReader = {
+  read: (path) => readFile(path, "utf8"),
+  list: (path) => readdir(path),
+};
 
 const retryableFailureKinds = ["startup", "provider", "runtime", "timeout", "stalled"] as const satisfies readonly FailureKind[];
 const failureKinds = new Set<FailureKind>([
@@ -25,25 +197,93 @@ const failureKinds = new Set<FailureKind>([
 ]);
 
 export class RepositoryConfigLoader implements RepositoryConfigSource {
+  readonly #reader: RepositoryRevisionReader;
+  readonly #snapshotReads: number;
+
+  constructor(reader: RepositoryRevisionReader = nodeRevisionReader, snapshotReads = DEFAULT_SNAPSHOT_READS) {
+    if (!Number.isSafeInteger(snapshotReads) || snapshotReads < 2) {
+      throw new Error("Repository revision capture requires at least two snapshot reads");
+    }
+    this.#reader = reader;
+    this.#snapshotReads = snapshotReads;
+  }
+
   async load(repository: RepositoryRef, repositoryPath: string): Promise<RepositoryConfiguration> {
+    return (await this.loadRevision(repository, repositoryPath)).configuration;
+  }
+
+  async loadRevision(repository: RepositoryRef, repositoryPath: string): Promise<LoadedRepositoryConfiguration> {
+    const snapshot = await this.#stableSnapshot(repositoryPath);
+    const configuration = parseRepositorySnapshot(repository, snapshot);
+    return Object.freeze({ revision: snapshotRevision(snapshot), configuration: deepFreeze(configuration) });
+  }
+
+  async #stableSnapshot(repositoryPath: string): Promise<RepositorySnapshot> {
+    let previous: RepositorySnapshot | undefined;
+    let lastReadError: unknown;
+    for (let read = 0; read < this.#snapshotReads; read += 1) {
+      try {
+        const current = await this.#snapshot(repositoryPath);
+        if (previous && snapshotsEqual(previous, current)) return current;
+        previous = current;
+        lastReadError = undefined;
+      } catch (error) {
+        previous = undefined;
+        lastReadError = error;
+      }
+    }
+    if (lastReadError !== undefined && previous === undefined) {
+      const detail = lastReadError instanceof Error ? lastReadError.message : String(lastReadError);
+      throw new Error(`Unable to capture repository configuration after ${this.#snapshotReads} reads: ${detail}`);
+    }
+    throw new Error(`Repository configuration changed during ${this.#snapshotReads} consecutive snapshot reads`);
+  }
+
+  async #snapshot(repositoryPath: string): Promise<RepositorySnapshot> {
     const ensemblePath = join(repositoryPath, ".ensemble");
-    const [rawConfig, workflow, agents, roleNames] = await Promise.all([
-      readFile(join(ensemblePath, "config.yaml"), "utf8"),
-      readFile(join(ensemblePath, "WORKFLOW.md"), "utf8"),
-      readFile(join(repositoryPath, "AGENTS.md"), "utf8"),
-      readdir(join(ensemblePath, "roles")),
+    const roleNames = [...await this.#reader.list(join(ensemblePath, "roles"))]
+      .filter((name) => name.endsWith(".md"))
+      .sort();
+    const paths = [
+      ".ensemble/config.yaml",
+      ".ensemble/WORKFLOW.md",
+      "AGENTS.md",
+      ...roleNames.map((name) => `.ensemble/roles/${name}`),
+    ];
+    const contents = await Promise.all([
+      this.#reader.read(join(ensemblePath, "config.yaml")),
+      this.#reader.read(join(ensemblePath, "WORKFLOW.md")),
+      this.#reader.read(join(repositoryPath, "AGENTS.md")),
+      ...roleNames.map((name) => this.#reader.read(join(ensemblePath, "roles", name))),
     ]);
-    const config = parseSimpleYaml(rawConfig);
-    const roles = await Promise.all(
-      roleNames
-        .filter((name) => name.endsWith(".md"))
-        .sort()
-        .map(async (file): Promise<RoleDefinition> => ({
-          name: file.slice(0, -3),
-          instructions: await readFile(join(ensemblePath, "roles", file), "utf8"),
-        })),
-    );
+    return Object.freeze({
+      members: Object.freeze(paths.map((path, index) => Object.freeze({ path, content: contents[index]! }))),
+    });
+  }
+}
+
+interface RepositorySnapshotMember {
+  readonly path: string;
+  readonly content: string;
+}
+
+interface RepositorySnapshot {
+  readonly members: readonly RepositorySnapshotMember[];
+}
+
+function parseRepositorySnapshot(repository: RepositoryRef, snapshot: RepositorySnapshot): RepositoryConfiguration {
+    const byPath = new Map(snapshot.members.map((member) => [member.path, member.content]));
+    const rawConfig = requiredMember(byPath, ".ensemble/config.yaml");
+    const workflow = requiredMember(byPath, ".ensemble/WORKFLOW.md");
+    const agents = requiredMember(byPath, "AGENTS.md");
+    const roles = snapshot.members
+      .filter((member) => member.path.startsWith(".ensemble/roles/") && member.path.endsWith(".md"))
+      .map((member): RoleDefinition => ({
+        name: member.path.slice(".ensemble/roles/".length, -3),
+        instructions: member.content,
+      }));
     if (roles.length === 0) throw new Error("At least one .ensemble role is required");
+    const config = parseSimpleYaml(rawConfig);
 
     const runtime = objectAt(config, "runtime");
     const statuses = objectAt(config, "statuses", false);
@@ -106,7 +346,49 @@ export class RepositoryConfigLoader implements RepositoryConfigSource {
         hookTimeoutMs: nonNegativeIntegerAt(workspace, "hookTimeoutMs", 60_000, "workspace.hookTimeoutMs"),
       },
     };
+}
+
+function requiredMember(members: ReadonlyMap<string, string>, path: string): string {
+  const content = members.get(path);
+  if (content === undefined) throw new Error(`Missing repository configuration member: ${path}`);
+  return content;
+}
+
+function snapshotsEqual(left: RepositorySnapshot, right: RepositorySnapshot): boolean {
+  return left.members.length === right.members.length
+    && left.members.every((member, index) => member.path === right.members[index]?.path
+      && member.content === right.members[index]?.content);
+}
+
+function snapshotRevision(snapshot: RepositorySnapshot): string {
+  const hash = createHash("sha256");
+  for (const member of snapshot.members) {
+    hash.update(String(Buffer.byteLength(member.path)));
+    hash.update(":");
+    hash.update(member.path);
+    hash.update(String(Buffer.byteLength(member.content)));
+    hash.update(":");
+    hash.update(member.content);
   }
+  return hash.digest("hex");
+}
+
+async function loadWithoutRevision(
+  source: RepositoryConfigSource,
+  repository: RepositoryRef,
+  repositoryPath: string,
+): Promise<LoadedRepositoryConfiguration> {
+  const configuration = await source.load(repository, repositoryPath);
+  const revision = createHash("sha256").update(JSON.stringify(configuration)).digest("hex");
+  return { revision, configuration };
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
 }
 
 function nonNegativeIntegerAt(value: ConfigObject, key: string, fallback: number, path = key): number {

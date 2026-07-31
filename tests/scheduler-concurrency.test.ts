@@ -103,6 +103,10 @@ class ControlledExecutions implements TaskExecutionService {
     this.configuration = configuration;
   }
 
+  async reloadConfiguration() {
+    return { status: "unchanged" as const, revision: "controlled", configuration: this.configuration };
+  }
+
   async withConfiguration<T>(item: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
     this.configured.push(item.id);
     let used = false;

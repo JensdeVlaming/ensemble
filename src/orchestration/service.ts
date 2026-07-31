@@ -1,4 +1,6 @@
 import type {
+  SchedulerConfigurationReloadReport,
+  SchedulerOperationalPolicy,
   SchedulerShutdownOptions,
   SchedulerShutdownReport,
   SchedulerStartupReport,
@@ -8,6 +10,7 @@ import type {
 export type OrchestratorServiceState = "idle" | "starting" | "running" | "draining" | "stopped";
 
 export interface OrchestratorScheduler {
+  reloadConfiguration(): Promise<SchedulerConfigurationReloadReport>;
   startup(): Promise<SchedulerStartupReport>;
   tick(): Promise<SchedulerTickReport>;
   shutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport>;
@@ -25,6 +28,7 @@ export interface RepositoryTickReport {
   readonly repositoryId: string;
   readonly outcome: "completed" | "failed";
   readonly dispatchedTaskIds: readonly string[];
+  readonly configurationDiagnostic?: string;
   readonly error?: string;
 }
 
@@ -57,6 +61,7 @@ export interface ServiceTimerSource {
 
 interface RegistrationState {
   readonly registration: OrchestratorRegistration;
+  operationalPolicy: SchedulerOperationalPolicy;
   initialized: boolean;
   startup?: Promise<void>;
   tick?: Promise<RepositoryTickReport>;
@@ -98,7 +103,15 @@ export class OrchestratorService {
       validateBound(registration.pollIntervalMs, `${registration.id}.pollIntervalMs`);
       validateBound(registration.drainTimeoutMs, `${registration.id}.drainTimeoutMs`);
       validateBound(registration.cancellationTimeoutMs, `${registration.id}.cancellationTimeoutMs`);
-      return { registration: Object.freeze({ ...registration }), initialized: false };
+      return {
+        registration: Object.freeze({ ...registration }),
+        initialized: false,
+        operationalPolicy: Object.freeze({
+          pollIntervalMs: registration.pollIntervalMs,
+          drainTimeoutMs: registration.drainTimeoutMs,
+          cancellationTimeoutMs: registration.cancellationTimeoutMs,
+        }),
+      };
     }).sort((left, right) => left.registration.id.localeCompare(right.registration.id)));
     this.#signals = signals;
     this.#timers = timers;
@@ -175,7 +188,11 @@ export class OrchestratorService {
     const tick = (async (): Promise<RepositoryTickReport> => {
       try {
         await this.#ensureStartup(state);
-        if (this.#state === "draining" || this.#state === "stopped") {
+        if (isClosedState(this.#state)) {
+          throw new Error(`Cannot dispatch ${state.registration.id} while ${this.#state}`);
+        }
+        const configuration = await this.#reloadConfiguration(state);
+        if (isClosedState(this.#state)) {
           throw new Error(`Cannot dispatch ${state.registration.id} while ${this.#state}`);
         }
         const report = await state.registration.scheduler.tick();
@@ -184,6 +201,9 @@ export class OrchestratorService {
           repositoryId: state.registration.id,
           outcome: "completed" as const,
           dispatchedTaskIds: Object.freeze([...report.dispatchedTaskIds]),
+          ...(configuration.diagnostic === undefined
+            ? {}
+            : { configurationDiagnostic: boundedMessage(configuration.diagnostic) }),
         });
       } catch (error) {
         state.lastError = errorMessage(error);
@@ -205,16 +225,20 @@ export class OrchestratorService {
   #ensureStartup(state: RegistrationState): Promise<void> {
     if (state.initialized) return Promise.resolve();
     if (state.startup) return state.startup;
-    const startup = state.registration.scheduler.startup().then(() => {
-      if (this.#state === "draining" || this.#state === "stopped") {
-        throw new Error(`Startup completed after intake closed for ${state.registration.id}`);
+    const startup = (async () => {
+      try {
+        await this.#reloadConfiguration(state);
+        await state.registration.scheduler.startup();
+        if (this.#state === "draining" || this.#state === "stopped") {
+          throw new Error(`Startup completed after intake closed for ${state.registration.id}`);
+        }
+        state.initialized = true;
+        state.lastError = undefined;
+      } catch (error) {
+        state.lastError = errorMessage(error);
+        throw error;
       }
-      state.initialized = true;
-      state.lastError = undefined;
-    }, (error: unknown) => {
-      state.lastError = errorMessage(error);
-      throw error;
-    });
+    })();
     state.startup = startup;
     void startup.finally(() => {
       if (state.startup === startup) state.startup = undefined;
@@ -224,7 +248,7 @@ export class OrchestratorService {
 
   #schedule(state: RegistrationState): void {
     if (this.#state !== "running" || state.timer !== undefined) return;
-    state.timer = this.#timers.set(state.registration.pollIntervalMs, () => {
+    state.timer = this.#timers.set(state.operationalPolicy.pollIntervalMs, () => {
       state.timer = undefined;
       void this.#tickRegistration(state).finally(() => {
         if (this.#state === "running") this.#schedule(state);
@@ -245,8 +269,8 @@ export class OrchestratorService {
     const reports = await Promise.all(this.#registrations.map(async (state): Promise<RepositoryShutdownReport> => {
       try {
         const scheduler = await state.registration.scheduler.shutdown({
-          drainTimeoutMs: state.registration.drainTimeoutMs,
-          cancellationTimeoutMs: state.registration.cancellationTimeoutMs,
+          drainTimeoutMs: state.operationalPolicy.drainTimeoutMs,
+          cancellationTimeoutMs: state.operationalPolicy.cancellationTimeoutMs,
         });
         return Object.freeze({
           repositoryId: state.registration.id,
@@ -286,6 +310,15 @@ export class OrchestratorService {
     this.#signals.removeListener("SIGINT", this.#signalListener);
     this.#signals.removeListener("SIGTERM", this.#signalListener);
   }
+
+  async #reloadConfiguration(state: RegistrationState): Promise<SchedulerConfigurationReloadReport> {
+    const reload = await state.registration.scheduler.reloadConfiguration();
+    validateBound(reload.operationalPolicy.pollIntervalMs, `${state.registration.id}.pollIntervalMs`);
+    validateBound(reload.operationalPolicy.drainTimeoutMs, `${state.registration.id}.drainTimeoutMs`);
+    validateBound(reload.operationalPolicy.cancellationTimeoutMs, `${state.registration.id}.cancellationTimeoutMs`);
+    state.operationalPolicy = Object.freeze({ ...reload.operationalPolicy });
+    return reload;
+  }
 }
 
 interface Deferred<T> {
@@ -304,5 +337,13 @@ function validateBound(value: number, name: string): void {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return boundedMessage(error instanceof Error ? error.message : String(error));
+}
+
+function boundedMessage(message: string): string {
+  return message.length <= 1_024 ? message : `${message.slice(0, 1_023)}…`;
+}
+
+function isClosedState(state: OrchestratorServiceState): boolean {
+  return state === "draining" || state === "stopped";
 }

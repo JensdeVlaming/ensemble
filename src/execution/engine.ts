@@ -1,7 +1,15 @@
 import type { RepositoryConfiguration, RoleDefinition, RuntimeResult, Task, TaskComment, Artifact, Workspace } from "../domain/model.ts";
-import type { RepositoryConfigSource } from "./repository.ts";
+import { ConfigurationReloadError } from "./repository.ts";
+import type {
+  ConfigurationReloadResult,
+  ConfigurationResolver,
+  ReloadableConfigurationResolver,
+  RepositoryConfigSource,
+} from "./repository.ts";
 import type { Runtime, RuntimeEvent, RuntimeRegistry, RuntimeSession } from "../runtimes/runtime.ts";
 import type { WorkspaceManager } from "./workspace.ts";
+
+export type { ConfigurationResolver } from "./repository.ts";
 
 export interface RuntimeExecutionRequest {
   readonly task: Task;
@@ -65,14 +73,11 @@ export interface ConfiguredExecution {
 }
 
 export interface TaskExecutionService {
+  reloadConfiguration(): Promise<ConfigurationReloadResult>;
   withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T>;
 }
 
 export type EventSink = (event: RuntimeEvent, task: Task) => void | Promise<void>;
-
-export interface ConfigurationResolver {
-  resolve(task: Task): Promise<RepositoryConfiguration>;
-}
 
 export class WorkspaceConfigurationResolver implements ConfigurationResolver {
   readonly source: RepositoryConfigSource;
@@ -112,6 +117,13 @@ export class ExecutionEngine implements TaskExecutionService {
     this.events = events;
     this.failureDrainMs = failureDrainMs;
     this.now = now;
+  }
+
+  reloadConfiguration(): Promise<ConfigurationReloadResult> {
+    if (!isReloadableConfigurationResolver(this.configurations)) {
+      return Promise.reject(new ConfigurationReloadError("Execution configuration source does not support reload"));
+    }
+    return this.configurations.reload();
   }
 
   async withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
@@ -411,12 +423,17 @@ function delay(milliseconds: number): Promise<void> {
 export class EngineExecutionService implements TaskExecutionService {
   readonly engine: ExecutionEngine;
   constructor(engine: ExecutionEngine) { this.engine = engine; }
+  reloadConfiguration(): Promise<ConfigurationReloadResult> { return this.engine.reloadConfiguration(); }
   withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
     return this.engine.withConfiguration(task, work);
   }
   withEnvironment<T>(task: Task, work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T> {
     return this.engine.withEnvironment(task, work);
   }
+}
+
+function isReloadableConfigurationResolver(value: ConfigurationResolver): value is ReloadableConfigurationResolver {
+  return "reload" in value && typeof value.reload === "function";
 }
 
 export function validateRuntimeResult(value: RuntimeResult): RuntimeResult {

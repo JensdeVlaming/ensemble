@@ -54,6 +54,9 @@ class PendingExecutions implements TaskExecutionService {
   starts = 0;
   cancellations: string[] = [];
   readonly config = configuration();
+  async reloadConfiguration() {
+    return { status: "unchanged" as const, revision: "controlled", configuration: this.config };
+  }
   async withConfiguration<T>(_task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
     return work({
       configuration: this.config,
@@ -77,6 +80,9 @@ class PendingExecutions implements TaskExecutionService {
 
 class CompletedExecutions implements TaskExecutionService {
   readonly config = configuration();
+  async reloadConfiguration() {
+    return { status: "unchanged" as const, revision: "controlled", configuration: this.config };
+  }
   async withConfiguration<T>(taskValue: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
     return work({
       configuration: this.config,

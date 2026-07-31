@@ -51,6 +51,21 @@ supported. Duplicate keys, multiple documents, custom or explicit tags, merge
 keys, cyclic/excessive aliases, non-mapping roots, and prototype-sensitive keys
 are rejected before typed configuration validation.
 
+The loader captures `config.yaml`, `WORKFLOW.md`, `AGENTS.md`, and the complete
+sorted role set twice before accepting a revision. `RepositoryConfigurationManager`
+atomically installs only a stable, fully validated revision and retains the
+exact last-known-good object when a later revision is invalid. The long-running
+service reloads through the Scheduler's own execution service before every
+tick, so reload and dispatch cannot be wired to different configuration stores.
+Valid polling and shutdown bound changes apply to subsequent service operations;
+already-running workers retain the immutable revision captured at dispatch.
+
+Repository text is never subject to environment substitution. Host configuration
+may resolve explicitly documented `$NAME` secret references with
+`HostSecretResolver`; missing or empty values fail validation, and every value
+resolved through that instance is removed from reload diagnostics. Secrets must
+remain deployment inputs and must not be written into `.ensemble`.
+
 The stable public API is re-exported from `src/index.ts`. `InMemoryProvider` and
 `ScriptedRuntime` are executable reference adapters suitable for tests and local
 experiments. `GitRepositoryDriver` materializes isolated repository checkouts;

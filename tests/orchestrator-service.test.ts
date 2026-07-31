@@ -5,6 +5,7 @@ import {
 } from "../src/index.ts";
 import type {
   OrchestratorScheduler,
+  SchedulerConfigurationReloadReport,
   SchedulerShutdownOptions,
   SchedulerShutdownReport,
   SchedulerStartupReport,
@@ -34,10 +35,20 @@ class ControlledScheduler implements OrchestratorScheduler {
   readonly events: string[] = [];
   readonly shutdownOptions: SchedulerShutdownOptions[] = [];
   startupCalls = 0;
+  reloadCalls = 0;
   tickCalls = 0;
   startupFailures = 0;
   startupGate?: Deferred<void>;
+  readonly reloadResults: Array<SchedulerConfigurationReloadReport | Error> = [];
   readonly tickGates: Deferred<void>[] = [];
+
+  async reloadConfiguration() {
+    this.reloadCalls += 1;
+    this.events.push("reload");
+    const result = this.reloadResults.shift() ?? reloadReport("unchanged", 10, 20, 30);
+    if (result instanceof Error) throw result;
+    return result;
+  }
 
   async startup(): Promise<SchedulerStartupReport> {
     this.startupCalls += 1;
@@ -90,9 +101,11 @@ class FakeSignals implements ServiceSignalSource {
 
 class FakeTimers implements ServiceTimerSource {
   readonly pending = new Map<object, () => void>();
+  readonly delays: number[] = [];
 
-  set(_delayMs: number, callback: () => void): unknown {
+  set(delayMs: number, callback: () => void): unknown {
     const handle = {};
+    this.delays.push(delayMs);
     this.pending.set(handle, callback);
     return handle;
   }
@@ -110,6 +123,21 @@ class FakeTimers implements ServiceTimerSource {
 
 function registration(id: string, scheduler: OrchestratorScheduler) {
   return { id, scheduler, pollIntervalMs: 10, drainTimeoutMs: 20, cancellationTimeoutMs: 30 };
+}
+
+function reloadReport(
+  status: "installed" | "unchanged" | "retained",
+  pollIntervalMs: number,
+  drainTimeoutMs: number,
+  cancellationTimeoutMs: number,
+  diagnostic?: string,
+): SchedulerConfigurationReloadReport {
+  return {
+    status,
+    revision: `revision-${pollIntervalMs}`,
+    operationalPolicy: { pollIntervalMs, drainTimeoutMs, cancellationTimeoutMs },
+    ...(diagnostic === undefined ? {} : { diagnostic }),
+  };
 }
 
 test("manual ticks startup-gate concurrent repositories, isolate failures, and recover", async () => {
@@ -150,8 +178,8 @@ test("manual ticks startup-gate concurrent repositories, isolate failures, and r
       { repositoryId: "z-repository", outcome: "completed", dispatchedTaskIds: ["task-2"] },
     ],
   });
-  assert.deepEqual(first.events.slice(0, 2), ["startup", "tick"]);
-  assert.deepEqual(second.events.slice(0, 3), ["startup", "startup", "tick"]);
+  assert.deepEqual(first.events.slice(0, 4), ["reload", "startup", "reload", "tick"]);
+  assert.deepEqual(second.events.slice(0, 6), ["reload", "startup", "reload", "startup", "reload", "tick"]);
   await service.shutdown();
   await assert.rejects(service.tick(), /while stopped/u);
 });
@@ -196,6 +224,76 @@ test("failed startup retries on the next host-timed cycle rather than immediatel
   assert.equal(scheduler.startupCalls, 2);
   await service.shutdown();
   await started;
+});
+
+test("first-invalid configuration prevents startup and dispatch until a later valid revision", async () => {
+  const scheduler = new ControlledScheduler();
+  scheduler.reloadResults.push(
+    new Error("first configuration invalid"),
+    reloadReport("installed", 11, 21, 31),
+    reloadReport("unchanged", 11, 21, 31),
+  );
+  const service = new OrchestratorService([registration("repository", scheduler)], new FakeSignals(), new FakeTimers());
+
+  assert.deepEqual(await service.tick(), {
+    repositories: [{
+      repositoryId: "repository",
+      outcome: "failed",
+      dispatchedTaskIds: [],
+      error: "first configuration invalid",
+    }],
+  });
+  assert.equal(scheduler.startupCalls, 0);
+  assert.equal(scheduler.tickCalls, 0);
+
+  assert.deepEqual(await service.tick(), {
+    repositories: [{ repositoryId: "repository", outcome: "completed", dispatchedTaskIds: ["task-1"] }],
+  });
+  assert.equal(scheduler.startupCalls, 1);
+  assert.equal(scheduler.tickCalls, 1);
+  await service.shutdown();
+});
+
+test("retained invalid reloads dispatch with a bounded diagnostic and last-known-good shutdown bounds", async () => {
+  const scheduler = new ControlledScheduler();
+  scheduler.reloadResults.push(
+    reloadReport("installed", 11, 21, 31),
+    reloadReport("retained", 11, 21, 31, "invalid update"),
+  );
+  const service = new OrchestratorService([registration("repository", scheduler)], new FakeSignals(), new FakeTimers());
+
+  assert.deepEqual(await service.tick(), {
+    repositories: [{
+      repositoryId: "repository",
+      outcome: "completed",
+      dispatchedTaskIds: ["task-1"],
+      configurationDiagnostic: "invalid update",
+    }],
+  });
+  await service.shutdown();
+  assert.deepEqual(scheduler.shutdownOptions, [{ drainTimeoutMs: 21, cancellationTimeoutMs: 31 }]);
+});
+
+test("valid reloads change the next completion-based timer and latest shutdown bounds", async () => {
+  const scheduler = new ControlledScheduler();
+  scheduler.reloadResults.push(
+    reloadReport("installed", 11, 21, 31),
+    reloadReport("installed", 12, 22, 32),
+    reloadReport("installed", 13, 23, 33),
+  );
+  const timers = new FakeTimers();
+  const service = new OrchestratorService([registration("repository", scheduler)], new FakeSignals(), timers);
+
+  const started = service.start();
+  await waitFor(() => scheduler.tickCalls === 1 && timers.pending.size === 1);
+  assert.equal(timers.delays.at(-1), 12);
+  timers.fireAll();
+  await waitFor(() => scheduler.tickCalls === 2 && timers.pending.size === 1);
+  assert.equal(timers.delays.at(-1), 13);
+
+  await service.shutdown();
+  await started;
+  assert.deepEqual(scheduler.shutdownOptions, [{ drainTimeoutMs: 23, cancellationTimeoutMs: 33 }]);
 });
 
 test("concurrent starts share signal ownership and a startup-racing signal shuts down once", async () => {
