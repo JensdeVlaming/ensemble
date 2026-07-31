@@ -376,17 +376,17 @@ test("failed failure synchronization retries the exact record before redispatch"
   let failFirst = true;
   let claimCalls = 0;
   const provider = proxyProvider(delegate, {
-    beginExecution: async (id, role, status) => {
+    beginExecution: async (id, role, status, lease) => {
       claimCalls += 1;
-      return delegate.beginExecution(id, role, status);
+      return delegate.beginExecution(id, role, status, lease);
     },
-    failExecution: async (id, executionId, record, status, comment) => {
+    failExecution: async (id, executionId, lease, record, status, comment) => {
       attempted.push(structuredClone(record));
       if (failFirst) {
         failFirst = false;
         throw new Error("failure mutation unavailable");
       }
-      await delegate.failExecution(id, executionId, record, status, comment);
+      await delegate.failExecution(id, executionId, lease, record, status, comment);
     },
   });
   const executions = new ControlledExecutions(configuration({ maxAttempts: 3 }), [
@@ -498,10 +498,10 @@ test("an already-written completion record still repairs remaining provider side
   const delegate = new InMemoryProvider([task("completion-saga")]);
   let completionCalls = 0;
   const provider = proxyProvider(delegate, {
-    completeExecution: async (id, executionId, completion) => {
+    completeExecution: async (id, executionId, lease, completion) => {
       completionCalls += 1;
       if (completionCalls === 1) {
-        await delegate.completeExecution(id, executionId, {
+        await delegate.completeExecution(id, executionId, lease, {
           ...completion,
           comments: [],
           artifacts: [],
@@ -563,7 +563,7 @@ test("a conflicting completion record cannot clear synchronization quarantine", 
   assert.deepEqual(executions.started, ["completion-conflict"]);
 });
 
-test("graceful shutdown reports unresolved provider synchronization", async () => {
+test("graceful shutdown bounds and releases unresolved provider synchronization keepers", async () => {
   const delegate = new InMemoryProvider([task("pending-sync")]);
   const provider = proxyProvider(delegate, {
     completeExecution: async () => { throw new Error("provider remains unavailable"); },
@@ -574,9 +574,9 @@ test("graceful shutdown reports unresolved provider synchronization", async () =
   );
   assert.match((await scheduler.poll())[0]?.error ?? "", /provider remains unavailable/u);
   assert.deepEqual(await scheduler.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 1 }), {
-    drained: false,
+    drained: true,
     cancelledTaskIds: [],
-    remainingTaskIds: ["pending-sync"],
+    remainingTaskIds: [],
   });
 });
 

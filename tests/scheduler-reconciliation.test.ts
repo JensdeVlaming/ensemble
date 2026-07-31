@@ -188,14 +188,13 @@ class ProviderControl {
         if (property === "refreshTasks") return async (ids: readonly string[]) =>
           control.refresh ? control.refresh(ids) : target.refreshTasks(ids);
         if (property === "cancelExecution") return async (
-          taskId: string,
-          executionId: string,
-          cancellation: ExecutionCancellation,
+          taskId: string, executionId: string,
+          lease: Parameters<ProviderAdapter["cancelExecution"]>[2], cancellation: ExecutionCancellation,
         ) => {
           control.cancellationCalls.push({ taskId, executionId, cancellation });
           const gate = control.cancellationGates.shift();
           if (gate) await gate.promise;
-          return target.cancelExecution(taskId, executionId, cancellation);
+          return target.cancelExecution(taskId, executionId, lease, cancellation);
         };
         const value = Reflect.get(target, property, receiver) as unknown;
         return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;

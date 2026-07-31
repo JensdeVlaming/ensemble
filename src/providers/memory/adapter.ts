@@ -1,6 +1,9 @@
 import type { Artifact, FailureKind, Task, TaskComment, TaskId } from "../../domain/model.ts";
 import type {
   ActiveExecution,
+  ExecutionLeaseBasis,
+  ExecutionLeaseClaim,
+  ExecutionLeaseGuard,
   ExecutionCompletion,
   ExecutionRecord,
   ExecutionCancellation,
@@ -9,6 +12,7 @@ import type {
   TaskQuery,
   TaskRefreshResult,
 } from "../provider.ts";
+import { ProviderClaimConflict } from "../provider.ts";
 
 const failureKinds = new Set<FailureKind>([
   "startup", "provider", "configuration", "runtime", "timeout", "stalled", "reconciliation", "shutdown",
@@ -21,10 +25,18 @@ export class InMemoryProvider implements ProviderAdapter {
   readonly #comments = new Map<TaskId, TaskComment[]>();
   readonly #artifacts = new Map<TaskId, Artifact[]>();
   readonly #isWorkflowCandidate: (task: Task) => boolean;
+  readonly #now: () => Date;
+  readonly #executionId?: (taskId: string, historyLength: number) => string;
 
-  constructor(tasks: readonly Task[] = [], isWorkflowCandidate: (task: Task) => boolean = () => true) {
+  constructor(
+    tasks: readonly Task[] = [],
+    isWorkflowCandidate: (task: Task) => boolean = () => true,
+    options: { readonly now?: () => Date; readonly executionId?: (taskId: string, historyLength: number) => string } = {},
+  ) {
     for (const task of tasks) this.#tasks.set(task.id, task);
     this.#isWorkflowCandidate = isWorkflowCandidate;
+    this.#now = options.now ?? (() => new Date());
+    this.#executionId = options.executionId;
   }
 
   async discoverTasks(query: TaskQuery): Promise<readonly Task[]> {
@@ -95,21 +107,59 @@ export class InMemoryProvider implements ProviderAdapter {
     return artifact;
   }
 
-  async beginExecution(id: TaskId, role: string, runningStatus: string): Promise<ActiveExecution> {
+  async beginExecution(id: TaskId, role: string, runningStatus: string, lease: ExecutionLeaseClaim): Promise<ActiveExecution> {
     const task = await this.getTask(id);
-    const existing = task.metadata?.activeExecution;
-    if (isActiveExecution(existing)) return existing;
+    validateLeaseClaim(lease);
+    const existingValue = task.metadata?.activeExecution;
+    const existing = existingValue === undefined ? undefined : validateActiveExecution(existingValue);
+    assertLeaseBasis(id, lease.expected, existing);
+    if (existing?.ownerId && existing.leaseExpiresAt
+      && existing.ownerId !== lease.ownerId && Date.parse(existing.leaseExpiresAt) > Date.parse(lease.observedAt)) {
+      throw new ProviderClaimConflict(id, existing);
+    }
     const history = Array.isArray(task.metadata?.executionHistory) ? task.metadata.executionHistory : [];
-    const execution = { id: `${id}:${history.length + 1}`, role, startedAt: new Date().toISOString() };
+    const execution = existing ? {
+      ...existing,
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.expiresAt,
+    } : {
+      id: this.#executionId?.(id, history.length) ?? `${id}:${history.length + 1}`,
+      role,
+      startedAt: this.#now().toISOString(),
+      ownerId: lease.ownerId,
+      leaseExpiresAt: lease.expiresAt,
+    };
     this.#tasks.set(id, { ...task, status: runningStatus, metadata: { ...task.metadata, activeExecution: execution } });
-    return execution;
+    return Object.freeze({ ...execution });
   }
 
-  async completeExecution(id: TaskId, executionId: string, completion: ExecutionCompletion): Promise<void> {
+  async renewExecutionLease(id: TaskId, executionId: string, lease: ExecutionLeaseClaim): Promise<ActiveExecution> {
     const task = await this.getTask(id);
-    if (hasExecution(task, executionId)) return;
+    validateLeaseClaim(lease);
+    const existingValue = task.metadata?.activeExecution;
+    const existing = existingValue === undefined ? undefined : validateActiveExecution(existingValue);
+    assertLeaseBasis(id, lease.expected, existing);
+    if (!existing || existing.id !== executionId || !existing.ownerId || !existing.leaseExpiresAt
+      || existing.ownerId !== lease.ownerId || Date.parse(existing.leaseExpiresAt) <= Date.parse(lease.observedAt)
+      || Date.parse(lease.expiresAt) <= Date.parse(existing.leaseExpiresAt)) {
+      if (existing) throw new ProviderClaimConflict(id, existing);
+      throw new Error(`Execution is not active: ${executionId}`);
+    }
+    const renewed = { ...existing, leaseExpiresAt: lease.expiresAt };
+    this.#tasks.set(id, { ...task, metadata: { ...task.metadata, activeExecution: renewed } });
+    return Object.freeze(renewed);
+  }
+
+  async completeExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, completion: ExecutionCompletion): Promise<void> {
+    const task = await this.getTask(id);
+    const recorded = findExecution(task, executionId);
+    if (recorded) {
+      if (!sameRecord(recorded, completion.record)) throw new Error(`Conflicting execution record: ${executionId}`);
+      return;
+    }
     const active = task.metadata?.activeExecution;
     if (!isActiveExecution(active) || active.id !== executionId) throw new Error(`Execution is not active: ${executionId}`);
+    assertLeaseGuard(id, active, lease);
     const comments = this.#comments.get(id) ?? [];
     for (const body of completion.comments) comments.push({ id: `${id}-comment-${comments.length + 1}`, body, createdAt: new Date().toISOString() });
     this.#comments.set(id, comments);
@@ -123,24 +173,27 @@ export class InMemoryProvider implements ProviderAdapter {
       nextRole: completion.record.nextRole, executionHistory: history } });
   }
 
-  async failExecution(id: TaskId, executionId: string, record: ExecutionRecord, status: string, comment: string): Promise<void> {
-    await this.completeExecution(id, executionId, { record, comments: [comment], artifacts: [], status });
+  async failExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, record: ExecutionRecord, status: string, comment: string): Promise<void> {
+    await this.completeExecution(id, executionId, lease, { record, comments: [comment], artifacts: [], status });
   }
 
-  async cancelExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void> {
-    await this.completeExecution(id, executionId, {
+  async cancelExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, cancellation: ExecutionCancellation): Promise<void> {
+    await this.completeExecution(id, executionId, lease, {
       record: cancellation.record, comments: [cancellation.comment], artifacts: [], status: cancellation.status,
     });
   }
 
-  async blockExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void> {
-    await this.cancelExecution(id, executionId, cancellation);
+  async blockExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, cancellation: ExecutionCancellation): Promise<void> {
+    await this.cancelExecution(id, executionId, lease, cancellation);
   }
 }
 
 function isActiveExecution(value: unknown): value is ActiveExecution {
   return !!value && typeof value === "object" && typeof (value as ActiveExecution).id === "string"
-    && typeof (value as ActiveExecution).role === "string" && typeof (value as ActiveExecution).startedAt === "string";
+    && typeof (value as ActiveExecution).role === "string" && typeof (value as ActiveExecution).startedAt === "string"
+    && (((value as ActiveExecution).ownerId === undefined && (value as ActiveExecution).leaseExpiresAt === undefined)
+      || (typeof (value as ActiveExecution).ownerId === "string" && !!(value as ActiveExecution).ownerId
+        && isCanonicalTimestamp((value as ActiveExecution).leaseExpiresAt)));
 }
 
 function validateActiveExecution(value: unknown): ActiveExecution {
@@ -186,7 +239,38 @@ function compareExecutionRecords(left: ExecutionRecord, right: ExecutionRecord):
   return left.finishedAt.localeCompare(right.finishedAt) || left.id.localeCompare(right.id);
 }
 
-function hasExecution(task: Task, id: string): boolean {
-  return Array.isArray(task.metadata?.executionHistory)
-    && task.metadata.executionHistory.some((item) => !!item && typeof item === "object" && (item as { id?: unknown }).id === id);
+function findExecution(task: Task, id: string): ExecutionRecord | undefined {
+  if (!Array.isArray(task.metadata?.executionHistory)) return undefined;
+  const value = task.metadata.executionHistory.find((item) => !!item && typeof item === "object" && (item as { id?: unknown }).id === id);
+  return value === undefined ? undefined : validateExecutionRecord(value);
+}
+
+function validateLeaseClaim(lease: ExecutionLeaseClaim): void {
+  if (!lease.ownerId.trim() || !isCanonicalTimestamp(lease.observedAt) || !isCanonicalTimestamp(lease.expiresAt)
+    || Date.parse(lease.expiresAt) <= Date.parse(lease.observedAt)) throw new Error("Invalid execution lease claim");
+}
+
+function assertLeaseBasis(taskId: string, basis: ExecutionLeaseBasis, active: ActiveExecution | undefined): void {
+  const matches = basis.kind === "none"
+    ? active === undefined
+    : active !== undefined && basis.executionId === active.id && basis.role === active.role && basis.startedAt === active.startedAt
+      && (basis.kind === "legacy"
+        ? active.ownerId === undefined && active.leaseExpiresAt === undefined
+        : basis.ownerId === active.ownerId && basis.leaseExpiresAt === active.leaseExpiresAt);
+  if (matches) return;
+  if (active) throw new ProviderClaimConflict(taskId, active);
+  throw new Error(`Execution lease basis no longer exists for task ${taskId}`);
+}
+
+function assertLeaseGuard(taskId: string, active: ActiveExecution, guard: ExecutionLeaseGuard): void {
+  if (!guard.ownerId.trim() || !isCanonicalTimestamp(guard.observedAt) || !isCanonicalTimestamp(guard.leaseExpiresAt)
+    || active.ownerId !== guard.ownerId || active.leaseExpiresAt !== guard.leaseExpiresAt
+    || Date.parse(guard.leaseExpiresAt) <= Date.parse(guard.observedAt)) throw new ProviderClaimConflict(taskId, active);
+}
+
+function sameRecord(left: ExecutionRecord, right: ExecutionRecord): boolean {
+  return left.id === right.id && left.role === right.role && left.outcome === right.outcome
+    && left.summary === right.summary && left.nextRole === right.nextRole && left.finishedAt === right.finishedAt
+    && JSON.stringify(left.failure) === JSON.stringify(right.failure)
+    && JSON.stringify(left.blockingRequest) === JSON.stringify(right.blockingRequest);
 }

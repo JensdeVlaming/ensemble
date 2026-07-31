@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { leaseClaim } from "./lease-helpers.ts";
 import {
   CodexRuntime,
   EngineExecutionService,
@@ -226,7 +227,7 @@ test("provider state selects the next role after scheduler reconstruction", asyn
 test("a reconstructed scheduler recovers a durable in-progress execution", async () => {
   const root = await fixtureRepository();
   const provider = new InMemoryProvider([task("restart-1")]);
-  const started = await provider.beginExecution("restart-1", "implementation", "in_progress");
+  const started = await provider.beginExecution("restart-1", "implementation", "in_progress", leaseClaim());
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "Recovered", comments: [], artifacts: [] });
   const scheduler = new Scheduler(provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
     new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))));
@@ -257,8 +258,8 @@ test("a provider response failure after atomic completion is safe to retry", asy
   let failResponse = true;
   const provider = new Proxy(delegate, {
     get(target, property, receiver) {
-      if (property === "completeExecution") return async (id: TaskId, executionId: string, completion: ExecutionCompletion) => {
-        await target.completeExecution(id, executionId, completion);
+      if (property === "completeExecution") return async (id: TaskId, executionId: string, lease: Parameters<ProviderAdapter["completeExecution"]>[2], completion: ExecutionCompletion) => {
+        await target.completeExecution(id, executionId, lease, completion);
         if (failResponse) { failResponse = false; throw new Error("provider response lost"); }
       };
       const value = Reflect.get(target, property, receiver) as unknown;

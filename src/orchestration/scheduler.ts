@@ -1,7 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { ExecutionCancelledError } from "../execution/engine.ts";
 import type { ConfiguredExecution, RunningExecution, TaskExecutionService } from "../execution/engine.ts";
 import { ProviderClaimConflict } from "../providers/provider.ts";
-import type { ExecutionCompletion, ExecutionRecord, ProviderAdapter, ProviderExecutionState, TaskRefreshResult } from "../providers/provider.ts";
+import type {
+  ActiveExecution,
+  ExecutionCompletion,
+  ExecutionLeaseBasis,
+  ExecutionLeaseClaim,
+  ExecutionLeaseGuard,
+  ExecutionRecord,
+  ProviderAdapter,
+  ProviderExecutionState,
+  TaskRefreshResult,
+} from "../providers/provider.ts";
 import type { FailureKind, RepositoryConfiguration, RuntimeResult, Task } from "../domain/model.ts";
 
 export interface ScheduleReport {
@@ -33,7 +44,22 @@ export interface SchedulerShutdownReport {
 
 export interface SchedulerOptions {
   readonly now?: () => Date;
+  readonly lease?: Partial<SchedulerLeasePolicy>;
+  readonly timers?: SchedulerTimerSource;
 }
+
+export interface SchedulerLeasePolicy {
+  readonly ownerId: string;
+  readonly durationMs: number;
+  readonly renewIntervalMs: number;
+}
+
+export interface SchedulerTimerSource {
+  set(delayMs: number, callback: () => void): unknown;
+  clear(handle: unknown): void;
+}
+
+export const processExecutionOwner = Object.freeze({ id: randomUUID() });
 
 interface WorkerReservation {
   readonly taskId: string;
@@ -44,6 +70,18 @@ interface WorkerReservation {
   role?: string;
   running?: RunningExecution;
   reconciliation?: ReconciliationQuarantine;
+  lease?: LeaseController;
+  leaseTransferred?: boolean;
+}
+
+interface LeaseController {
+  readonly reservation: WorkerReservation;
+  active: ActiveExecution & Required<Pick<ActiveExecution, "ownerId" | "leaseExpiresAt">>;
+  timer?: unknown;
+  renewal?: Promise<void>;
+  operationTail: Promise<void>;
+  lost?: Error;
+  stopped: boolean;
 }
 
 interface ReconciliationQuarantine {
@@ -53,6 +91,7 @@ interface ReconciliationQuarantine {
   readonly configuration: RepositoryConfiguration;
   readonly reservation: WorkerReservation;
   readonly summary: string;
+  readonly lease: LeaseController;
   readonly settled: Deferred<void>;
   durableSettled: boolean;
   localSettled: boolean;
@@ -64,7 +103,8 @@ interface SynchronizationQuarantine {
   readonly taskId: string;
   readonly executionId: string;
   readonly record: ExecutionRecord;
-  readonly synchronize: () => Promise<void>;
+  readonly synchronize: (guard: ExecutionLeaseGuard) => Promise<void>;
+  readonly lease: LeaseController;
   attempt?: Promise<void>;
   lastError?: string;
 }
@@ -92,11 +132,15 @@ export class Scheduler {
   readonly provider: ProviderAdapter;
   readonly executions: TaskExecutionService;
   readonly #now: () => Date;
+  readonly #leasePolicy: SchedulerLeasePolicy;
+  readonly #timers: SchedulerTimerSource;
 
   constructor(provider: ProviderAdapter, executions: TaskExecutionService, options: SchedulerOptions = {}) {
     this.provider = provider;
     this.executions = executions;
     this.#now = options.now ?? (() => new Date());
+    this.#leasePolicy = validateLeasePolicy(options.lease);
+    this.#timers = options.timers ?? nodeSchedulerTimers;
   }
 
   async startup(): Promise<SchedulerStartupReport> {
@@ -226,13 +270,13 @@ export class Scheduler {
         roleName = state.active.role;
         reservation.executionId = state.active.id;
         reservation.role = state.active.role;
-        const reason = reconciliationReason(task, execution.configuration);
-        if (reason) {
-          this.#beginReconciliationCancellation(reservation, reason, task.status, true);
+        if (isForeignLiveLease(state.active, this.#leasePolicy.ownerId, this.#nowEpoch())) {
+          this.#release(reservation);
+          completion.resolve(undefined);
           return entry(false);
         }
       }
-      if (task.dispatchable === false) {
+      if (task.dispatchable === false && !state.active) {
         this.#release(reservation);
         completion.resolve(undefined);
         return entry(false);
@@ -243,12 +287,23 @@ export class Scheduler {
         return entry(false);
       }
 
-      const active = state.active ?? await this.provider.beginExecution(task.id, selectedRole, execution.configuration.runningStatus);
+      const active = await this.provider.beginExecution(
+        task.id,
+        selectedRole,
+        execution.configuration.runningStatus,
+        this.#leaseClaim(state.active),
+      );
       executionId = active.id;
       roleName = active.role;
       reservation.executionId = active.id;
       reservation.role = active.role;
+      reservation.lease = this.#startLease(reservation, active);
       if (!state.active) reservation.status = execution.configuration.runningStatus;
+      const reason = state.active ? reconciliationReason(task, execution.configuration) : undefined;
+      if (reason) {
+        this.#beginReconciliationCancellation(reservation, reason, task.status, true);
+        return entry(false);
+      }
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       failureKind = "configuration";
       const role = execution.configuration.workflow.roles.find((candidate) => candidate.name === roleName);
@@ -258,6 +313,7 @@ export class Scheduler {
         this.provider.getComments(task.id),
         this.provider.getArtifacts(task.id),
       ]);
+      this.#assertLeaseOwned(reservation);
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       failureKind = "startup";
       const running = await execution.withEnvironment((environment) => environment.start({
@@ -268,6 +324,7 @@ export class Scheduler {
         executionId: active.id,
       }));
       reservation.running = running;
+      if (reservation.lease.lost) void running.cancel("lease_lost").catch(() => undefined);
       if (!this.#accepting) {
         void running.cancel("shutdown").catch(() => undefined);
       }
@@ -291,7 +348,7 @@ export class Scheduler {
       }
       const report = await this.#recordFailure(
         task,
-        execution.configuration,
+        reservation,
         roleName,
         executionId,
         state?.history ?? [],
@@ -315,16 +372,20 @@ export class Scheduler {
     try {
       const report = await running.result;
       if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
-      return await this.#synchronizeResult(task, reservation.configuration, roleName, executionId, report.result);
+      this.#assertLeaseOwned(reservation);
+      return await this.#synchronizeResult(task, reservation, roleName, executionId, report.result);
     } catch (error) {
       if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
+      if (reservation.lease?.lost || (error instanceof ExecutionCancelledError && error.reason === "lease_lost")) {
+        return failureReport(task.id, roleName, reservation.lease?.lost ?? error);
+      }
       if (error instanceof ExecutionCancelledError && error.reason === "shutdown") {
-        return this.#recordCancellation(task.id, reservation.configuration, roleName, executionId);
+        return this.#recordCancellation(task.id, reservation, roleName, executionId);
       }
       const kind: FailureKind = error instanceof ExecutionCancelledError && (error.reason === "timeout" || error.reason === "stalled")
         ? error.reason
         : "runtime";
-      return this.#recordFailure(task, reservation.configuration, roleName, executionId, history, kind, error);
+      return this.#recordFailure(task, reservation, roleName, executionId, history, kind, error);
     } finally {
       if (!reservation.reconciliation) this.#release(reservation);
     }
@@ -332,15 +393,16 @@ export class Scheduler {
 
   async #recordFailure(
     task: Task,
-    configuration: RepositoryConfiguration,
+    reservation: WorkerReservation,
     roleName: string,
     executionId: string | undefined,
     history: readonly ExecutionRecord[],
     kind: FailureKind,
     error: unknown,
   ): Promise<ScheduleReport> {
+    const configuration = reservation.configuration;
     let reportError = error;
-    if (executionId) {
+    if (executionId && reservation.lease && !reservation.lease.lost) {
       const message = errorMessage(error);
       const record = failureRecord(
         executionId,
@@ -352,17 +414,19 @@ export class Scheduler {
         this.#nowDate(),
       );
       const comment = `Ensemble execution failed: ${message}`;
-      const synchronize = (): Promise<void> => this.provider.failExecution(
+      const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.provider.failExecution(
         task.id,
         executionId,
+        guard,
         record,
         configuration.failedStatus,
         comment,
       );
       try {
-        await synchronize();
+        await this.#withLeaseGuard(reservation.lease, synchronize);
       } catch (synchronizationError) {
-        this.#registerSynchronization(task.id, executionId, record, synchronize, synchronizationError);
+        if (synchronizationError instanceof ProviderClaimConflict) this.#loseLease(reservation.lease, synchronizationError);
+        else this.#registerSynchronization(task.id, executionId, record, synchronize, reservation.lease, synchronizationError);
         reportError = synchronizationError;
       }
     }
@@ -373,7 +437,8 @@ export class Scheduler {
     taskId: string,
     executionId: string,
     record: ExecutionRecord,
-    synchronize: () => Promise<void>,
+    synchronize: (guard: ExecutionLeaseGuard) => Promise<void>,
+    lease: LeaseController,
     error: unknown,
   ): void {
     if (this.#synchronizations.has(taskId)) return;
@@ -382,8 +447,10 @@ export class Scheduler {
       executionId,
       record,
       synchronize,
+      lease,
       lastError: errorMessage(error),
     });
+    lease.reservation.leaseTransferred = true;
   }
 
   #nowDate(): Date {
@@ -397,6 +464,7 @@ export class Scheduler {
   }
 
   #release(reservation: WorkerReservation): void {
+    if (reservation.lease && !reservation.leaseTransferred) this.#stopLease(reservation.lease);
     if (this.#workers.get(reservation.taskId) === reservation) this.#workers.delete(reservation.taskId);
     this.#notifyIdle();
   }
@@ -427,7 +495,7 @@ export class Scheduler {
       if (!reservation.reconciliation && reservation.executionId && reservation.role) {
         void this.#recordCancellation(
           reservation.taskId,
-          reservation.configuration,
+          reservation,
           reservation.role,
           reservation.executionId,
         );
@@ -443,6 +511,7 @@ export class Scheduler {
       void quarantine.reservation.running.result.catch(() => undefined);
     }
     await waitWithin(this.#waitForIdle(), options.cancellationTimeoutMs);
+    for (const synchronization of [...this.#synchronizations.values()]) this.#dropSynchronization(synchronization);
     return Object.freeze({
       drained: this.#workers.size === 0 && this.#quarantines.size === 0 && this.#synchronizations.size === 0
         && this.#tickInProgress === undefined,
@@ -520,6 +589,7 @@ export class Scheduler {
       if (this.#synchronizations.get(synchronization.taskId) === synchronization) {
         this.#synchronizations.delete(synchronization.taskId);
       }
+      this.#stopLease(synchronization.lease);
       this.#notifyIdle();
       return;
     }
@@ -528,6 +598,10 @@ export class Scheduler {
 
   async #confirmOrRetrySynchronization(synchronization: SynchronizationQuarantine): Promise<void> {
     if (synchronization.attempt) return synchronization.attempt;
+    if (synchronization.lease.lost) {
+      this.#dropSynchronization(synchronization);
+      return;
+    }
     let state: ProviderExecutionState;
     try {
       state = await this.provider.getExecutionState(synchronization.taskId);
@@ -546,14 +620,16 @@ export class Scheduler {
     }
 
     let attempt!: Promise<void>;
-    attempt = synchronization.synchronize().then(
+    attempt = this.#withLeaseGuard(synchronization.lease, synchronization.synchronize).then(
       () => {
-        if (this.#synchronizations.get(synchronization.taskId) === synchronization) {
-          this.#synchronizations.delete(synchronization.taskId);
-        }
+        this.#dropSynchronization(synchronization);
       },
       (error: unknown) => {
         synchronization.lastError = errorMessage(error);
+        if (error instanceof ProviderClaimConflict) {
+          this.#loseLease(synchronization.lease, error);
+          this.#dropSynchronization(synchronization);
+        }
       },
     ).finally(() => {
       if (synchronization.attempt === attempt) synchronization.attempt = undefined;
@@ -608,6 +684,7 @@ export class Scheduler {
       configuration: reservation.configuration,
       reservation,
       summary,
+      lease: reservation.lease!,
       settled: deferred<void>(),
       durableSettled: !persist,
       localSettled: reservation.running === undefined,
@@ -644,6 +721,7 @@ export class Scheduler {
       "reconciliation",
       status,
       quarantine.summary,
+      quarantine.lease,
     ).then(
       (report) => {
         quarantine.lastReport = report;
@@ -651,6 +729,7 @@ export class Scheduler {
       },
       (error: unknown) => {
         quarantine.lastReport = failureReport(quarantine.taskId, quarantine.role, error);
+        if (error instanceof ProviderClaimConflict || quarantine.lease.lost) quarantine.durableSettled = true;
       },
     ).finally(() => {
       if (quarantine.providerAttempt === attempt) quarantine.providerAttempt = undefined;
@@ -682,7 +761,7 @@ export class Scheduler {
     entry: (dispatched: boolean) => DispatchEntry,
   ): Promise<DispatchEntry> {
     const report = executionId
-      ? await this.#recordCancellation(task.id, reservation.configuration, roleName, executionId)
+      ? await this.#recordCancellation(task.id, reservation, roleName, executionId)
       : undefined;
     this.#release(reservation);
     completion.resolve(report);
@@ -691,10 +770,11 @@ export class Scheduler {
 
   async #recordCancellation(
     taskId: string,
-    configuration: RepositoryConfiguration,
+    reservation: WorkerReservation,
     roleName: string,
     executionId: string,
   ): Promise<ScheduleReport> {
+    const configuration = reservation.configuration;
     const summary = "Ensemble execution cancelled during shutdown";
     try {
       return await this.#persistCancellation(
@@ -704,6 +784,7 @@ export class Scheduler {
         "shutdown",
         configuration.failedStatus,
         summary,
+        reservation.lease!,
       );
     } catch (error) {
       return failureReport(taskId, roleName, error);
@@ -717,29 +798,26 @@ export class Scheduler {
     kind: "reconciliation" | "shutdown",
     status: string,
     summary: string,
+    lease: LeaseController,
   ): Promise<ScheduleReport> {
-    await this.provider.cancelExecution(taskId, executionId, {
+    const cancellation = {
       record: {
-        id: executionId,
-        role: roleName,
-        outcome: "cancelled",
-        summary,
-        finishedAt: this.#nowDate().toISOString(),
-        failure: { kind, retryable: false },
-      },
-      status,
-      comment: summary,
-    });
+        id: executionId, role: roleName, outcome: "cancelled", summary,
+        finishedAt: this.#nowDate().toISOString(), failure: { kind, retryable: false } as const,
+      }, status, comment: summary,
+    };
+    await this.#withLeaseGuard(lease, (guard) => this.provider.cancelExecution(taskId, executionId, guard, cancellation));
     return { taskId, outcome: "failed", role: roleName, error: summary };
   }
 
   async #synchronizeResult(
     task: Task,
-    config: RepositoryConfiguration,
+    reservation: WorkerReservation,
     role: string,
     executionId: string,
     result: RuntimeResult,
   ): Promise<ScheduleReport> {
+    const config = reservation.configuration;
     const terminal = config.terminalOutcomes.includes(result.outcome);
     if (!terminal && !result.nextRole) throw new Error(`Non-terminal outcome '${result.outcome}' requires nextRole`);
     if (result.nextRole && !config.workflow.roles.some((candidate) => candidate.name === result.nextRole)) {
@@ -759,11 +837,13 @@ export class Scheduler {
       artifacts: Object.freeze(result.artifacts.map((artifact) => Object.freeze({ ...artifact }))),
       status: terminal ? config.completedStatus : config.runningStatus,
     });
-    const synchronize = (): Promise<void> => this.provider.completeExecution(task.id, executionId, completion);
+    const lease = reservation.lease!;
+    const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.provider.completeExecution(task.id, executionId, guard, completion);
     try {
-      await synchronize();
+      await this.#withLeaseGuard(lease, synchronize);
     } catch (error) {
-      this.#registerSynchronization(task.id, executionId, record, synchronize, error);
+      if (error instanceof ProviderClaimConflict) this.#loseLease(lease, error);
+      else this.#registerSynchronization(task.id, executionId, record, synchronize, lease, error);
       return failureReport(task.id, role, error);
     }
     return {
@@ -772,6 +852,117 @@ export class Scheduler {
       role,
       nextRole: result.nextRole,
     };
+  }
+
+  #leaseClaim(active: ActiveExecution | undefined): ExecutionLeaseClaim {
+    const observed = this.#nowDate();
+    const maximumEpoch = 8_640_000_000_000_000;
+    const expiresEpoch = Math.min(maximumEpoch, observed.getTime() + this.#leasePolicy.durationMs);
+    if (expiresEpoch <= observed.getTime()) throw new Error("Scheduler clock cannot create a future execution lease");
+    return Object.freeze({
+      ownerId: this.#leasePolicy.ownerId,
+      observedAt: observed.toISOString(),
+      expiresAt: new Date(expiresEpoch).toISOString(),
+      expected: leaseBasis(active),
+    });
+  }
+
+  #startLease(reservation: WorkerReservation, active: ActiveExecution): LeaseController {
+    if (!active.ownerId || !active.leaseExpiresAt) throw new Error(`Provider returned an unleased execution: ${active.id}`);
+    const lease: LeaseController = {
+      reservation,
+      active: { ...active, ownerId: active.ownerId, leaseExpiresAt: active.leaseExpiresAt },
+      operationTail: Promise.resolve(),
+      stopped: false,
+    };
+    this.#scheduleRenewal(lease);
+    return lease;
+  }
+
+  #scheduleRenewal(lease: LeaseController): void {
+    if (lease.stopped || lease.lost) return;
+    const remaining = Date.parse(lease.active.leaseExpiresAt) - this.#nowEpoch();
+    lease.timer = this.#timers.set(Math.max(1, Math.min(this.#leasePolicy.renewIntervalMs, remaining)), () => {
+      lease.timer = undefined;
+      if (lease.stopped || lease.lost || lease.renewal) return;
+      const renewal = this.#serializeLease(lease, () => this.#renewLease(lease)).finally(() => {
+        if (lease.renewal === renewal) lease.renewal = undefined;
+        this.#scheduleRenewal(lease);
+      });
+      lease.renewal = renewal;
+    });
+  }
+
+  async #renewLease(lease: LeaseController): Promise<void> {
+    try {
+      const renewed = await this.provider.renewExecutionLease(
+        lease.reservation.taskId,
+        lease.active.id,
+        this.#leaseClaim(lease.active),
+      );
+      if (!renewed.ownerId || !renewed.leaseExpiresAt) throw new Error("Provider returned an invalid renewed lease");
+      lease.active = { ...renewed, ownerId: renewed.ownerId, leaseExpiresAt: renewed.leaseExpiresAt };
+    } catch (error) {
+      if (error instanceof ProviderClaimConflict || this.#nowEpoch() >= Date.parse(lease.active.leaseExpiresAt)) {
+        this.#loseLease(lease, error);
+      }
+    }
+  }
+
+  #leaseGuard(lease: LeaseController): ExecutionLeaseGuard {
+    if (lease.lost) throw lease.lost;
+    const observedAt = this.#nowDate().toISOString();
+    if (Date.parse(observedAt) >= Date.parse(lease.active.leaseExpiresAt)) {
+      const error = new Error(`Execution lease expired: ${lease.active.id}`);
+      this.#loseLease(lease, error);
+      throw error;
+    }
+    return Object.freeze({ ownerId: lease.active.ownerId, leaseExpiresAt: lease.active.leaseExpiresAt, observedAt });
+  }
+
+  async #withLeaseGuard<T>(lease: LeaseController, operation: (guard: ExecutionLeaseGuard) => Promise<T>): Promise<T> {
+    return this.#serializeLease(lease, () => operation(this.#leaseGuard(lease)));
+  }
+
+  #serializeLease<T>(lease: LeaseController, operation: () => Promise<T>): Promise<T> {
+    const result = lease.operationTail.then(operation, operation);
+    lease.operationTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  #assertLeaseOwned(reservation: WorkerReservation): void {
+    if (!reservation.lease) throw new Error(`Execution has no ownership lease: ${reservation.taskId}`);
+    this.#leaseGuard(reservation.lease);
+  }
+
+  #loseLease(lease: LeaseController, cause: unknown): void {
+    if (lease.lost) return;
+    lease.lost = cause instanceof Error ? cause : new Error(errorMessage(cause));
+    this.#stopLease(lease);
+    const running = lease.reservation.running;
+    if (running) {
+      void running.cancel("lease_lost").catch(() => undefined);
+      void running.result.catch(() => undefined);
+    }
+    const synchronization = this.#synchronizations.get(lease.reservation.taskId);
+    if (synchronization?.lease === lease) this.#dropSynchronization(synchronization);
+    const reconciliation = lease.reservation.reconciliation;
+    if (reconciliation) {
+      reconciliation.durableSettled = true;
+      this.#maybeClearQuarantine(reconciliation);
+    }
+  }
+
+  #stopLease(lease: LeaseController): void {
+    lease.stopped = true;
+    if (lease.timer !== undefined) this.#timers.clear(lease.timer);
+    lease.timer = undefined;
+  }
+
+  #dropSynchronization(synchronization: SynchronizationQuarantine): void {
+    if (this.#synchronizations.get(synchronization.taskId) === synchronization) this.#synchronizations.delete(synchronization.taskId);
+    this.#stopLease(synchronization.lease);
+    this.#notifyIdle();
   }
 }
 
@@ -783,6 +974,50 @@ function compareCandidates(left: Task, right: Task): number {
     if (priority !== 0) return priority;
   }
   return left.id.localeCompare(right.id);
+}
+
+const nodeSchedulerTimers: SchedulerTimerSource = Object.freeze({
+  set: (delayMs: number, callback: () => void) => {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref();
+    return timer;
+  },
+  clear: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+});
+
+function validateLeasePolicy(value: Partial<SchedulerLeasePolicy> | undefined): SchedulerLeasePolicy {
+  const policy = {
+    ownerId: value?.ownerId ?? processExecutionOwner.id,
+    durationMs: value?.durationMs ?? 60_000,
+    renewIntervalMs: value?.renewIntervalMs ?? 20_000,
+  };
+  if (!policy.ownerId.trim()) throw new Error("Scheduler lease owner must not be empty");
+  if (!Number.isSafeInteger(policy.durationMs) || policy.durationMs <= 0) throw new Error("Scheduler lease duration must be a positive integer");
+  if (!Number.isSafeInteger(policy.renewIntervalMs) || policy.renewIntervalMs <= 0
+    || policy.renewIntervalMs >= policy.durationMs) {
+    throw new Error("Scheduler lease renewal interval must be a positive integer smaller than its duration");
+  }
+  return Object.freeze(policy);
+}
+
+function leaseBasis(active: ActiveExecution | undefined): ExecutionLeaseBasis {
+  if (!active) return Object.freeze({ kind: "none" });
+  if (!active.ownerId || !active.leaseExpiresAt) {
+    return Object.freeze({ kind: "legacy", executionId: active.id, role: active.role, startedAt: active.startedAt });
+  }
+  return Object.freeze({
+    kind: "leased",
+    executionId: active.id,
+    role: active.role,
+    startedAt: active.startedAt,
+    ownerId: active.ownerId,
+    leaseExpiresAt: active.leaseExpiresAt,
+  });
+}
+
+function isForeignLiveLease(active: ActiveExecution, ownerId: string, nowEpoch: number): boolean {
+  return active.ownerId !== undefined && active.leaseExpiresAt !== undefined
+    && active.ownerId !== ownerId && Date.parse(active.leaseExpiresAt) > nowEpoch;
 }
 
 function selectRole(state: ProviderExecutionState, config: RepositoryConfiguration): string {

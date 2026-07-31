@@ -239,9 +239,10 @@ test("running-status capacity is reserved before claim and held through synchron
   const releaseSynchronization = deferred<void>();
   const provider = new Proxy(delegate, {
     get(target, property, receiver) {
-      if (property === "beginExecution") return async (id: string, role: string, status: string) => {
+      if (property === "beginExecution") return async (...args: Parameters<ProviderAdapter["beginExecution"]>) => {
+        const [id] = args;
         assert.equal(executions.allocated.includes(id), false);
-        return target.beginExecution(id, role, status);
+        return target.beginExecution(...args);
       };
       if (property === "completeExecution") return async (...args: Parameters<ProviderAdapter["completeExecution"]>) => {
         synchronizationEntered.resolve();
@@ -383,11 +384,12 @@ test("claim conflicts and failed workers release capacity without leaking runtim
   const delegate = new InMemoryProvider([task("conflict", 1), task("failure", 2), task("after", 3)]);
   const provider = new Proxy(delegate, {
     get(target, property, receiver) {
-      if (property === "beginExecution") return async (id: string, role: string, status: string) => {
+      if (property === "beginExecution") return async (...args: Parameters<ProviderAdapter["beginExecution"]>) => {
+        const [id, role] = args;
         if (id === "conflict") {
           throw new ProviderClaimConflict(id, { id: "other", role, startedAt: "2026-07-31T00:00:00.000Z" });
         }
-        return target.beginExecution(id, role, status);
+        return target.beginExecution(...args);
       };
       const value = Reflect.get(target, property, receiver) as unknown;
       return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;

@@ -33,6 +33,38 @@ export interface ActiveExecution {
   readonly id: string;
   readonly role: string;
   readonly startedAt: string;
+  readonly ownerId?: string;
+  readonly leaseExpiresAt?: string;
+}
+
+export type ExecutionLeaseBasis =
+  | { readonly kind: "none" }
+  | {
+    readonly kind: "legacy";
+    readonly executionId: string;
+    readonly role: string;
+    readonly startedAt: string;
+  }
+  | {
+    readonly kind: "leased";
+    readonly executionId: string;
+    readonly role: string;
+    readonly startedAt: string;
+    readonly ownerId: string;
+    readonly leaseExpiresAt: string;
+  };
+
+export interface ExecutionLeaseClaim {
+  readonly ownerId: string;
+  readonly observedAt: string;
+  readonly expiresAt: string;
+  readonly expected: ExecutionLeaseBasis;
+}
+
+export interface ExecutionLeaseGuard {
+  readonly ownerId: string;
+  readonly leaseExpiresAt: string;
+  readonly observedAt: string;
 }
 
 export interface ProviderExecutionState {
@@ -83,13 +115,15 @@ export interface ProviderAdapter {
   createComment(id: TaskId, body: string): Promise<TaskComment>;
   uploadArtifact(id: TaskId, artifact: Artifact): Promise<Artifact>;
   /** Atomically creates, or returns, the durable active execution marker. */
-  beginExecution(id: TaskId, role: string, runningStatus: string): Promise<ActiveExecution>;
+  beginExecution(id: TaskId, role: string, runningStatus: string, lease: ExecutionLeaseClaim): Promise<ActiveExecution>;
+  /** Atomically extends a live same-owner execution lease. */
+  renewExecutionLease(id: TaskId, executionId: string, lease: ExecutionLeaseClaim): Promise<ActiveExecution>;
   /** Atomically and idempotently applies every result side effect. */
-  completeExecution(id: TaskId, executionId: string, completion: ExecutionCompletion): Promise<void>;
+  completeExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, completion: ExecutionCompletion): Promise<void>;
   /** Atomically and idempotently records a failed execution. */
-  failExecution(id: TaskId, executionId: string, record: ExecutionRecord, status: string, comment: string): Promise<void>;
+  failExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, record: ExecutionRecord, status: string, comment: string): Promise<void>;
   /** Atomically and idempotently records a reconciliation or shutdown cancellation. */
-  cancelExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void>;
+  cancelExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, cancellation: ExecutionCancellation): Promise<void>;
   /** Atomically and idempotently records work that requires operator action. */
-  blockExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void>;
+  blockExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, cancellation: ExecutionCancellation): Promise<void>;
 }

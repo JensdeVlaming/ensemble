@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { leaseClaim, leaseGuard } from "./lease-helpers.ts";
 import {
   ProviderClaimConflict,
   VikunjaApiError,
@@ -83,7 +84,7 @@ test("Vikunja adapter filters and normalizes workflow candidates", async () => {
 test("Vikunja execution journal claims once and synchronizes idempotently", async () => {
   const api = new FakeVikunjaApi([task(1, "Work", [1], 1)]);
   const provider = providerFor(api, "execution-1");
-  const active = await provider.beginExecution("1", "implementation", "running");
+  const active = await provider.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-1"));
   assert.equal(active.id, "execution-1");
   assert.equal((await provider.getTask("1")).status, "running");
 
@@ -96,8 +97,8 @@ test("Vikunja execution journal claims once and synchronizes idempotently", asyn
     artifacts: [{ type: "pull_request", url: "https://example.test/pr/1" }],
     status: "completed",
   };
-  await provider.completeExecution("1", active.id, completion);
-  await provider.completeExecution("1", active.id, completion);
+  await provider.completeExecution("1", active.id, leaseGuard(active), completion);
+  await provider.completeExecution("1", active.id, leaseGuard(active), completion);
   const state = await provider.getExecutionState("1");
   assert.equal(state.active, undefined);
   assert.deepEqual(state.history.map((record) => record.id), ["execution-1"]);
@@ -112,14 +113,38 @@ test("Vikunja append-only claims deterministically reject a competing claimant",
   const left = providerFor(api, "claim-left");
   const right = providerFor(api, "claim-right");
   const settled = await Promise.allSettled([
-    left.beginExecution("1", "implementation", "running"),
-    right.beginExecution("1", "implementation", "running"),
+    left.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-left")),
+    right.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-right")),
   ]);
   assert.equal(settled.filter((item) => item.status === "fulfilled").length, 1);
   const rejected = settled.find((item): item is PromiseRejectedResult => item.status === "rejected");
   assert.ok(rejected?.reason instanceof ProviderClaimConflict);
   const state = await left.getExecutionState("1");
   assert.ok(state.active?.id === "claim-left" || state.active?.id === "claim-right");
+});
+
+test("Vikunja expired takeover has one winner and preserves the execution identity", async () => {
+  const api = new FakeVikunjaApi([task(1, "Takeover", [1], 1)]);
+  const original = providerFor(api, "original-id");
+  const active = await original.beginExecution("1", "implementation", "running", {
+    ...leaseClaim(undefined, "expired-owner"), expiresAt: "2026-01-01T00:00:10.000Z",
+  });
+  const left = providerFor(api, "unused-left");
+  const right = providerFor(api, "unused-right");
+  const settled = await Promise.allSettled([
+    left.beginExecution("1", "ignored", "running", {
+      ...leaseClaim(active, "takeover-left"), observedAt: "2026-01-01T00:00:10.000Z", expiresAt: "2026-01-01T00:01:10.000Z",
+    }),
+    right.beginExecution("1", "ignored", "running", {
+      ...leaseClaim(active, "takeover-right"), observedAt: "2026-01-01T00:00:10.000Z", expiresAt: "2026-01-01T00:01:10.000Z",
+    }),
+  ]);
+  assert.equal(settled.filter((item) => item.status === "fulfilled").length, 1);
+  const winner = (await original.getExecutionState("1")).active;
+  assert.equal(winner?.id, active.id);
+  assert.equal(winner?.role, active.role);
+  assert.equal(winner?.startedAt, active.startedAt);
+  assert.ok(winner?.ownerId === "takeover-left" || winner?.ownerId === "takeover-right");
 });
 
 test("Vikunja reconciliation distinguishes current, missing, and unreadable tasks", async () => {

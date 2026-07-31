@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { leaseClaim, leaseGuard } from "./lease-helpers.ts";
 import {
   ExecutionEngine,
   InMemoryProvider,
@@ -109,6 +110,9 @@ test("typed provider state is validated, ordered, copied, and orchestration igno
   await assert.rejects(new InMemoryProvider([task("bad-container", "todo", { executionHistory: "bad" })]).getExecutionState("bad-container"), /Invalid execution history/u);
   await assert.rejects(new InMemoryProvider([task("bad-record", "todo", { executionHistory: [{ id: 1 }] })]).getExecutionState("bad-record"), /Invalid execution record/u);
   await assert.rejects(new InMemoryProvider([task("bad-active", "todo", { activeExecution: { id: "x" } })]).getExecutionState("bad-active"), /Invalid active execution/u);
+  await assert.rejects(new InMemoryProvider([task("partial-lease", "todo", {
+    activeExecution: { id: "x", role: "implementation", startedAt: "2026-01-01T00:00:00.000Z", ownerId: "owner" },
+  })]).getExecutionState("partial-lease"), /Invalid active execution/u);
   await assert.rejects(new InMemoryProvider([task("bad-role", "todo", { nextRole: 42 })]).getExecutionState("bad-role"), /Invalid next role/u);
 });
 
@@ -117,7 +121,8 @@ test("retry state survives Scheduler reconstruction and caps failures per role",
   const recoveredProvider = new InMemoryProvider([task("recovered-retry")]);
   assert.equal((await scheduler(recoveredProvider, failingRuntime(), new CountingWorkspaces(root)).poll())[0]?.outcome, "failed");
   const recoveredRuntime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "recovered", comments: [], artifacts: [] });
-  assert.equal((await scheduler(recoveredProvider, recoveredRuntime, new CountingWorkspaces(root)).poll())[0]?.outcome, "completed");
+  const recovered = (await scheduler(recoveredProvider, recoveredRuntime, new CountingWorkspaces(root)).poll())[0];
+  assert.equal(recovered?.outcome, "completed", JSON.stringify(recovered));
 
   const provider = new InMemoryProvider([task("bounded")]);
   const run = scheduler(provider, failingRuntime(), new CountingWorkspaces(root));
@@ -136,8 +141,8 @@ test("retry state survives Scheduler reconstruction and caps failures per role",
 test("failures in an earlier role do not exhaust a later role", async () => {
   const root = await fixture(1);
   const provider = new InMemoryProvider([task("roles")]);
-  const execution = await provider.beginExecution("roles", "implementation", "in_progress");
-  await provider.failExecution("roles", execution.id, {
+  const execution = await provider.beginExecution("roles", "implementation", "in_progress", leaseClaim());
+  await provider.failExecution("roles", execution.id, leaseGuard(execution), {
     id: execution.id, role: "implementation", outcome: "failed", summary: "failed",
     nextRole: "reviewer", finishedAt: "2026-01-01T00:00:00.000Z",
     failure: { kind: "runtime", retryable: true, nextAttemptAt: "2026-01-01T00:00:00.000Z" },
@@ -149,7 +154,7 @@ test("failures in an earlier role do not exhaust a later role", async () => {
 test("authoritative ineligibility cancels durable active work before workspace allocation", async () => {
   const root = await fixture(0);
   const provider = new InMemoryProvider([task("recover", "archived")]);
-  const active = await provider.beginExecution("recover", "reviewer", "archived");
+  const active = await provider.beginExecution("recover", "reviewer", "archived", leaseClaim());
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "recovered", comments: [], artifacts: [] });
   const workspaces = new CountingWorkspaces(root);
   const [report] = await scheduler(provider, runtime, workspaces).poll();

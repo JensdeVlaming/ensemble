@@ -18,7 +18,7 @@ export interface ExecutionReport {
   readonly executionId: string;
 }
 
-export type CancellationReason = "reconciliation" | "shutdown" | "timeout" | "stalled" | "operator";
+export type CancellationReason = "reconciliation" | "shutdown" | "timeout" | "stalled" | "operator" | "lease_lost";
 
 export type RunningExecutionState = "running" | "cancelling" | "completed" | "failed" | "cancelled";
 
