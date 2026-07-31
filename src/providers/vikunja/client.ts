@@ -1,3 +1,6 @@
+import type { OperationalEventReporter } from "../../domain/observability.ts";
+import { emitOperational } from "../../observability/logging.ts";
+
 export interface VikunjaClientOptions {
   readonly baseUrl: string;
   readonly token: string;
@@ -9,6 +12,8 @@ export interface VikunjaClientOptions {
   readonly delay?: (milliseconds: number) => Promise<void>;
   readonly now?: () => Date;
   readonly onEvent?: (event: VikunjaClientEvent) => void;
+  readonly operationalEvents?: OperationalEventReporter;
+  readonly repositoryId?: string;
 }
 
 export type VikunjaClientEvent =
@@ -79,6 +84,8 @@ export class VikunjaClient {
   readonly #delay: (milliseconds: number) => Promise<void>;
   readonly #now: () => Date;
   readonly #onEvent?: (event: VikunjaClientEvent) => void;
+  readonly #operationalEvents?: OperationalEventReporter;
+  readonly #repositoryId?: string;
   #lastObserverError?: VikunjaObserverError;
 
   constructor(options: VikunjaClientOptions) {
@@ -93,6 +100,8 @@ export class VikunjaClient {
     this.#delay = options.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.#now = options.now ?? (() => new Date());
     this.#onEvent = options.onEvent;
+    this.#operationalEvents = options.operationalEvents;
+    this.#repositoryId = options.repositoryId;
   }
 
   get lastObserverError(): VikunjaObserverError | undefined {
@@ -181,17 +190,42 @@ export class VikunjaClient {
   }
 
   #emit(event: VikunjaClientEvent): void {
-    if (!this.#onEvent) return;
-    try {
-      this.#onEvent(event);
-    } catch (error) {
-      this.#lastObserverError = Object.freeze({
-        name: error instanceof Error ? error.name : "Error",
-        message: error instanceof Error ? error.message : String(error),
-        event,
-      });
+    if (this.#onEvent) {
+      try {
+        this.#onEvent(event);
+      } catch (error) {
+        this.#lastObserverError = Object.freeze({
+          name: error instanceof Error ? error.name : "Error",
+          message: error instanceof Error ? error.message : String(error),
+          event,
+        });
+      }
     }
+    emitOperational(this.#operationalEvents, event.kind === "rate_limit" ? {
+      level: "warn", event: "provider.rate_limited", provider: "vikunja",
+      ...(this.#repositoryId ? { repositoryId: this.#repositoryId } : {}),
+      data: { method: event.method, endpoint: endpointClass(event.path), httpStatus: event.status,
+        attempt: event.attempt, maxRetries: event.maxRetries, willRetry: event.willRetry,
+        ...(event.retryAfterMs === undefined ? {} : { delayMs: event.retryAfterMs }) },
+    } : {
+      level: "warn", event: "provider.request_retry", provider: "vikunja",
+      ...(this.#repositoryId ? { repositoryId: this.#repositoryId } : {}),
+      data: { method: event.method, endpoint: endpointClass(event.path), httpStatus: event.status,
+        attempt: event.attempt, delayMs: event.delayMs, willRetry: true },
+    });
   }
+}
+
+function endpointClass(path: string): string {
+  const normalized = path.split("?", 1)[0]?.replace(/^\/+|\/+$/gu, "") ?? "";
+  if (/^projects\/\d+\/views(?:\/|$)/u.test(normalized)) return "project_views";
+  if (/^projects\/\d+\/tasks(?:\/|$)/u.test(normalized)) return "project_tasks";
+  if (/^projects(?:\/|$)/u.test(normalized)) return "projects";
+  if (/^tasks\/\d+\/comments(?:\/|$)/u.test(normalized)) return "task_comments";
+  if (/^tasks(?:\/|$)/u.test(normalized)) return "tasks";
+  if (/^labels(?:\/|$)/u.test(normalized)) return "labels";
+  if (/^users(?:\/|$)/u.test(normalized)) return "users";
+  return "other";
 }
 
 function apiBaseUrl(value: string): URL {

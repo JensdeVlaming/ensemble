@@ -10,6 +10,7 @@ import type {
   ExecutionEnvironment,
   ExecutionRecord,
   FailureKind,
+  OperationalEvent,
   ProviderAdapter,
   RepositoryConfiguration,
   RunningExecution,
@@ -454,7 +455,9 @@ test("unreadable and conflicting synchronization state remain quarantined", asyn
     },
   });
   const executions = new ControlledExecutions(configuration(), [new Error("original"), completed("must not run")]);
-  const scheduler = new Scheduler(provider, executions, { now: () => new Date("2026-01-01T00:00:00.000Z") });
+  const operationalEvents: OperationalEvent[] = [];
+  const scheduler = new Scheduler(provider, executions, { now: () => new Date("2026-01-01T00:00:00.000Z"),
+    events: { emit: (event) => { operationalEvents.push(event); } } });
 
   await scheduler.poll();
   assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, []);
@@ -465,8 +468,16 @@ test("unreadable and conflicting synchronization state remain quarantined", asyn
   refreshMode = "current";
   conflict = true;
   assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, []);
+  await waitFor(() => operationalEvents.some((event) => event.event === "synchronization.conflict"));
   assert.equal(failCalls, 1);
   assert.deepEqual(executions.started, ["conflict"]);
+  for (const event of ["synchronization.failed", "synchronization.conflict"] as const) {
+    const item = operationalEvents.find((candidate) => candidate.event === event && candidate.taskId === "conflict");
+    assert.equal(item?.provider, "memory", event);
+    assert.equal(item?.repositoryId, "retry", event);
+    assert.equal(item?.role, "implementation", event);
+    assert.ok(item?.executionId, event);
+  }
 });
 
 test("authoritative missing state settles synchronization without provider mutation", async () => {
@@ -524,7 +535,10 @@ test("an already-written completion record still repairs remaining provider side
     comments: ["side effect"],
     artifacts: [{ type: "report", url: "https://example.test/report" }],
   };
-  const scheduler = new Scheduler(provider, new ControlledExecutions(configuration(), [result]));
+  const operationalEvents: OperationalEvent[] = [];
+  const scheduler = new Scheduler(provider, new ControlledExecutions(configuration(), [result]), {
+    events: { emit: (event) => { operationalEvents.push(event); } },
+  });
   assert.match((await scheduler.poll())[0]?.error ?? "", /response lost before side effects/u);
   assert.equal((await delegate.getTask("completion-saga")).status, "in_progress");
   assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, []);
@@ -533,6 +547,14 @@ test("an already-written completion record still repairs remaining provider side
   assert.deepEqual((await delegate.getComments("completion-saga")).map((comment) => comment.body), ["side effect", "finished"]);
   assert.deepEqual(await delegate.getArtifacts("completion-saga"), result.artifacts);
   assert.equal((await delegate.getExecutionState("completion-saga")).history.length, 1);
+  for (const event of ["synchronization.failed", "synchronization.quarantined", "synchronization.retry_started",
+    "synchronization.retry_completed"] as const) {
+    const item = operationalEvents.find((candidate) => candidate.event === event && candidate.taskId === "completion-saga");
+    assert.equal(item?.provider, "memory", event);
+    assert.equal(item?.repositoryId, "retry", event);
+    assert.equal(item?.role, "implementation", event);
+    assert.ok(item?.executionId, event);
+  }
 });
 
 test("a conflicting completion record cannot clear synchronization quarantine", async () => {

@@ -157,3 +157,24 @@ JSON result, supports resume by Codex thread ID, and cancels the child process.
 Authentication remains deployment configuration. A repository may select a
 model through `runtime.config.model`; the transport validates it and emits the
 documented `--model` argv pair without hard-coding any model name.
+
+## Operational logs
+
+Ensemble components accept an optional `OperationalEventReporter`. The built-in
+`StructuredLogger` turns stable lifecycle events into immutable records with a
+timestamp, service instance ID, and available provider, repository, task, role,
+and execution correlation IDs. `JsonLinesOperationalLogSink` writes one JSON
+object per line to an injected writable.
+
+Logging is best-effort: throwing or rejecting reporters, sinks, and redactors
+never change orchestration outcomes. Records use a closed event catalog and
+allowlisted data fields. Correlations and strings are UTF-8 bounded, nested
+values have fixed depth and width limits, and a complete record never exceeds
+8,192 JSON-encoded bytes. Unknown, cyclic, excessive, or unsupported values are
+replaced with deterministic truncation markers.
+
+Provider credentials, authorization values, prompts, raw runtime messages,
+tool names and arguments, results, request and response bodies, error messages,
+and stacks are not part of component projections. Hosts may additionally pass
+`HostSecretResolver.redact` to `StructuredLogger` so resolved deployment secret
+values are removed before a sink can observe a record.

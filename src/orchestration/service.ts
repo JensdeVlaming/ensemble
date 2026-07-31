@@ -6,6 +6,8 @@ import type {
   SchedulerStartupReport,
   SchedulerTickReport,
 } from "./scheduler.ts";
+import type { OperationalEventReporter } from "../domain/observability.ts";
+import { emitOperational } from "../observability/logging.ts";
 
 export type OrchestratorServiceState = "idle" | "starting" | "running" | "draining" | "stopped";
 
@@ -83,8 +85,10 @@ export class OrchestratorService {
   readonly #registrations: readonly RegistrationState[];
   readonly #signals: ServiceSignalSource;
   readonly #timers: ServiceTimerSource;
+  readonly #events?: OperationalEventReporter;
   readonly #stop = deferred<void>();
-  readonly #signalListener = (): void => { void this.shutdown().catch(() => undefined); };
+  readonly #interruptListener = (): void => { this.#onSignal("SIGINT"); };
+  readonly #terminateListener = (): void => { this.#onSignal("SIGTERM"); };
   #state: OrchestratorServiceState = "idle";
   #start?: Promise<void>;
   #shutdown?: Promise<OrchestratorShutdownReport>;
@@ -94,6 +98,7 @@ export class OrchestratorService {
     registrations: readonly OrchestratorRegistration[],
     signals: ServiceSignalSource = nodeSignals,
     timers: ServiceTimerSource = nodeTimers,
+    events?: OperationalEventReporter,
   ) {
     const ids = new Set<string>();
     this.#registrations = Object.freeze([...registrations].map((registration) => {
@@ -115,6 +120,7 @@ export class OrchestratorService {
     }).sort((left, right) => left.registration.id.localeCompare(right.registration.id)));
     this.#signals = signals;
     this.#timers = timers;
+    this.#events = events;
   }
 
   get state(): OrchestratorServiceState {
@@ -128,6 +134,7 @@ export class OrchestratorService {
     if (this.#start) return this.#start;
     if (this.#state === "draining") return Promise.reject(new Error("Cannot start service while draining"));
     this.#state = "starting";
+    this.#emit({ level: "info", event: "service.starting" });
     try {
       this.#installSignals();
     } catch (error) {
@@ -167,6 +174,7 @@ export class OrchestratorService {
     await Promise.all(this.#registrations.map((registration) => this.#ensureStartup(registration).catch(() => undefined)));
     if (this.#state !== "starting") return;
     this.#state = "running";
+    this.#emit({ level: "info", event: "service.running" });
     await Promise.all(this.#registrations.map((registration) => this.#tickInitializedRegistration(registration)));
     if (this.#state === "running") {
       for (const registration of this.#registrations) this.#schedule(registration);
@@ -187,6 +195,7 @@ export class OrchestratorService {
     if (state.tick) return state.tick;
     const tick = (async (): Promise<RepositoryTickReport> => {
       try {
+        this.#emit({ level: "debug", event: "tick.started", repositoryId: state.registration.id });
         await this.#ensureStartup(state);
         if (isClosedState(this.#state)) {
           throw new Error(`Cannot dispatch ${state.registration.id} while ${this.#state}`);
@@ -197,6 +206,8 @@ export class OrchestratorService {
         }
         const report = await state.registration.scheduler.tick();
         state.lastError = undefined;
+        this.#emit({ level: "info", event: "tick.completed", repositoryId: state.registration.id,
+          data: { dispatchedCount: report.dispatchedTaskIds.length } });
         return Object.freeze({
           repositoryId: state.registration.id,
           outcome: "completed" as const,
@@ -207,6 +218,8 @@ export class OrchestratorService {
         });
       } catch (error) {
         state.lastError = errorMessage(error);
+        this.#emit({ level: "error", event: "tick.failed", repositoryId: state.registration.id,
+          data: { errorCategory: "unexpected" } });
         return Object.freeze({
           repositoryId: state.registration.id,
           outcome: "failed" as const,
@@ -227,6 +240,7 @@ export class OrchestratorService {
     if (state.startup) return state.startup;
     const startup = (async () => {
       try {
+        this.#emit({ level: "info", event: "repository.startup_started", repositoryId: state.registration.id });
         await this.#reloadConfiguration(state);
         await state.registration.scheduler.startup();
         if (this.#state === "draining" || this.#state === "stopped") {
@@ -234,8 +248,11 @@ export class OrchestratorService {
         }
         state.initialized = true;
         state.lastError = undefined;
+        this.#emit({ level: "info", event: "repository.startup_succeeded", repositoryId: state.registration.id });
       } catch (error) {
         state.lastError = errorMessage(error);
+        this.#emit({ level: "error", event: "repository.startup_failed", repositoryId: state.registration.id,
+          data: { errorCategory: "configuration" } });
         throw error;
       }
     })();
@@ -254,11 +271,14 @@ export class OrchestratorService {
         if (this.#state === "running") this.#schedule(state);
       }).catch(() => undefined);
     });
+    this.#emit({ level: "debug", event: "service.timer_scheduled", repositoryId: state.registration.id,
+      data: { pollIntervalMs: state.operationalPolicy.pollIntervalMs } });
   }
 
   async #performShutdown(): Promise<OrchestratorShutdownReport> {
     if (this.#state === "stopped") return Object.freeze({ repositories: Object.freeze([]) });
     this.#state = "draining";
+    this.#emit({ level: "info", event: "service.shutdown_started" });
     this.#removeSignals();
     for (const state of this.#registrations) {
       if (state.timer !== undefined) {
@@ -272,6 +292,9 @@ export class OrchestratorService {
           drainTimeoutMs: state.operationalPolicy.drainTimeoutMs,
           cancellationTimeoutMs: state.operationalPolicy.cancellationTimeoutMs,
         });
+        this.#emit({ level: "info", event: "repository.shutdown_completed", repositoryId: state.registration.id,
+          data: { drained: scheduler.drained, cancelledCount: scheduler.cancelledTaskIds.length,
+            remainingCount: scheduler.remainingTaskIds.length } });
         return Object.freeze({
           repositoryId: state.registration.id,
           outcome: "completed",
@@ -282,11 +305,14 @@ export class OrchestratorService {
           }),
         });
       } catch (error) {
+        this.#emit({ level: "error", event: "repository.shutdown_failed", repositoryId: state.registration.id,
+          data: { errorCategory: "unexpected" } });
         return Object.freeze({ repositoryId: state.registration.id, outcome: "failed", error: errorMessage(error) });
       }
     }));
     this.#state = "stopped";
     this.#stop.resolve();
+    this.#emit({ level: "info", event: "service.shutdown_completed" });
     return Object.freeze({ repositories: Object.freeze(reports) });
   }
 
@@ -294,12 +320,12 @@ export class OrchestratorService {
     if (this.#signalsInstalled) return;
     let interruptInstalled = false;
     try {
-      this.#signals.addListener("SIGINT", this.#signalListener);
+      this.#signals.addListener("SIGINT", this.#interruptListener);
       interruptInstalled = true;
-      this.#signals.addListener("SIGTERM", this.#signalListener);
+      this.#signals.addListener("SIGTERM", this.#terminateListener);
       this.#signalsInstalled = true;
     } catch (error) {
-      if (interruptInstalled) this.#signals.removeListener("SIGINT", this.#signalListener);
+      if (interruptInstalled) this.#signals.removeListener("SIGINT", this.#interruptListener);
       throw error;
     }
   }
@@ -307,18 +333,36 @@ export class OrchestratorService {
   #removeSignals(): void {
     if (!this.#signalsInstalled) return;
     this.#signalsInstalled = false;
-    this.#signals.removeListener("SIGINT", this.#signalListener);
-    this.#signals.removeListener("SIGTERM", this.#signalListener);
+    this.#signals.removeListener("SIGINT", this.#interruptListener);
+    this.#signals.removeListener("SIGTERM", this.#terminateListener);
   }
 
   async #reloadConfiguration(state: RegistrationState): Promise<SchedulerConfigurationReloadReport> {
-    const reload = await state.registration.scheduler.reloadConfiguration();
+    this.#emit({ level: "debug", event: "configuration.reload_started", repositoryId: state.registration.id });
+    let reload: SchedulerConfigurationReloadReport;
+    try { reload = await state.registration.scheduler.reloadConfiguration(); }
+    catch (error) {
+      this.#emit({ level: "error", event: "configuration.reload_failed", repositoryId: state.registration.id,
+        data: { errorCategory: "configuration" } });
+      throw error;
+    }
     validateBound(reload.operationalPolicy.pollIntervalMs, `${state.registration.id}.pollIntervalMs`);
     validateBound(reload.operationalPolicy.drainTimeoutMs, `${state.registration.id}.drainTimeoutMs`);
     validateBound(reload.operationalPolicy.cancellationTimeoutMs, `${state.registration.id}.cancellationTimeoutMs`);
     state.operationalPolicy = Object.freeze({ ...reload.operationalPolicy });
+    const event = reload.status === "installed" ? "configuration.reload_installed"
+      : reload.status === "unchanged" ? "configuration.reload_unchanged" : "configuration.reload_retained";
+    this.#emit({ level: reload.status === "retained" ? "warn" : "info", event,
+      repositoryId: state.registration.id, data: { revision: reload.revision, configurationStatus: reload.status } });
     return reload;
   }
+
+  #onSignal(signal: ServiceSignal): void {
+    this.#emit({ level: "info", event: "service.signal_received", data: { signal } });
+    void this.shutdown().catch(() => undefined);
+  }
+
+  #emit(event: Parameters<typeof emitOperational>[1]): void { emitOperational(this.#events, event); }
 }
 
 interface Deferred<T> {

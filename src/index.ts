@@ -1,4 +1,6 @@
 export * from "./domain/model.ts";
+export * from "./domain/observability.ts";
+export * from "./observability/logging.ts";
 export * from "./providers/provider.ts";
 export * from "./providers/memory/adapter.ts";
 export * from "./providers/vikunja/client.ts";

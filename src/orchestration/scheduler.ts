@@ -16,6 +16,8 @@ import type {
   TaskRefreshResult,
 } from "../providers/provider.ts";
 import type { FailureKind, RepositoryConfiguration, RuntimeResult, Task } from "../domain/model.ts";
+import type { OperationalEvent, OperationalEventReporter } from "../domain/observability.ts";
+import { emitOperational } from "../observability/logging.ts";
 
 export interface ScheduleReport {
   readonly taskId: string;
@@ -61,6 +63,7 @@ export interface SchedulerOptions {
   readonly now?: () => Date;
   readonly lease?: Partial<SchedulerLeasePolicy>;
   readonly timers?: SchedulerTimerSource;
+  readonly events?: OperationalEventReporter;
 }
 
 export interface SchedulerLeasePolicy {
@@ -116,6 +119,8 @@ interface ReconciliationQuarantine {
 
 interface SynchronizationQuarantine {
   readonly taskId: string;
+  readonly repositoryId: string;
+  readonly role: string;
   readonly executionId: string;
   readonly record: ExecutionRecord;
   readonly synchronize: (guard: ExecutionLeaseGuard) => Promise<void>;
@@ -149,6 +154,7 @@ export class Scheduler {
   readonly #now: () => Date;
   readonly #leasePolicy: SchedulerLeasePolicy;
   readonly #timers: SchedulerTimerSource;
+  readonly #events?: OperationalEventReporter;
 
   constructor(provider: ProviderAdapter, executions: TaskExecutionService, options: SchedulerOptions = {}) {
     this.provider = provider;
@@ -156,6 +162,7 @@ export class Scheduler {
     this.#now = options.now ?? (() => new Date());
     this.#leasePolicy = validateLeasePolicy(options.lease);
     this.#timers = options.timers ?? nodeSchedulerTimers;
+    this.#events = options.events;
   }
 
   async reloadConfiguration(): Promise<SchedulerConfigurationReloadReport> {
@@ -180,16 +187,29 @@ export class Scheduler {
 
   async startup(): Promise<SchedulerStartupReport> {
     if (!this.#accepting) throw new Error("Scheduler intake is closed");
-    const discovered = [...await this.provider.discoverTasks({ scope: "workflow_candidates" })].sort(compareCandidates);
-    const validated: string[] = [];
-    for (const candidate of discovered) {
-      if (!this.#accepting) throw new Error("Scheduler intake is closed");
-      const task = await this.provider.getTask(candidate.id);
-      await this.executions.withConfiguration(task, async () => undefined);
-      validated.push(task.id);
+    this.#emit({ level: "info", event: "scheduler.startup_started" });
+    let discovered: Task[];
+    try { discovered = [...await this.provider.discoverTasks({ scope: "workflow_candidates" })].sort(compareCandidates); }
+    catch (error) {
+      this.#emit({ level: "error", event: "scheduler.startup_failed", data: { errorCategory: "provider" } });
+      throw error;
     }
-    await this.#reconcileActiveWork();
-    return Object.freeze({ validatedTaskIds: Object.freeze(validated) });
+    try {
+      const validated: string[] = [];
+      for (const candidate of discovered) {
+        if (!this.#accepting) throw new Error("Scheduler intake is closed");
+        const task = await this.provider.getTask(candidate.id);
+        await this.executions.withConfiguration(task, async () => undefined);
+        validated.push(task.id);
+      }
+      await this.#reconcileActiveWork();
+      this.#emit({ level: "info", event: "scheduler.startup_completed",
+        data: { candidateCount: discovered.length, validatedCount: validated.length } });
+      return Object.freeze({ validatedTaskIds: Object.freeze(validated) });
+    } catch (error) {
+      this.#emit({ level: "error", event: "scheduler.startup_failed", data: { errorCategory: "configuration" } });
+      throw error;
+    }
   }
 
   async tick(): Promise<SchedulerTickReport> {
@@ -233,17 +253,34 @@ export class Scheduler {
 
   async #dispatchTick(): Promise<readonly DispatchEntry[]> {
     if (!this.#accepting) return Object.freeze([]);
-    const reconciledTaskIds = await this.#reconcileActiveWork();
+    this.#emit({ level: "debug", event: "scheduler.tick_started" });
+    let reconciledTaskIds: ReadonlySet<string>;
+    try { reconciledTaskIds = await this.#reconcileActiveWork(); }
+    catch (error) {
+      this.#emit({ level: "error", event: "scheduler.tick_failed", data: { errorCategory: "provider" } });
+      throw error;
+    }
     if (!this.#accepting) return Object.freeze([]);
-    const tasks = await this.provider.discoverTasks({ scope: "workflow_candidates" });
+    let tasks: readonly Task[];
+    try { tasks = await this.provider.discoverTasks({ scope: "workflow_candidates" }); }
+    catch (error) {
+      this.#emit({ level: "error", event: "scheduler.tick_failed", data: { errorCategory: "provider" } });
+      throw error;
+    }
     const entries: DispatchEntry[] = [];
     for (const discovered of [...tasks].sort(compareCandidates)) {
+      this.#emitForTask(discovered, { level: "debug", event: "candidate.discovered" });
       if (!this.#accepting) break;
       if (reconciledTaskIds.has(discovered.id) || this.#workers.has(discovered.id)
-        || this.#quarantines.has(discovered.id) || this.#synchronizations.has(discovered.id)) continue;
+        || this.#quarantines.has(discovered.id) || this.#synchronizations.has(discovered.id)) {
+        this.#emitForTask(discovered, { level: "debug", event: "candidate.skipped", data: { reason: "active" } });
+        continue;
+      }
       const entry = await this.#dispatchCandidate(discovered);
       if (entry) entries.push(entry);
     }
+    this.#emit({ level: "info", event: "scheduler.tick_completed", data: { candidateCount: tasks.length,
+      dispatchedCount: entries.filter((entry) => entry.dispatched).length, workerCount: this.#workers.size } });
     return entries;
   }
 
@@ -259,7 +296,11 @@ export class Scheduler {
     try {
       return await this.executions.withConfiguration(task, async (execution) => {
         if (!this.#accepting || this.#workers.has(task.id) || this.#quarantines.has(task.id) || this.#synchronizations.has(task.id)
-          || !this.#hasCapacity(execution.configuration, task.status)) return undefined;
+          || !this.#hasCapacity(execution.configuration, task.status)) {
+          this.#emitForTask(task, { level: "debug", event: "candidate.capacity_rejected", data: { reason: "capacity" } });
+          return undefined;
+        }
+        this.#emitForTask(task, { level: "debug", event: "candidate.eligible" });
         return this.#reserveAndDispatch(task, execution);
       });
     } catch (error) {
@@ -312,27 +353,34 @@ export class Scheduler {
         }
       }
       if (task.dispatchable === false && !state.active) {
+        this.#emitForTask(task, { level: "debug", event: "candidate.skipped", data: { reason: "ineligible" } });
         this.#release(reservation);
         completion.resolve(undefined);
         return entry(false);
       }
       if (!state.active && !isEligible(task, state, selectedRole, execution.configuration, this.#nowEpoch())) {
+        this.#emitForTask(task, { level: "debug", event: "retry.deferred", role: selectedRole, data: { reason: "not_due" } });
         this.#release(reservation);
         completion.resolve(undefined);
         return entry(false);
       }
 
-      const active = await this.provider.beginExecution(
-        task.id,
-        selectedRole,
-        execution.configuration.runningStatus,
-        this.#leaseClaim(state.active),
-      );
+      this.#emitForTask(task, { level: "debug", event: "claim.started", role: selectedRole });
+      let active: ActiveExecution;
+      try {
+        active = await this.provider.beginExecution(task.id, selectedRole, execution.configuration.runningStatus,
+          this.#leaseClaim(state.active));
+      } catch (error) {
+        if (!(error instanceof ProviderClaimConflict)) this.#emitForTask(task, { level: "error",
+          event: "claim.failed", role: selectedRole, data: { errorCategory: "provider" } });
+        throw error;
+      }
       executionId = active.id;
       roleName = active.role;
       reservation.executionId = active.id;
       reservation.role = active.role;
       reservation.lease = this.#startLease(reservation, active);
+      this.#emitForTask(task, { level: "info", event: "claim.succeeded", role: active.role, executionId: active.id });
       if (!state.active) reservation.status = execution.configuration.runningStatus;
       const reason = state.active ? reconciliationReason(task, execution.configuration) : undefined;
       if (reason) {
@@ -351,6 +399,7 @@ export class Scheduler {
       this.#assertLeaseOwned(reservation);
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       failureKind = "startup";
+      this.#emitForTask(task, { level: "info", event: "dispatch.started", role: active.role, executionId: active.id });
       const running = await execution.withEnvironment((environment) => environment.start({
         task,
         role,
@@ -359,6 +408,7 @@ export class Scheduler {
         executionId: active.id,
       }));
       reservation.running = running;
+      this.#emitForTask(task, { level: "info", event: "dispatch.runtime_started", role: active.role, executionId: active.id });
       if (reservation.lease.lost) void running.cancel("lease_lost").catch(() => undefined);
       if (!this.#accepting) {
         void running.cancel("shutdown").catch(() => undefined);
@@ -377,6 +427,8 @@ export class Scheduler {
       return entry(this.#accepting);
     } catch (error) {
       if (error instanceof ProviderClaimConflict) {
+        this.#emitForTask(task, { level: "warn", event: "claim.conflict", role: roleName,
+          ...(executionId ? { executionId } : {}), data: { errorCategory: "claim_conflict" } });
         this.#release(reservation);
         completion.resolve(undefined);
         return entry(false);
@@ -390,6 +442,8 @@ export class Scheduler {
         failureKind,
         error,
       );
+      this.#emitForTask(task, { level: "error", event: "dispatch.failed", role: roleName,
+        ...(executionId ? { executionId } : {}), data: { failureKind, errorCategory: schedulerErrorCategory(failureKind) } });
       this.#release(reservation);
       completion.resolve(report);
       return entry(false);
@@ -408,7 +462,10 @@ export class Scheduler {
       const report = await running.result;
       if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
       this.#assertLeaseOwned(reservation);
-      return await this.#synchronizeResult(task, reservation, roleName, executionId, report.result);
+      const synchronized = await this.#synchronizeResult(task, reservation, roleName, executionId, report.result);
+      this.#emitForTask(task, { level: "info", event: "dispatch.completed", role: roleName, executionId,
+        data: { success: true } });
+      return synchronized;
     } catch (error) {
       if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
       if (reservation.lease?.lost || (error instanceof ExecutionCancelledError && error.reason === "lease_lost")) {
@@ -448,6 +505,13 @@ export class Scheduler {
         configuration,
         this.#nowDate(),
       );
+      this.#emitForTask(task, record.failure?.retryable && record.failure.nextAttemptAt ? {
+        level: "warn", event: "retry.scheduled", role: roleName, executionId,
+        data: { failureKind: kind, retryable: true, retryAt: record.failure.nextAttemptAt },
+      } : {
+        level: "warn", event: "retry.suppressed", role: roleName, executionId,
+        data: { failureKind: kind, retryable: false },
+      });
       const comment = `Ensemble execution failed: ${message}`;
       const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.provider.failExecution(
         task.id,
@@ -458,10 +522,19 @@ export class Scheduler {
         comment,
       );
       try {
+        this.#emitForTask(task, { level: "debug", event: "synchronization.started", role: roleName, executionId });
         await this.#withLeaseGuard(reservation.lease, synchronize);
+        this.#emitForTask(task, { level: "info", event: "synchronization.completed", role: roleName, executionId });
       } catch (synchronizationError) {
-        if (synchronizationError instanceof ProviderClaimConflict) this.#loseLease(reservation.lease, synchronizationError);
-        else this.#registerSynchronization(task.id, executionId, record, synchronize, reservation.lease, synchronizationError);
+        if (synchronizationError instanceof ProviderClaimConflict) {
+          this.#emitForTask(task, { level: "error", event: "synchronization.conflict", role: roleName, executionId,
+            data: { errorCategory: "claim_conflict" } });
+          this.#loseLease(reservation.lease, synchronizationError);
+        } else {
+          this.#emitForTask(task, { level: "error", event: "synchronization.failed", role: roleName, executionId,
+            data: { errorCategory: "synchronization" } });
+          this.#registerSynchronization(task, roleName, executionId, record, synchronize, reservation.lease, synchronizationError);
+        }
         reportError = synchronizationError;
       }
     }
@@ -469,22 +542,28 @@ export class Scheduler {
   }
 
   #registerSynchronization(
-    taskId: string,
+    task: Task,
+    role: string,
     executionId: string,
     record: ExecutionRecord,
     synchronize: (guard: ExecutionLeaseGuard) => Promise<void>,
     lease: LeaseController,
     error: unknown,
   ): void {
-    if (this.#synchronizations.has(taskId)) return;
-    this.#synchronizations.set(taskId, {
-      taskId,
+    if (this.#synchronizations.has(task.id)) return;
+    this.#synchronizations.set(task.id, {
+      taskId: task.id,
+      repositoryId: task.repository.id,
+      role,
       executionId,
       record,
       synchronize,
       lease,
       lastError: errorMessage(error),
     });
+    this.#emit({ level: "warn", event: "synchronization.quarantined", repositoryId: task.repository.id,
+      taskId: task.id, role, executionId,
+      data: { errorCategory: "synchronization" } });
     lease.reservation.leaseTransferred = true;
   }
 
@@ -506,6 +585,7 @@ export class Scheduler {
 
   async shutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport> {
     this.#accepting = false;
+    this.#emit({ level: "info", event: "scheduler.shutdown_started", data: { workerCount: this.#workers.size } });
     this.#shutdown ??= this.#performShutdown(options);
     return this.#shutdown;
   }
@@ -513,11 +593,16 @@ export class Scheduler {
   async #performShutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport> {
     if (this.#workers.size === 0 && this.#quarantines.size === 0 && this.#synchronizations.size === 0
       && this.#tickInProgress === undefined) {
-      return Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
+      const report = Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
+      this.#emit({ level: "info", event: "scheduler.shutdown_completed", data: { drained: true, cancelledCount: 0, remainingCount: 0 } });
+      return report;
     }
     const drained = await waitWithin(this.#waitForIdle(), options.drainTimeoutMs);
+    this.#emit({ level: "debug", event: "scheduler.shutdown_draining", data: { drained, workerCount: this.#workers.size } });
     if (drained) {
-      return Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
+      const report = Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
+      this.#emit({ level: "info", event: "scheduler.shutdown_completed", data: { drained: true, cancelledCount: 0, remainingCount: 0 } });
+      return report;
     }
 
     const cancelledTaskIds = [...new Set([
@@ -526,6 +611,7 @@ export class Scheduler {
         .map((reservation) => reservation.taskId),
       ...this.#quarantines.keys(),
     ])].sort();
+    this.#emit({ level: "warn", event: "scheduler.shutdown_cancelling", data: { cancelledCount: cancelledTaskIds.length } });
     for (const reservation of this.#workers.values()) {
       if (!reservation.reconciliation && reservation.executionId && reservation.role) {
         void this.#recordCancellation(
@@ -547,7 +633,7 @@ export class Scheduler {
     }
     await waitWithin(this.#waitForIdle(), options.cancellationTimeoutMs);
     for (const synchronization of [...this.#synchronizations.values()]) this.#dropSynchronization(synchronization);
-    return Object.freeze({
+    const report = Object.freeze({
       drained: this.#workers.size === 0 && this.#quarantines.size === 0 && this.#synchronizations.size === 0
         && this.#tickInProgress === undefined,
       cancelledTaskIds: Object.freeze(cancelledTaskIds),
@@ -557,6 +643,9 @@ export class Scheduler {
         ...this.#synchronizations.keys(),
       ])].sort()),
     });
+    this.#emit({ level: "info", event: "scheduler.shutdown_completed", data: { drained: report.drained,
+      cancelledCount: report.cancelledTaskIds.length, remainingCount: report.remainingTaskIds.length } });
+    return report;
   }
 
   #waitForIdle(): Promise<void> {
@@ -579,11 +668,24 @@ export class Scheduler {
       ...this.#synchronizations.keys(),
     ])].sort();
     const excluded = new Set([...this.#quarantines.keys(), ...this.#synchronizations.keys()]);
-    if (taskIds.length === 0) return excluded;
-    const refreshed = await this.provider.refreshTasks(taskIds);
+    this.#emit({ level: "debug", event: "reconciliation.started", data: { candidateCount: taskIds.length } });
+    if (taskIds.length === 0) {
+      this.#emit({ level: "debug", event: "reconciliation.completed", data: { candidateCount: 0 } });
+      return excluded;
+    }
+    let refreshed: ReadonlyMap<string, TaskRefreshResult>;
+    try { refreshed = await this.provider.refreshTasks(taskIds); }
+    catch (error) {
+      this.#emit({ level: "error", event: "reconciliation.failed", data: { errorCategory: "provider" } });
+      throw error;
+    }
     for (const taskId of taskIds) {
       const result = refreshed.get(taskId);
-      if (!result || result.kind === "unreadable") continue;
+      if (!result || result.kind === "unreadable") {
+        this.#emit({ level: "warn", event: "reconciliation.refresh_unreadable", taskId,
+          data: { errorCategory: "provider" } });
+        continue;
+      }
       const synchronization = this.#synchronizations.get(taskId);
       if (synchronization) {
         this.#reconcileSynchronization(synchronization, result);
@@ -613,6 +715,7 @@ export class Scheduler {
         excluded.add(taskId);
       }
     }
+    this.#emit({ level: "debug", event: "reconciliation.completed", data: { candidateCount: taskIds.length } });
     return excluded;
   }
 
@@ -642,28 +745,48 @@ export class Scheduler {
       state = await this.provider.getExecutionState(synchronization.taskId);
     } catch (error) {
       synchronization.lastError = errorMessage(error);
+      this.#emit({ level: "error", event: "synchronization.failed", taskId: synchronization.taskId,
+        repositoryId: synchronization.repositoryId, role: synchronization.role,
+        executionId: synchronization.executionId, data: { errorCategory: "provider" } });
       return;
     }
     const existing = state.history.find((record) => record.id === synchronization.executionId);
     if (existing && !sameExecutionRecord(existing, synchronization.record)) {
       synchronization.lastError = `Conflicting durable execution record: ${synchronization.executionId}`;
+      this.#emit({ level: "error", event: "synchronization.conflict", taskId: synchronization.taskId,
+        repositoryId: synchronization.repositoryId, role: synchronization.role,
+        executionId: synchronization.executionId, data: { errorCategory: "synchronization" } });
       return;
     }
     if (!existing && state.active?.id !== synchronization.executionId) {
       synchronization.lastError = `Execution is neither active nor durably synchronized: ${synchronization.executionId}`;
+      this.#emit({ level: "error", event: "synchronization.failed", taskId: synchronization.taskId,
+        repositoryId: synchronization.repositoryId, role: synchronization.role,
+        executionId: synchronization.executionId, data: { errorCategory: "synchronization" } });
       return;
     }
 
+    this.#emit({ level: "info", event: "synchronization.retry_started", taskId: synchronization.taskId,
+      repositoryId: synchronization.repositoryId, role: synchronization.role, executionId: synchronization.executionId });
     let attempt!: Promise<void>;
     attempt = this.#withLeaseGuard(synchronization.lease, synchronization.synchronize).then(
       () => {
+        this.#emit({ level: "info", event: "synchronization.retry_completed", taskId: synchronization.taskId,
+          repositoryId: synchronization.repositoryId, role: synchronization.role, executionId: synchronization.executionId });
         this.#dropSynchronization(synchronization);
       },
       (error: unknown) => {
         synchronization.lastError = errorMessage(error);
         if (error instanceof ProviderClaimConflict) {
+          this.#emit({ level: "error", event: "synchronization.conflict", taskId: synchronization.taskId,
+            repositoryId: synchronization.repositoryId, role: synchronization.role,
+            executionId: synchronization.executionId, data: { errorCategory: "claim_conflict" } });
           this.#loseLease(synchronization.lease, error);
           this.#dropSynchronization(synchronization);
+        } else {
+          this.#emit({ level: "error", event: "synchronization.failed", taskId: synchronization.taskId,
+            repositoryId: synchronization.repositoryId, role: synchronization.role,
+            executionId: synchronization.executionId, data: { errorCategory: "synchronization" } });
         }
       },
     ).finally(() => {
@@ -725,6 +848,9 @@ export class Scheduler {
       localSettled: reservation.running === undefined,
     };
     reservation.reconciliation = quarantine;
+    this.#emit({ level: "warn", event: "reconciliation.cancellation_started",
+      repositoryId: reservation.configuration.repository.id, taskId: reservation.taskId,
+      role: reservation.role, executionId: reservation.executionId, data: { reason: "ineligible" } });
     this.#quarantines.set(reservation.taskId, quarantine);
 
     if (persist && status !== undefined) void this.#attemptReconciliationPersistence(quarantine, status);
@@ -741,6 +867,9 @@ export class Scheduler {
     );
     void Promise.race([resultSettled, cancellationSettled]).then(() => {
       quarantine.localSettled = true;
+      this.#emit({ level: "info", event: "reconciliation.local_settled",
+        repositoryId: quarantine.configuration.repository.id, taskId: quarantine.taskId,
+        role: quarantine.role, executionId: quarantine.executionId });
       this.#maybeClearQuarantine(quarantine);
     });
   }
@@ -748,11 +877,16 @@ export class Scheduler {
   async #attemptReconciliationPersistence(quarantine: ReconciliationQuarantine, status: string): Promise<void> {
     if (quarantine.durableSettled) return;
     if (quarantine.providerAttempt) return quarantine.providerAttempt;
+    const retrying = quarantine.lastReport !== undefined;
+    this.#emit({ level: "debug", event: retrying ? "synchronization.retry_started" : "synchronization.started",
+      repositoryId: quarantine.configuration.repository.id, taskId: quarantine.taskId,
+      role: quarantine.role, executionId: quarantine.executionId });
     let attempt!: Promise<void>;
     attempt = this.#persistCancellation(
       quarantine.taskId,
       quarantine.role,
       quarantine.executionId,
+      quarantine.configuration.repository.id,
       "reconciliation",
       status,
       quarantine.summary,
@@ -761,9 +895,19 @@ export class Scheduler {
       (report) => {
         quarantine.lastReport = report;
         quarantine.durableSettled = true;
+        if (retrying) this.#emit({ level: "info", event: "synchronization.retry_completed",
+          repositoryId: quarantine.configuration.repository.id, taskId: quarantine.taskId,
+          role: quarantine.role, executionId: quarantine.executionId });
+        this.#emit({ level: "info", event: "reconciliation.durable_settled", taskId: quarantine.taskId,
+          repositoryId: quarantine.configuration.repository.id, role: quarantine.role, executionId: quarantine.executionId });
       },
       (error: unknown) => {
         quarantine.lastReport = failureReport(quarantine.taskId, quarantine.role, error);
+        this.#emit({ level: error instanceof ProviderClaimConflict ? "error" : "warn",
+          event: error instanceof ProviderClaimConflict ? "synchronization.conflict" : "synchronization.failed",
+          repositoryId: quarantine.configuration.repository.id, taskId: quarantine.taskId,
+          role: quarantine.role, executionId: quarantine.executionId,
+          data: { errorCategory: error instanceof ProviderClaimConflict ? "claim_conflict" : "synchronization" } });
         if (error instanceof ProviderClaimConflict || quarantine.lease.lost) quarantine.durableSettled = true;
       },
     ).finally(() => {
@@ -812,16 +956,23 @@ export class Scheduler {
     const configuration = reservation.configuration;
     const summary = "Ensemble execution cancelled during shutdown";
     try {
+      this.#emit({ level: "debug", event: "synchronization.started", repositoryId: configuration.repository.id,
+        taskId, role: roleName, executionId });
       return await this.#persistCancellation(
         taskId,
         roleName,
         executionId,
+        configuration.repository.id,
         "shutdown",
         configuration.failedStatus,
         summary,
         reservation.lease!,
       );
     } catch (error) {
+      this.#emit({ level: error instanceof ProviderClaimConflict ? "error" : "warn",
+        event: error instanceof ProviderClaimConflict ? "synchronization.conflict" : "synchronization.failed",
+        repositoryId: configuration.repository.id, taskId, role: roleName, executionId,
+        data: { errorCategory: error instanceof ProviderClaimConflict ? "claim_conflict" : "synchronization" } });
       return failureReport(taskId, roleName, error);
     }
   }
@@ -830,6 +981,7 @@ export class Scheduler {
     taskId: string,
     roleName: string,
     executionId: string,
+    repositoryId: string,
     kind: "reconciliation" | "shutdown",
     status: string,
     summary: string,
@@ -842,6 +994,7 @@ export class Scheduler {
       }, status, comment: summary,
     };
     await this.#withLeaseGuard(lease, (guard) => this.provider.cancelExecution(taskId, executionId, guard, cancellation));
+    this.#emit({ level: "info", event: "synchronization.completed", repositoryId, taskId, role: roleName, executionId });
     return { taskId, outcome: "failed", role: roleName, error: summary };
   }
 
@@ -875,10 +1028,19 @@ export class Scheduler {
     const lease = reservation.lease!;
     const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.provider.completeExecution(task.id, executionId, guard, completion);
     try {
+      this.#emitForTask(task, { level: "debug", event: "synchronization.started", role, executionId });
       await this.#withLeaseGuard(lease, synchronize);
+      this.#emitForTask(task, { level: "info", event: "synchronization.completed", role, executionId });
     } catch (error) {
-      if (error instanceof ProviderClaimConflict) this.#loseLease(lease, error);
-      else this.#registerSynchronization(task.id, executionId, record, synchronize, lease, error);
+      if (error instanceof ProviderClaimConflict) {
+        this.#emitForTask(task, { level: "error", event: "synchronization.conflict", role, executionId,
+          data: { errorCategory: "claim_conflict" } });
+        this.#loseLease(lease, error);
+      } else {
+        this.#emitForTask(task, { level: "error", event: "synchronization.failed", role, executionId,
+          data: { errorCategory: "synchronization" } });
+        this.#registerSynchronization(task, role, executionId, record, synchronize, lease, error);
+      }
       return failureReport(task.id, role, error);
     }
     return {
@@ -973,6 +1135,10 @@ export class Scheduler {
   #loseLease(lease: LeaseController, cause: unknown): void {
     if (lease.lost) return;
     lease.lost = cause instanceof Error ? cause : new Error(errorMessage(cause));
+    this.#emit({ level: "error", event: "lease.lost", taskId: lease.reservation.taskId,
+      ...(lease.reservation.role ? { role: lease.reservation.role } : {}),
+      ...(lease.reservation.executionId ? { executionId: lease.reservation.executionId } : {}),
+      data: { errorCategory: "provider" } });
     this.#stopLease(lease);
     const running = lease.reservation.running;
     if (running) {
@@ -999,6 +1165,23 @@ export class Scheduler {
     this.#stopLease(synchronization.lease);
     this.#notifyIdle();
   }
+
+  #emit(event: Omit<OperationalEvent, "provider">): void {
+    emitOperational(this.#events, { ...event, provider: this.provider.name });
+  }
+
+  #emitForTask(task: Task, event: Omit<OperationalEvent, "provider" | "repositoryId" | "taskId">): void {
+    this.#emit({ ...event, repositoryId: task.repository.id, taskId: task.id });
+  }
+}
+
+function schedulerErrorCategory(kind: FailureKind): "configuration" | "provider" | "runtime" | "timeout" | "stalled" | "unexpected" {
+  if (kind === "configuration") return "configuration";
+  if (kind === "provider") return "provider";
+  if (kind === "runtime") return "runtime";
+  if (kind === "timeout") return "timeout";
+  if (kind === "stalled") return "stalled";
+  return "unexpected";
 }
 
 function compareCandidates(left: Task, right: Task): number {

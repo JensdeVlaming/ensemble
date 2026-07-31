@@ -10,6 +10,7 @@ import type {
   ConfiguredExecution,
   ExecutionEnvironment,
   ExecutionReport,
+  OperationalEvent,
   ProviderAdapter,
   RepositoryConfiguration,
   RunningExecution,
@@ -428,14 +429,59 @@ test("shutdown drains naturally, closes intake, and cancels live workers after t
 
   const forcedExecutions = new ControlledExecutions(configuration(1));
   const forcedProvider = new InMemoryProvider([task("forced")]);
-  const forced = new Scheduler(forcedProvider, forcedExecutions);
+  const operationalEvents: OperationalEvent[] = [];
+  const forced = new Scheduler(forcedProvider, forcedExecutions, {
+    events: { emit: (event) => { operationalEvents.push(event); } },
+  });
   assert.deepEqual((await forced.tick()).dispatchedTaskIds, ["forced"]);
   const forcedReport = await forced.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 100 });
   assert.deepEqual(forcedExecutions.cancelled, ["forced"]);
   assert.deepEqual(forcedReport, { drained: true, cancelledTaskIds: ["forced"], remainingTaskIds: [] });
   const forcedState = await forcedProvider.getExecutionState("forced");
   assert.deepEqual(forcedState.history.at(-1)?.failure, { kind: "shutdown", retryable: false });
+  for (const event of ["synchronization.started", "synchronization.completed"] as const) {
+    const item = operationalEvents.find((candidate) => candidate.event === event && candidate.taskId === "forced");
+    assert.equal(item?.provider, "memory", event);
+    assert.equal(item?.repositoryId, "concurrency", event);
+    assert.equal(item?.role, "implementation", event);
+    assert.ok(item?.executionId, event);
+  }
   assert.deepEqual((await forced.tick()).dispatchedTaskIds, []);
+});
+
+test("shutdown synchronization failures and conflicts retain every available correlation", async () => {
+  for (const expected of ["synchronization.failed", "synchronization.conflict"] as const) {
+    const taskId = expected === "synchronization.failed" ? "shutdown-failure" : "shutdown-conflict";
+    const delegate = new InMemoryProvider([task(taskId)]);
+    const provider = new Proxy(delegate, {
+      get(target, property, receiver) {
+        if (property === "cancelExecution") {
+          return async () => {
+            if (expected === "synchronization.failed") throw new Error("provider unavailable");
+            throw new ProviderClaimConflict(taskId, {
+              id: "other", role: "implementation", startedAt: "2026-07-31T00:00:00.000Z",
+            });
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as ProviderAdapter;
+    const executions = new ControlledExecutions(configuration(1));
+    const operationalEvents: OperationalEvent[] = [];
+    const scheduler = new Scheduler(provider, executions, {
+      events: { emit: (event) => { operationalEvents.push(event); } },
+    });
+
+    assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, [taskId]);
+    const report = await scheduler.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 100 });
+    assert.deepEqual(report, { drained: true, cancelledTaskIds: [taskId], remainingTaskIds: [] });
+    const item = operationalEvents.find((candidate) => candidate.event === expected && candidate.taskId === taskId);
+    assert.equal(item?.provider, "memory", expected);
+    assert.equal(item?.repositoryId, "concurrency", expected);
+    assert.equal(item?.role, "implementation", expected);
+    assert.ok(item?.executionId, expected);
+  }
 });
 
 test("shutdown remains bounded when cancellation and result channels do not cooperate", async () => {

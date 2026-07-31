@@ -137,7 +137,7 @@ export class VikunjaProvider implements ProviderAdapter {
   #labelIds?: ReadonlyMap<string, number>;
 
   constructor(options: VikunjaProviderOptions) {
-    this.client = new VikunjaClient(options);
+    this.client = new VikunjaClient({ ...options, repositoryId: options.repository.id });
     this.projectId = positiveInteger(options.projectId, "projectId");
     this.viewId = positiveInteger(options.viewId, "viewId");
     this.repository = Object.freeze({ ...options.repository });

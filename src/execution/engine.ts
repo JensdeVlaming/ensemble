@@ -8,6 +8,8 @@ import type {
 } from "./repository.ts";
 import type { Runtime, RuntimeEvent, RuntimeRegistry, RuntimeSession } from "../runtimes/runtime.ts";
 import type { WorkspaceManager } from "./workspace.ts";
+import type { OperationalEvent, OperationalEventReporter } from "../domain/observability.ts";
+import { emitOperational } from "../observability/logging.ts";
 
 export type { ConfigurationResolver } from "./repository.ts";
 
@@ -102,6 +104,7 @@ export class ExecutionEngine implements TaskExecutionService {
   readonly events: EventSink;
   readonly failureDrainMs: number;
   readonly now: () => string;
+  readonly operationalEvents?: OperationalEventReporter;
 
   constructor(
     runtimes: RuntimeRegistry,
@@ -110,6 +113,7 @@ export class ExecutionEngine implements TaskExecutionService {
     events: EventSink = () => undefined,
     failureDrainMs = 100,
     now: () => string = () => new Date().toISOString(),
+    operationalEvents?: OperationalEventReporter,
   ) {
     this.runtimes = runtimes;
     this.workspaces = workspaces;
@@ -117,6 +121,7 @@ export class ExecutionEngine implements TaskExecutionService {
     this.events = events;
     this.failureDrainMs = failureDrainMs;
     this.now = now;
+    this.operationalEvents = operationalEvents;
   }
 
   reloadConfiguration(): Promise<ConfigurationReloadResult> {
@@ -127,7 +132,15 @@ export class ExecutionEngine implements TaskExecutionService {
   }
 
   async withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
-    const configuration = await this.configurations.resolve(task);
+    this.#emit(task, { level: "debug", event: "configuration.resolve_started" });
+    let configuration: RepositoryConfiguration;
+    try {
+      configuration = await this.configurations.resolve(task);
+      this.#emit(task, { level: "info", event: "configuration.resolve_completed" });
+    } catch (error) {
+      this.#emit(task, { level: "error", event: "configuration.resolve_failed", data: { errorCategory: "configuration" } });
+      throw error;
+    }
     let open = true;
     let used = false;
     const execution: ConfiguredExecution = Object.freeze({
@@ -160,7 +173,14 @@ export class ExecutionEngine implements TaskExecutionService {
     let used = false;
     let cleanupTransferred = false;
     try {
-      workspace = (await this.workspaces.restore(task)) ?? (await this.workspaces.create(task));
+      this.#emit(task, { level: "debug", event: "workspace.restore_started" });
+      workspace = await this.workspaces.restore(task);
+      if (workspace) this.#emit(task, { level: "info", event: "workspace.restored", data: { restored: true } });
+      else {
+        this.#emit(task, { level: "debug", event: "workspace.create_started" });
+        workspace = await this.workspaces.create(task);
+        this.#emit(task, { level: "info", event: "workspace.created", data: { restored: false } });
+      }
       const environment: ExecutionEnvironment = Object.freeze({
         configuration,
         start: async (request: RuntimeExecutionRequest) => {
@@ -172,12 +192,15 @@ export class ExecutionEngine implements TaskExecutionService {
         },
       });
       return await work(environment);
+    } catch (error) {
+      if (!workspace) this.#emit(task, { level: "error", event: "workspace.allocation_failed", data: { errorCategory: "unexpected" } });
+      throw error;
     } finally {
       open = false;
       if (workspace && !cleanupTransferred) {
         // Workspace disposal is best-effort. Cleanup must never replace a
         // scheduling, provider, event-stream, or runtime outcome.
-        await this.workspaces.cleanup(workspace).catch(() => undefined);
+        await this.#cleanup(task, workspace).catch(() => undefined);
       }
     }
   }
@@ -185,6 +208,7 @@ export class ExecutionEngine implements TaskExecutionService {
   async #start(workspace: Workspace, configuration: RepositoryConfiguration, request: RuntimeExecutionRequest): Promise<RunningExecution> {
     try {
       const runtime = this.runtimes.get(configuration.runtime.name);
+      this.#emit(request.task, contextEvent(request, "runtime.prepare_started", "debug"));
       const prepared = await runtime.prepare({
         repository: request.task.repository,
         workspace,
@@ -196,8 +220,11 @@ export class ExecutionEngine implements TaskExecutionService {
         role: request.role,
         runtimeConfig: configuration.runtime.config,
       });
+      this.#emit(request.task, contextEvent(request, "runtime.prepared", "info"));
       const startedAt = this.now();
+      this.#emit(request.task, contextEvent(request, "runtime.start_started", "debug"));
       const session = await runtime.start(prepared);
+      this.#emit(request.task, contextEvent(request, "runtime.started", "info"));
       return new LiveRunningExecution({
         runtime,
         session,
@@ -208,12 +235,29 @@ export class ExecutionEngine implements TaskExecutionService {
         failureDrainMs: this.failureDrainMs,
         startedAt,
         now: this.now,
-        cleanup: () => this.workspaces.cleanup(workspace),
+        operationalEvents: this.operationalEvents,
+        cleanup: () => this.#cleanup(request.task, workspace),
       });
     } catch (error) {
-      beginBestEffortCleanup(() => this.workspaces.cleanup(workspace));
+      this.#emit(request.task, { ...contextEvent(request, "runtime.failed", "error"), data: { errorCategory: "runtime" } });
+      beginBestEffortCleanup(() => this.#cleanup(request.task, workspace));
       throw error;
     }
+  }
+
+  async #cleanup(task: Task, workspace: Workspace): Promise<void> {
+    this.#emit(task, { level: "debug", event: "workspace.cleanup_started" });
+    try {
+      await this.workspaces.cleanup(workspace);
+      this.#emit(task, { level: "info", event: "workspace.cleanup_completed" });
+    } catch (error) {
+      this.#emit(task, { level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "cleanup" } });
+      throw error;
+    }
+  }
+
+  #emit(task: Task, event: Omit<OperationalEvent, "repositoryId" | "taskId">): void {
+    emitOperational(this.operationalEvents, { ...event, repositoryId: task.repository.id, taskId: task.id });
   }
 }
 
@@ -236,6 +280,7 @@ interface LiveRunningExecutionOptions {
   readonly startedAt: string;
   readonly now: () => string;
   readonly cleanup: () => Promise<void>;
+  readonly operationalEvents?: OperationalEventReporter;
 }
 
 class LiveRunningExecution implements RunningExecution {
@@ -304,17 +349,21 @@ class LiveRunningExecution implements RunningExecution {
   cancel(reason: CancellationReason): Promise<void> {
     if (isTerminal(this.#state)) return Promise.resolve();
     if (!this.#cancellationReason) {
+      this.#emit("runtime.cancellation_started", "info", { reason });
       this.#cancellationReason = reason;
       this.#state = "cancelling";
       this.#resolveCancellation(reason);
     }
-    this.#cancelCompletion ??= Promise.all([this.#cancelRuntimeBounded(), this.#terminal]).then(() => undefined);
+    this.#cancelCompletion ??= Promise.all([this.#cancelRuntimeBounded(), this.#terminal]).then(() => {
+      this.#emit("runtime.cancellation_completed", "info", { reason: this.#cancellationReason ?? reason });
+    });
     return this.#cancelCompletion;
   }
 
   async #pumpEvents(): Promise<void> {
     for await (const event of this.#options.session.events) {
       if (isActivityEvent(event)) this.#lastActivityAt = this.#options.now();
+      this.#emit("runtime.event", "debug", runtimeEventData(event));
       await this.#options.events(event, this.#options.request.task);
     }
   }
@@ -385,7 +434,15 @@ class LiveRunningExecution implements RunningExecution {
     this.#state = state;
     this.#finishedAt = this.#options.now();
     this.#beginCleanup();
+    this.#emit(state === "completed" ? "runtime.completed" : "runtime.failed", state === "completed" ? "info" : "error",
+      state === "completed" ? { success: true } : { errorCategory: state === "cancelled" ? "cancelled" : "runtime" });
     this.#resolveTerminal();
+  }
+
+  #emit(event: OperationalEvent["event"], level: OperationalEvent["level"], data?: OperationalEvent["data"]): void {
+    const request = this.#options.request;
+    emitOperational(this.#options.operationalEvents, { level, event, repositoryId: request.task.repository.id,
+      taskId: request.task.id, role: request.role.name, executionId: request.executionId, ...(data ? { data } : {}) });
   }
 
   #beginCleanup(): void {
@@ -401,6 +458,24 @@ function isTerminal(state: RunningExecutionState): boolean {
 
 function isActivityEvent(event: RuntimeEvent): boolean {
   return event.type !== "run_started" && event.type !== "run_completed" && event.type !== "run_failed";
+}
+
+function contextEvent(
+  request: RuntimeExecutionRequest,
+  event: OperationalEvent["event"],
+  level: OperationalEvent["level"],
+): Omit<OperationalEvent, "repositoryId" | "taskId"> {
+  return { level, event, role: request.role.name, executionId: request.executionId };
+}
+
+function runtimeEventData(event: RuntimeEvent): OperationalEvent["data"] {
+  if (event.type === "tool_finished" || event.type === "validation_finished") {
+    return { runtimeEventType: event.type, success: event.success };
+  }
+  if (event.type === "progress_updated" && event.percent !== undefined) {
+    return { runtimeEventType: event.type, status: "active" };
+  }
+  return { runtimeEventType: event.type };
 }
 
 function beginBestEffortCleanup(cleanup: () => Promise<void>): void {
