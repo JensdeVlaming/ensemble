@@ -156,7 +156,7 @@ test("scheduler is deterministic and synchronizes structured results", async () 
   });
   const observed: string[] = [];
   const engine = new ExecutionEngine(new RuntimeRegistry([runtime]), new FixedWorkspaces(root),
-    new WorkspaceConfigurationResolver(new RepositoryConfigLoader()), (event, item) => {
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root), (event, item) => {
     if (event.type === "run_started") observed.push(item.id);
   });
   const scheduler = new Scheduler(
@@ -185,7 +185,7 @@ test("a non-terminal result requires a valid next role", async () => {
   });
   const scheduler = new Scheduler(
     provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
-      new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader()))),
+      new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))),
   );
   const [report] = await scheduler.poll();
   assert.equal(report?.outcome, "failed");
@@ -206,7 +206,7 @@ test("provider state selects the next role after scheduler reconstruction", asyn
   });
   const makeScheduler = (runtime: ScriptedRuntime) => new Scheduler(
     provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
-      new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader()))),
+      new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))),
   );
   assert.equal((await makeScheduler(implementation).poll())[0]?.outcome, "advanced");
   assert.equal((await provider.getExecutionState("task-2")).nextRole, "reviewer");
@@ -229,7 +229,7 @@ test("a reconstructed scheduler recovers a durable in-progress execution", async
   const started = await provider.beginExecution("restart-1", "implementation", "in_progress");
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "Recovered", comments: [], artifacts: [] });
   const scheduler = new Scheduler(provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
-    new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader()))));
+    new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))));
   assert.equal((await scheduler.poll())[0]?.outcome, "completed");
   assert.equal((await provider.getTask("restart-1")).status, "done");
   assert.equal((await provider.getExecutionState("restart-1")).history[0]?.id, started.id);
@@ -245,7 +245,7 @@ test("repository-defined custom runnable statuses are discoverable", async () =>
   const provider = new InMemoryProvider([task("custom-1", "queued"), task("ignored", "todo")]);
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "Done", comments: [], artifacts: [] });
   const scheduler = new Scheduler(provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
-    new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader()))));
+    new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))));
   assert.deepEqual((await scheduler.poll()).map((item) => item.taskId), ["custom-1"]);
   assert.equal((await provider.getTask("custom-1")).status, "shipped");
   assert.equal((await provider.getTask("ignored")).status, "todo");
@@ -267,7 +267,7 @@ test("a provider response failure after atomic completion is safe to retry", asy
   }) as ProviderAdapter;
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "Once", comments: ["One"], artifacts: [] });
   const makeScheduler = () => new Scheduler(provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
-    new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader()))));
+    new FixedWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))));
   assert.equal((await makeScheduler().poll())[0]?.outcome, "failed");
   assert.deepEqual(await makeScheduler().poll(), []);
   assert.deepEqual((await delegate.getComments("retry-1")).map((item) => item.body), ["One", "Once"]);
@@ -291,7 +291,7 @@ test("runtime failure is durably recorded and workspace cleanup still runs", asy
     cancel: async () => undefined,
   };
   const scheduler = new Scheduler(provider, new EngineExecutionService(new ExecutionEngine(new RuntimeRegistry([runtime]),
-    workspaces, new WorkspaceConfigurationResolver(new RepositoryConfigLoader()))));
+    workspaces, new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root))));
   assert.equal((await scheduler.poll())[0]?.outcome, "failed");
   assert.equal((await provider.getTask("failure-1")).status, "failed");
   assert.equal(cleaned, 1);

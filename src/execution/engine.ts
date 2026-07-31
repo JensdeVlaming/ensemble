@@ -59,21 +59,33 @@ export interface ExecutionEnvironment {
   start(request: RuntimeExecutionRequest): Promise<RunningExecution>;
 }
 
+export interface ConfiguredExecution {
+  readonly configuration: RepositoryConfiguration;
+  withEnvironment<T>(work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T>;
+}
+
 export interface TaskExecutionService {
-  withEnvironment<T>(task: Task, work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T>;
+  withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T>;
 }
 
 export type EventSink = (event: RuntimeEvent, task: Task) => void | Promise<void>;
 
 export interface ConfigurationResolver {
-  resolve(task: Task, workspace: Workspace): Promise<RepositoryConfiguration>;
+  resolve(task: Task): Promise<RepositoryConfiguration>;
 }
 
 export class WorkspaceConfigurationResolver implements ConfigurationResolver {
   readonly source: RepositoryConfigSource;
-  constructor(source: RepositoryConfigSource) { this.source = source; }
-  resolve(task: Task, workspace: Workspace): Promise<RepositoryConfiguration> {
-    return this.source.load(task.repository, workspace.repositoryPath);
+  readonly repositoryPath: string | ((task: Task) => string | Promise<string>);
+
+  constructor(source: RepositoryConfigSource, repositoryPath: string | ((task: Task) => string | Promise<string>)) {
+    this.source = source;
+    this.repositoryPath = repositoryPath;
+  }
+
+  async resolve(task: Task): Promise<RepositoryConfiguration> {
+    const repositoryPath = typeof this.repositoryPath === "string" ? this.repositoryPath : await this.repositoryPath(task);
+    return this.source.load(task.repository, repositoryPath);
   }
 }
 
@@ -102,14 +114,41 @@ export class ExecutionEngine implements TaskExecutionService {
     this.now = now;
   }
 
-  async withEnvironment<T>(task: Task, work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T> {
+  async withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
+    const configuration = await this.configurations.resolve(task);
+    let open = true;
+    let used = false;
+    const execution: ConfiguredExecution = Object.freeze({
+      configuration,
+      withEnvironment: async <TResult>(environmentWork: (environment: ExecutionEnvironment) => Promise<TResult>) => {
+        if (!open) throw new Error("Configured execution is closed");
+        if (used) throw new Error("Configured execution is single-use");
+        used = true;
+        return this.#withEnvironment(task, configuration, environmentWork);
+      },
+    });
+    try {
+      return await work(execution);
+    } finally {
+      open = false;
+    }
+  }
+
+  withEnvironment<T>(task: Task, work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T> {
+    return this.withConfiguration(task, (execution) => execution.withEnvironment(work));
+  }
+
+  async #withEnvironment<T>(
+    task: Task,
+    configuration: RepositoryConfiguration,
+    work: (environment: ExecutionEnvironment) => Promise<T>,
+  ): Promise<T> {
     let workspace: Workspace | undefined;
     let open = true;
     let used = false;
     let cleanupTransferred = false;
     try {
       workspace = (await this.workspaces.restore(task)) ?? (await this.workspaces.create(task));
-      const configuration = await this.configurations.resolve(task, workspace);
       const environment: ExecutionEnvironment = Object.freeze({
         configuration,
         start: async (request: RuntimeExecutionRequest) => {
@@ -372,6 +411,9 @@ function delay(milliseconds: number): Promise<void> {
 export class EngineExecutionService implements TaskExecutionService {
   readonly engine: ExecutionEngine;
   constructor(engine: ExecutionEngine) { this.engine = engine; }
+  withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
+    return this.engine.withConfiguration(task, work);
+  }
   withEnvironment<T>(task: Task, work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T> {
     return this.engine.withEnvironment(task, work);
   }

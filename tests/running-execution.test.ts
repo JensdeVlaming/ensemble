@@ -128,7 +128,7 @@ test("starting returns a live handle that owns activity, diagnostics, and worksp
   const engine = new ExecutionEngine(
     new RuntimeRegistry([runtime]),
     workspaces,
-    new WorkspaceConfigurationResolver(new RepositoryConfigLoader()),
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root),
     (event) => { if (event.type === "progress_updated") progressObserved.resolve(); },
     0,
     () => timestamps.shift() ?? "2026-07-31T10:03:00.000Z",
@@ -177,7 +177,7 @@ test("startup failure before runtime preparation releases transferred workspace 
   const engine = new ExecutionEngine(
     new RuntimeRegistry(),
     workspaces,
-    new WorkspaceConfigurationResolver(new RepositoryConfigLoader()),
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root),
   );
 
   await assert.rejects(
@@ -209,7 +209,7 @@ test("cancellation is first-reason, idempotent, bounded, and observes detached f
   const engine = new ExecutionEngine(
     new RuntimeRegistry([runtime]),
     workspaces,
-    new WorkspaceConfigurationResolver(new RepositoryConfigLoader()),
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root),
     () => undefined,
     0,
   );

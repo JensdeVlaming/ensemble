@@ -61,10 +61,10 @@ class CountingWorkspaces implements WorkspaceManager {
   async cleanup(): Promise<void> { this.cleaned += 1; if (this.cleanupError) throw this.cleanupError; }
 }
 
-function scheduler(provider: ProviderAdapter, runtime: Runtime, workspaces: WorkspaceManager): Scheduler {
+function scheduler(provider: ProviderAdapter, runtime: Runtime, workspaces: CountingWorkspaces): Scheduler {
   return new Scheduler(provider, new ExecutionEngine(
     new RuntimeRegistry([runtime]), workspaces,
-    new WorkspaceConfigurationResolver(new RepositoryConfigLoader()),
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), workspaces.repositoryPath),
   ));
 }
 
@@ -155,12 +155,13 @@ test("durable active execution bypasses status and retry eligibility", async () 
   assert.equal((await provider.getExecutionState("recover")).history[0]?.id, active.id);
 });
 
-test("engine cleans after rejection, provider read failure, and configuration failure", async () => {
+test("scheduler rejects ineligible, provider-read, and configuration failures before workspace allocation", async () => {
   const root = await fixture();
   const ignoredSpaces = new CountingWorkspaces(root);
   const ignored = new InMemoryProvider([task("ignored", "not-runnable")]);
   assert.deepEqual(await scheduler(ignored, new ScriptedRuntime("scripted", { outcome: "approved", summary: "ok", comments: [], artifacts: [] }), ignoredSpaces).poll(), []);
-  assert.equal(ignoredSpaces.cleaned, 1);
+  assert.equal(ignoredSpaces.created, 0);
+  assert.equal(ignoredSpaces.cleaned, 0);
 
   const failingSpaces = new CountingWorkspaces(root);
   const base = new InMemoryProvider([task("provider-read")]);
@@ -172,27 +173,38 @@ test("engine cleans after rejection, provider read failure, and configuration fa
     },
   }) as ProviderAdapter;
   assert.match((await scheduler(badProvider, new ScriptedRuntime("scripted", { outcome: "approved", summary: "ok", comments: [], artifacts: [] }), failingSpaces).poll())[0]?.error ?? "", /provider unavailable/u);
-  assert.equal(failingSpaces.cleaned, 1);
+  assert.equal(failingSpaces.created, 0);
+  assert.equal(failingSpaces.cleaned, 0);
 
   const missing = await mkdtemp(join(tmpdir(), "ensemble-missing-config-"));
   const configSpaces = new CountingWorkspaces(missing);
   assert.equal((await scheduler(new InMemoryProvider([task("bad-config")]), failingRuntime(), configSpaces).poll())[0]?.outcome, "failed");
-  assert.equal(configSpaces.cleaned, 1);
+  assert.equal(configSpaces.created, 0);
+  assert.equal(configSpaces.cleaned, 0);
 });
 
-test("environment is single-use and closed after its callback", async () => {
+test("captured configuration precedes workspace allocation and both execution capabilities are single-use", async () => {
   const root = await fixture();
+  const workspaces = new CountingWorkspaces(root);
   const engine = new ExecutionEngine(new RuntimeRegistry([new ScriptedRuntime("scripted", {
     outcome: "approved", summary: "ok", comments: [], artifacts: [],
-  })]), new CountingWorkspaces(root), new WorkspaceConfigurationResolver(new RepositoryConfigLoader()));
+  })]), workspaces, new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root));
+  let configured: import("../src/index.ts").ConfiguredExecution | undefined;
   let captured: import("../src/index.ts").ExecutionEnvironment | undefined;
   const request = { task: task("capability"), role: { name: "implementation", instructions: "" }, comments: [], artifacts: [], executionId: "x" };
-  await engine.withEnvironment(request.task, async (environment) => {
-    captured = environment;
-    await (await environment.start(request)).result;
-    await assert.rejects(environment.start(request), /single-use/u);
+  await engine.withConfiguration(request.task, async (execution) => {
+    configured = execution;
+    assert.equal(workspaces.created, 0);
+    await execution.withEnvironment(async (environment) => {
+      captured = environment;
+      assert.equal(environment.configuration, execution.configuration);
+      await (await environment.start(request)).result;
+      await assert.rejects(environment.start(request), /single-use/u);
+    });
+    await assert.rejects(execution.withEnvironment(async () => undefined), /single-use/u);
   });
   await assert.rejects(captured!.start(request), /closed/u);
+  await assert.rejects(configured!.withEnvironment(async () => undefined), /closed/u);
 });
 
 test("runtime result errors remain primary over event, cancellation, and cleanup failures", async () => {
