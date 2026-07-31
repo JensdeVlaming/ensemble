@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   InMemoryProvider,
+  ExecutionCancelledError,
   ProviderClaimConflict,
   Scheduler,
 } from "../src/index.ts";
@@ -91,9 +92,12 @@ class ControlledExecutions implements TaskExecutionService {
   readonly configured: string[] = [];
   readonly allocated: string[] = [];
   readonly started: string[] = [];
+  readonly cancelled: string[] = [];
   readonly #results = new Map<string, Deferred<ExecutionReport>>();
   readonly #environmentFailures = new Map<string, Error>();
   readonly #startupFailures = new Map<string, Error>();
+  readonly #startupGates = new Map<string, Deferred<void>>();
+  readonly #cancellationGates = new Map<string, Deferred<void>>();
 
   constructor(configuration: RepositoryConfiguration) {
     this.configuration = configuration;
@@ -144,9 +148,22 @@ class ControlledExecutions implements TaskExecutionService {
     this.#startupFailures.set(taskId, error);
   }
 
-  #start(request: RuntimeExecutionRequest): RunningExecution {
+  holdStartup(taskId: string): Deferred<void> {
+    const gate = deferred<void>();
+    this.#startupGates.set(taskId, gate);
+    return gate;
+  }
+
+  holdCancellation(taskId: string): Deferred<void> {
+    const gate = deferred<void>();
+    this.#cancellationGates.set(taskId, gate);
+    return gate;
+  }
+
+  async #start(request: RuntimeExecutionRequest): Promise<RunningExecution> {
     const startupFailure = this.#startupFailures.get(request.task.id);
     if (startupFailure) throw startupFailure;
+    await this.#startupGates.get(request.task.id)?.promise;
     this.started.push(request.task.id);
     const result = deferred<ExecutionReport>();
     this.#results.set(request.task.id, result);
@@ -165,10 +182,25 @@ class ControlledExecutions implements TaskExecutionService {
         startedAt: "2026-07-31T00:00:00.000Z",
         lastActivityAt: "2026-07-31T00:00:00.000Z",
       }),
-      cancel: async () => undefined,
+      cancel: async (reason) => {
+        this.cancelled.push(request.task.id);
+        const gate = this.#cancellationGates.get(request.task.id);
+        if (gate) return gate.promise;
+        result.reject(new ExecutionCancelledError(reason));
+      },
     };
   }
 }
+
+test("startup validates ordered repository configuration without allocating workspaces", async () => {
+  const executions = new ControlledExecutions(configuration(2));
+  const scheduler = new Scheduler(new InMemoryProvider([task("b"), task("a")]), executions);
+
+  assert.deepEqual(await scheduler.startup(), { validatedTaskIds: ["a", "b"] });
+  assert.deepEqual(executions.configured, ["a", "b"]);
+  assert.deepEqual(executions.allocated, []);
+  assert.deepEqual(executions.started, []);
+});
 
 test("poll overlaps workers within global capacity and preserves priority ordering", async () => {
   const provider = new InMemoryProvider([
@@ -374,6 +406,72 @@ test("claim conflicts and failed workers release capacity without leaking runtim
   executions.finish("after");
   const reports: readonly ScheduleReport[] = await secondPoll;
   assert.equal(reports.at(-1)?.taskId, "after");
+});
+
+test("shutdown drains naturally, closes intake, and cancels live workers after the deadline", async () => {
+  const naturalExecutions = new ControlledExecutions(configuration(1));
+  const natural = new Scheduler(new InMemoryProvider([task("natural")]), naturalExecutions);
+  assert.deepEqual((await natural.tick()).dispatchedTaskIds, ["natural"]);
+  const naturalShutdown = natural.shutdown({ drainTimeoutMs: 100, cancellationTimeoutMs: 100 });
+  naturalExecutions.finish("natural");
+  assert.deepEqual(await naturalShutdown, { drained: true, cancelledTaskIds: [], remainingTaskIds: [] });
+  assert.deepEqual((await natural.tick()).dispatchedTaskIds, []);
+
+  const forcedExecutions = new ControlledExecutions(configuration(1));
+  const forcedProvider = new InMemoryProvider([task("forced")]);
+  const forced = new Scheduler(forcedProvider, forcedExecutions);
+  assert.deepEqual((await forced.tick()).dispatchedTaskIds, ["forced"]);
+  const forcedReport = await forced.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 100 });
+  assert.deepEqual(forcedExecutions.cancelled, ["forced"]);
+  assert.deepEqual(forcedReport, { drained: true, cancelledTaskIds: ["forced"], remainingTaskIds: [] });
+  const forcedState = await forcedProvider.getExecutionState("forced");
+  assert.deepEqual(forcedState.history.at(-1)?.failure, { kind: "shutdown", retryable: false });
+  assert.deepEqual((await forced.tick()).dispatchedTaskIds, []);
+});
+
+test("shutdown remains bounded when cancellation and result channels do not cooperate", async () => {
+  const provider = new InMemoryProvider([task("stuck")]);
+  const executions = new ControlledExecutions(configuration(1));
+  const cancellation = executions.holdCancellation("stuck");
+  const scheduler = new Scheduler(provider, executions);
+
+  assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, ["stuck"]);
+  const report = await Promise.race([
+    scheduler.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 5 }),
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("shutdown exceeded its bound")), 100)),
+  ]);
+  assert.deepEqual(report, { drained: false, cancelledTaskIds: ["stuck"], remainingTaskIds: ["stuck"] });
+  await waitFor(async () => (await provider.getExecutionState("stuck")).history.length === 1);
+  assert.deepEqual((await provider.getExecutionState("stuck")).history[0]?.failure, {
+    kind: "shutdown",
+    retryable: false,
+  });
+
+  cancellation.reject(new Error("detached cancellation failed"));
+  executions.fail("stuck", new ExecutionCancelledError("shutdown"));
+  await waitFor(async () => (await provider.getTask("stuck")).status === "failed");
+});
+
+test("a runtime handle created after shutdown is quarantined and observed", async () => {
+  const provider = new InMemoryProvider([task("late")]);
+  const executions = new ControlledExecutions(configuration(1));
+  const startup = executions.holdStartup("late");
+  const cancellation = executions.holdCancellation("late");
+  const scheduler = new Scheduler(provider, executions);
+
+  const tick = scheduler.tick();
+  await waitFor(() => executions.allocated.includes("late"));
+  assert.deepEqual(await scheduler.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 0 }), {
+    drained: false,
+    cancelledTaskIds: ["late"],
+    remainingTaskIds: ["late"],
+  });
+  startup.resolve();
+  assert.deepEqual((await tick).dispatchedTaskIds, []);
+  await waitFor(() => executions.cancelled.includes("late"));
+  await waitFor(async () => (await provider.getTask("late")).status === "failed");
+  cancellation.reject(new Error("late detached cancellation failed"));
+  executions.fail("late", new ExecutionCancelledError("shutdown"));
 });
 
 async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {

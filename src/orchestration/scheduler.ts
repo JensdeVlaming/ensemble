@@ -1,3 +1,4 @@
+import { ExecutionCancelledError } from "../execution/engine.ts";
 import type { ConfiguredExecution, RunningExecution, TaskExecutionService } from "../execution/engine.ts";
 import { ProviderClaimConflict } from "../providers/provider.ts";
 import type { ExecutionRecord, ProviderAdapter, ProviderExecutionState } from "../providers/provider.ts";
@@ -15,10 +16,27 @@ export interface SchedulerTickReport {
   readonly dispatchedTaskIds: readonly string[];
 }
 
+export interface SchedulerStartupReport {
+  readonly validatedTaskIds: readonly string[];
+}
+
+export interface SchedulerShutdownOptions {
+  readonly drainTimeoutMs: number;
+  readonly cancellationTimeoutMs: number;
+}
+
+export interface SchedulerShutdownReport {
+  readonly drained: boolean;
+  readonly cancelledTaskIds: readonly string[];
+  readonly remainingTaskIds: readonly string[];
+}
+
 interface WorkerReservation {
   readonly taskId: string;
   readonly configuration: RepositoryConfiguration;
   status: string;
+  executionId?: string;
+  role?: string;
   running?: RunningExecution;
 }
 
@@ -35,8 +53,11 @@ interface Deferred<T> {
 
 export class Scheduler {
   readonly #workers = new Map<string, WorkerReservation>();
+  readonly #idleWaiters = new Set<() => void>();
   #tickInProgress?: Promise<readonly DispatchEntry[]>;
   #pollDispatchTail: Promise<void> = Promise.resolve();
+  #accepting = true;
+  #shutdown?: Promise<SchedulerShutdownReport>;
   readonly provider: ProviderAdapter;
   readonly executions: TaskExecutionService;
 
@@ -45,7 +66,22 @@ export class Scheduler {
     this.executions = executions;
   }
 
+  async startup(): Promise<SchedulerStartupReport> {
+    if (!this.#accepting) throw new Error("Scheduler intake is closed");
+    const discovered = [...await this.provider.discoverTasks({ scope: "workflow_candidates" })].sort(compareCandidates);
+    const validated: string[] = [];
+    for (const candidate of discovered) {
+      if (!this.#accepting) throw new Error("Scheduler intake is closed");
+      const task = await this.provider.getTask(candidate.id);
+      await this.executions.withConfiguration(task, async () => undefined);
+      validated.push(task.id);
+    }
+    await this.#reconcileForStartup();
+    return Object.freeze({ validatedTaskIds: Object.freeze(validated) });
+  }
+
   async tick(): Promise<SchedulerTickReport> {
+    if (!this.#accepting) return Object.freeze({ dispatchedTaskIds: Object.freeze([]) });
     const entries = await this.#beginTick();
     return Object.freeze({
       dispatchedTaskIds: Object.freeze(entries.filter((entry) => entry.dispatched).map((entry) => entry.taskId)),
@@ -53,6 +89,7 @@ export class Scheduler {
   }
 
   poll(): Promise<readonly ScheduleReport[]> {
+    if (!this.#accepting) return Promise.resolve(Object.freeze([]));
     const predecessor = this.#pollDispatchTail;
     let releaseDispatch!: () => void;
     this.#pollDispatchTail = new Promise((resolve) => { releaseDispatch = resolve; });
@@ -71,19 +108,23 @@ export class Scheduler {
   }
 
   #beginTick(): Promise<readonly DispatchEntry[]> {
+    if (!this.#accepting) return Promise.resolve(Object.freeze([]));
     if (this.#tickInProgress) return this.#tickInProgress;
     const tick = this.#dispatchTick();
     this.#tickInProgress = tick;
     void tick.finally(() => {
       if (this.#tickInProgress === tick) this.#tickInProgress = undefined;
+      this.#notifyIdle();
     }).catch(() => undefined);
     return tick;
   }
 
   async #dispatchTick(): Promise<readonly DispatchEntry[]> {
+    if (!this.#accepting) return Object.freeze([]);
     const tasks = await this.provider.discoverTasks({ scope: "workflow_candidates" });
     const entries: DispatchEntry[] = [];
     for (const discovered of [...tasks].sort(compareCandidates)) {
+      if (!this.#accepting) break;
       if (this.#workers.has(discovered.id)) continue;
       const entry = await this.#dispatchCandidate(discovered);
       if (entry) entries.push(entry);
@@ -98,10 +139,11 @@ export class Scheduler {
     } catch (error) {
       return settledEntry(discovered.id, failureReport(discovered.id, "unknown", error));
     }
+    if (!this.#accepting) return undefined;
     if (this.#workers.has(task.id)) return undefined;
     try {
       return await this.executions.withConfiguration(task, async (execution) => {
-        if (this.#workers.has(task.id) || !this.#hasCapacity(execution.configuration, task.status)) return undefined;
+        if (!this.#accepting || this.#workers.has(task.id) || !this.#hasCapacity(execution.configuration, task.status)) return undefined;
         return this.#reserveAndDispatch(task, execution);
       });
     } catch (error) {
@@ -136,6 +178,7 @@ export class Scheduler {
     let roleName = "unknown";
     try {
       const state = await this.provider.getExecutionState(task.id);
+      if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       if (task.dispatchable === false) {
         this.#release(reservation);
         completion.resolve(undefined);
@@ -152,13 +195,17 @@ export class Scheduler {
       const active = state.active ?? await this.provider.beginExecution(task.id, selectedRole, execution.configuration.runningStatus);
       executionId = active.id;
       roleName = active.role;
+      reservation.executionId = active.id;
+      reservation.role = active.role;
       if (!state.active) reservation.status = execution.configuration.runningStatus;
+      if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       const role = execution.configuration.workflow.roles.find((candidate) => candidate.name === roleName);
       if (!role) throw new Error(`Unknown role '${roleName}' for task ${task.id}`);
       const [comments, artifacts] = await Promise.all([
         this.provider.getComments(task.id),
         this.provider.getArtifacts(task.id),
       ]);
+      if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       const running = await execution.withEnvironment((environment) => environment.start({
         task,
         role,
@@ -167,6 +214,9 @@ export class Scheduler {
         executionId: active.id,
       }));
       reservation.running = running;
+      if (!this.#accepting) {
+        void running.cancel("shutdown").catch(() => undefined);
+      }
       void this.#completeWorker(task, reservation, roleName, active.id, running).then(
         completion.resolve,
         (error: unknown) => {
@@ -174,7 +224,7 @@ export class Scheduler {
           completion.resolve(failureReport(task.id, roleName, error));
         },
       );
-      return entry(true);
+      return entry(this.#accepting);
     } catch (error) {
       if (error instanceof ProviderClaimConflict) {
         this.#release(reservation);
@@ -201,6 +251,9 @@ export class Scheduler {
       const terminal = reservation.configuration.terminalOutcomes.includes(report.result.outcome);
       return { taskId: task.id, outcome: terminal ? "completed" : "advanced", role: roleName, nextRole: report.result.nextRole };
     } catch (error) {
+      if (error instanceof ExecutionCancelledError && error.reason === "shutdown") {
+        return this.#recordCancellation(task.id, reservation.configuration, roleName, executionId);
+      }
       return this.#recordFailure(task, reservation.configuration, roleName, executionId, error);
     } finally {
       this.#release(reservation);
@@ -234,6 +287,107 @@ export class Scheduler {
 
   #release(reservation: WorkerReservation): void {
     if (this.#workers.get(reservation.taskId) === reservation) this.#workers.delete(reservation.taskId);
+    this.#notifyIdle();
+  }
+
+  async shutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport> {
+    this.#accepting = false;
+    this.#shutdown ??= this.#performShutdown(options);
+    return this.#shutdown;
+  }
+
+  async #performShutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport> {
+    if (this.#workers.size === 0 && this.#tickInProgress === undefined) {
+      return Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
+    }
+    const drained = await waitWithin(this.#waitForIdle(), options.drainTimeoutMs);
+    if (drained) {
+      return Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
+    }
+
+    const cancelledTaskIds = [...this.#workers.values()]
+      .filter((reservation) => reservation.executionId !== undefined)
+      .map((reservation) => reservation.taskId)
+      .sort();
+    for (const reservation of this.#workers.values()) {
+      if (reservation.executionId && reservation.role) {
+        void this.#recordCancellation(
+          reservation.taskId,
+          reservation.configuration,
+          reservation.role,
+          reservation.executionId,
+        );
+      }
+      if (reservation.running) {
+        void reservation.running.cancel("shutdown").catch(() => undefined);
+        void reservation.running.result.catch(() => undefined);
+      }
+    }
+    await waitWithin(this.#waitForIdle(), options.cancellationTimeoutMs);
+    return Object.freeze({
+      drained: this.#workers.size === 0 && this.#tickInProgress === undefined,
+      cancelledTaskIds: Object.freeze(cancelledTaskIds),
+      remainingTaskIds: Object.freeze([...this.#workers.keys()].sort()),
+    });
+  }
+
+  #waitForIdle(): Promise<void> {
+    if (this.#workers.size === 0 && this.#tickInProgress === undefined) return Promise.resolve();
+    return new Promise((resolve) => { this.#idleWaiters.add(resolve); });
+  }
+
+  #notifyIdle(): void {
+    if (this.#workers.size !== 0 || this.#tickInProgress !== undefined) return;
+    for (const resolve of this.#idleWaiters) resolve();
+    this.#idleWaiters.clear();
+  }
+
+  async #reconcileForStartup(): Promise<void> {
+    const liveTaskIds = [...this.#workers.keys()].sort();
+    if (liveTaskIds.length === 0) return;
+    await this.provider.refreshTasks(liveTaskIds);
+  }
+
+  async #stopReservation(
+    task: Task,
+    reservation: WorkerReservation,
+    roleName: string,
+    executionId: string | undefined,
+    completion: Deferred<ScheduleReport | undefined>,
+    entry: (dispatched: boolean) => DispatchEntry,
+  ): Promise<DispatchEntry> {
+    const report = executionId
+      ? await this.#recordCancellation(task.id, reservation.configuration, roleName, executionId)
+      : undefined;
+    this.#release(reservation);
+    completion.resolve(report);
+    return entry(false);
+  }
+
+  async #recordCancellation(
+    taskId: string,
+    configuration: RepositoryConfiguration,
+    roleName: string,
+    executionId: string,
+  ): Promise<ScheduleReport> {
+    const summary = "Ensemble execution cancelled during shutdown";
+    try {
+      await this.provider.cancelExecution(taskId, executionId, {
+        record: {
+          id: executionId,
+          role: roleName,
+          outcome: "cancelled",
+          summary,
+          finishedAt: new Date().toISOString(),
+          failure: { kind: "shutdown", retryable: false },
+        },
+        status: configuration.failedStatus,
+        comment: summary,
+      });
+      return { taskId, outcome: "failed", role: roleName, error: summary };
+    } catch (error) {
+      return failureReport(taskId, roleName, error);
+    }
   }
 
   async #synchronize(task: Task, config: RepositoryConfiguration, role: string, executionId: string, result: RuntimeResult): Promise<void> {
@@ -300,4 +454,19 @@ function failureReport(taskId: string, role: string, error: unknown): ScheduleRe
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function waitWithin(promise: Promise<void>, milliseconds: number): Promise<boolean> {
+  if (milliseconds === 0) return false;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => { finish(false); }, milliseconds);
+    void promise.then(() => { finish(true); });
+  });
 }

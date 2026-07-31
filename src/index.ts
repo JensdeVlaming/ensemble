@@ -4,6 +4,7 @@ export * from "./providers/memory/adapter.ts";
 export * from "./providers/vikunja/client.ts";
 export * from "./providers/vikunja/adapter.ts";
 export * from "./orchestration/scheduler.ts";
+export * from "./orchestration/service.ts";
 export * from "./execution/engine.ts";
 export * from "./execution/repository.ts";
 export * from "./execution/workspace.ts";
