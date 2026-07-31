@@ -189,10 +189,10 @@ test("environment is single-use and closed after its callback", async () => {
   const request = { task: task("capability"), role: { name: "implementation", instructions: "" }, comments: [], artifacts: [], executionId: "x" };
   await engine.withEnvironment(request.task, async (environment) => {
     captured = environment;
-    await environment.run(request);
-    await assert.rejects(environment.run(request), /single-use/u);
+    await (await environment.start(request)).result;
+    await assert.rejects(environment.start(request), /single-use/u);
   });
-  await assert.rejects(captured!.run(request), /closed/u);
+  await assert.rejects(captured!.start(request), /closed/u);
 });
 
 test("runtime result errors remain primary over event, cancellation, and cleanup failures", async () => {

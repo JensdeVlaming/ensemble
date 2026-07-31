@@ -68,7 +68,8 @@ export class Scheduler {
         this.provider.getComments(task.id),
         this.provider.getArtifacts(task.id),
       ]);
-      const report = await environment.run({ task, role, comments, artifacts, executionId });
+      const running = await environment.start({ task, role, comments, artifacts, executionId });
+      const report = await running.result;
       await this.#synchronize(task, config, roleName, executionId, report.result);
       const terminal = config.terminalOutcomes.includes(report.result.outcome);
       return { taskId: task.id, outcome: terminal ? "completed" : "advanced", role: roleName, nextRole: report.result.nextRole };
