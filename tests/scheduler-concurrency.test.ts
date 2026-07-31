@@ -349,7 +349,7 @@ test("concurrent polls serialize dispatch only and never wait for each other's w
   assert.equal((await firstPoll)[0]?.taskId, "first-poll");
 });
 
-test("detached synchronization failures are observed and release capacity", async () => {
+test("failed completion synchronization is repaired exactly before redispatch", async () => {
   const delegate = new InMemoryProvider([task("sync-failure", 1), task("after-sync", 2)]);
   let failSynchronization = true;
   const provider = new Proxy(delegate, {
@@ -368,11 +368,14 @@ test("detached synchronization failures are observed and release capacity", asyn
   const executions = new ControlledExecutions(configuration(1));
   const scheduler = new Scheduler(provider, executions);
 
-  assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, ["sync-failure"]);
+  const first = scheduler.poll();
+  await waitFor(() => executions.started.includes("sync-failure"));
   executions.finish("sync-failure");
-  await waitFor(async () => (await delegate.getTask("sync-failure")).status === "failed");
+  assert.match((await first)[0]?.error ?? "", /provider synchronization failed/u);
+  assert.equal((await delegate.getTask("sync-failure")).status, "in_progress");
   assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, ["after-sync"]);
   executions.finish("after-sync");
+  await waitFor(async () => (await delegate.getTask("sync-failure")).status === "done");
   await waitFor(async () => (await delegate.getTask("after-sync")).status === "done");
 });
 

@@ -39,7 +39,7 @@ async function fixture(maxFailures = 3): Promise<string> {
     "runtime:", "  name: scripted", "initialRole: implementation",
     "terminalOutcomes: [approved]", "statuses:", "  runnable: [todo, in_progress]",
     "  running: in_progress", "  completed: done", "  failed: failed",
-    "retry:", `  maxFailedAttemptsPerRole: ${maxFailures}`,
+    "retry:", `  maxFailedAttemptsPerRole: ${maxFailures}`, "  initialDelayMs: 0", "  maxDelayMs: 0",
   ].join("\n"));
   return root;
 }
@@ -139,7 +139,8 @@ test("failures in an earlier role do not exhaust a later role", async () => {
   const execution = await provider.beginExecution("roles", "implementation", "in_progress");
   await provider.failExecution("roles", execution.id, {
     id: execution.id, role: "implementation", outcome: "failed", summary: "failed",
-    nextRole: "reviewer", finishedAt: new Date().toISOString(),
+    nextRole: "reviewer", finishedAt: "2026-01-01T00:00:00.000Z",
+    failure: { kind: "runtime", retryable: true, nextAttemptAt: "2026-01-01T00:00:00.000Z" },
   }, "failed", "failed");
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "reviewed", comments: [], artifacts: [] });
   assert.equal((await scheduler(provider, runtime, new CountingWorkspaces(root)).poll())[0]?.role, "reviewer");

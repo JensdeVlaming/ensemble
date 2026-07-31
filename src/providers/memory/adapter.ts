@@ -1,4 +1,4 @@
-import type { Artifact, Task, TaskComment, TaskId } from "../../domain/model.ts";
+import type { Artifact, FailureKind, Task, TaskComment, TaskId } from "../../domain/model.ts";
 import type {
   ActiveExecution,
   ExecutionCompletion,
@@ -9,6 +9,10 @@ import type {
   TaskQuery,
   TaskRefreshResult,
 } from "../provider.ts";
+
+const failureKinds = new Set<FailureKind>([
+  "startup", "provider", "configuration", "runtime", "timeout", "stalled", "reconciliation", "shutdown",
+]);
 
 /** Reference adapter used by tests and local experiments. */
 export class InMemoryProvider implements ProviderAdapter {
@@ -148,15 +152,26 @@ function validateExecutionRecord(value: unknown): ExecutionRecord {
   if (!value || typeof value !== "object") throw new Error("Invalid execution record");
   const record = value as Partial<ExecutionRecord>;
   if (typeof record.id !== "string" || typeof record.role !== "string" || typeof record.outcome !== "string"
-    || typeof record.summary !== "string" || typeof record.finishedAt !== "string"
+    || typeof record.summary !== "string" || typeof record.finishedAt !== "string" || Number.isNaN(Date.parse(record.finishedAt))
     || (record.nextRole !== undefined && typeof record.nextRole !== "string")
-    || (record.failure !== undefined && (!record.failure || typeof record.failure.kind !== "string"
-      || typeof record.failure.retryable !== "boolean" || (record.failure.nextAttemptAt !== undefined && typeof record.failure.nextAttemptAt !== "string")))
+    || (record.failure !== undefined && !isValidFailure(record.failure))
     || (record.blockingRequest !== undefined && (!record.blockingRequest || typeof record.blockingRequest.kind !== "string"
       || typeof record.blockingRequest.summary !== "string" || typeof record.blockingRequest.createdAt !== "string"))) {
     throw new Error("Invalid execution record");
   }
   return record as ExecutionRecord;
+}
+
+function isValidFailure(failure: NonNullable<ExecutionRecord["failure"]>): boolean {
+  if (!failure || !failureKinds.has(failure.kind) || typeof failure.retryable !== "boolean") return false;
+  if (!failure.retryable) return failure.nextAttemptAt === undefined;
+  return isCanonicalTimestamp(failure.nextAttemptAt);
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
 }
 
 function freezeExecutionRecord(record: ExecutionRecord): ExecutionRecord {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Artifact, RepositoryRef, Task, TaskBlocker, TaskComment, TaskId } from "../../domain/model.ts";
+import type { Artifact, FailureKind, RepositoryRef, Task, TaskBlocker, TaskComment, TaskId } from "../../domain/model.ts";
 import type {
   ActiveExecution,
   ExecutionCancellation,
@@ -17,6 +17,9 @@ import type { VikunjaClientOptions } from "./client.ts";
 const STATE_PREFIX = "<!-- ensemble-provider-state:v1\n";
 const STATE_SUFFIX = "\n-->";
 const SIDE_EFFECT_PREFIX = "<!-- ensemble-side-effect:";
+const failureKinds = new Set<FailureKind>([
+  "startup", "provider", "configuration", "runtime", "timeout", "stalled", "reconciliation", "shutdown",
+]);
 
 export interface VikunjaStatusLabels {
   readonly ready: string;
@@ -387,10 +390,23 @@ function validateEvent(value: unknown): ProviderEvent {
 function validateRecord(record: ExecutionRecord): ExecutionRecord {
   if (!record || typeof record !== "object" || typeof record.id !== "string" || typeof record.role !== "string"
     || typeof record.outcome !== "string" || typeof record.summary !== "string" || typeof record.finishedAt !== "string"
-    || Number.isNaN(Date.parse(record.finishedAt)) || (record.nextRole !== undefined && typeof record.nextRole !== "string")) {
+    || Number.isNaN(Date.parse(record.finishedAt)) || (record.nextRole !== undefined && typeof record.nextRole !== "string")
+    || (record.failure !== undefined && !isValidFailure(record.failure))) {
     throw new Error("Invalid Vikunja execution record");
   }
   return record;
+}
+
+function isValidFailure(failure: NonNullable<ExecutionRecord["failure"]>): boolean {
+  if (!failure || !failureKinds.has(failure.kind) || typeof failure.retryable !== "boolean") return false;
+  if (!failure.retryable) return failure.nextAttemptAt === undefined;
+  return isCanonicalTimestamp(failure.nextAttemptAt);
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
 }
 
 function validateComment(value: unknown): VikunjaComment {

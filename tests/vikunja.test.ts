@@ -143,6 +143,39 @@ test("Vikunja adapter rejects malformed provider-owned execution state", async (
   await assert.rejects(providerFor(api, "execution").getExecutionState("1"), /Malformed Ensemble provider state/u);
 });
 
+test("Vikunja execution state accepts legacy failures and validates present retry details", async () => {
+  const api = new FakeVikunjaApi([task(1, "Failure state", [4], 1)]);
+  const record = {
+    id: "legacy-failure",
+    role: "implementation",
+    outcome: "failed",
+    summary: "legacy",
+    finishedAt: "2026-07-31T10:00:00.000Z",
+  };
+  api.comments.set(1, [stateComment(1, {
+    protocol: "ensemble-provider-state/v1",
+    kind: "fail",
+    executionId: record.id,
+    createdAt: record.finishedAt,
+    record,
+  })]);
+  assert.equal((await providerFor(api, "execution").getExecutionState("1")).history[0]?.failure, undefined);
+
+  for (const [index, failure] of [
+    { kind: "runtime", retryable: true },
+    { kind: "runtime", retryable: true, nextAttemptAt: "2026-01-01" },
+  ].entries()) {
+    api.comments.set(1, [stateComment(index + 2, {
+      protocol: "ensemble-provider-state/v1",
+      kind: "fail",
+      executionId: "invalid-failure",
+      createdAt: "2026-07-31T10:00:01.000Z",
+      record: { ...record, id: "invalid-failure", failure },
+    })]);
+    await assert.rejects(providerFor(api, "execution").getExecutionState("1"), /Invalid Vikunja execution record/u);
+  }
+});
+
 function providerFor(api: FakeVikunjaApi, executionId: string, extra: { requiredAssignee?: string } = {}): VikunjaProvider {
   return new VikunjaProvider({
     baseUrl: "https://vikunja.example.test",
@@ -169,6 +202,15 @@ function task(
   return {
     id, identifier: `ENS-${id}`, title, description: `Description ${id}`, done: false, priority, project_id: 3,
     labels: statusLabels.filter((label) => labelIds.includes(label.id)), assignees, related_tasks: relatedTasks,
+  };
+}
+
+function stateComment(id: number, event: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  return {
+    id,
+    comment: `<!-- ensemble-provider-state:v1\n${JSON.stringify(event)}\n-->`,
+    created: "2026-07-31T10:00:00.000Z",
+    author: { id: 7, username: "ensemble-bot" },
   };
 }
 
