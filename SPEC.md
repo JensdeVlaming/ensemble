@@ -1,6 +1,6 @@
 # Ensemble Specification
 
-Version: 0.1
+Version: 0.2
 Status: Draft
 
 ---
@@ -37,6 +37,8 @@ This includes:
 * labels
 * assignments
 * execution history
+* the active execution marker
+* the next requested role
 * agent feedback
 
 Ensemble MUST NOT duplicate this state.
@@ -155,6 +157,13 @@ Responsibilities:
 
 The Scheduler MUST be deterministic.
 
+For a given provider snapshot and repository configuration, it MUST make the
+same eligibility and role-selection decisions. Tasks returned by a poll MUST be
+processed in ascending task-ID order.
+
+The Scheduler owns all durable execution transitions. Neither the Execution
+Engine nor a Runtime may directly change provider workflow state.
+
 ---
 
 ## Execution Engine
@@ -172,6 +181,11 @@ Responsibilities:
 * cleanup
 
 The Execution Engine MUST NOT contain runtime-specific logic.
+
+An execution environment MUST be scoped to a single callback and MUST permit at
+most one runtime invocation. The Execution Engine MUST attempt workspace cleanup
+after success or failure. Cleanup, cancellation, or secondary event-stream
+errors MUST NOT replace the primary runtime or scheduling failure.
 
 ---
 
@@ -195,12 +209,81 @@ Responsible for communication with task providers.
 
 Responsibilities:
 
-* discover tasks
+* discover workflow candidates
 * read task details
 * read comments
+* read artifacts
+* read durable execution state
 * update status
 * create comments
 * upload artifacts
+* atomically begin an execution
+* atomically complete an execution
+* atomically fail an execution
+
+Provider Adapters MUST translate provider-specific assignment, archive, and
+terminal-state concepts into the portable contracts defined below. No other
+component may inspect provider-specific task metadata.
+
+### Workflow Candidate Discovery
+
+The Scheduler requests tasks using the semantic scope `workflow_candidates`.
+A Provider Adapter MUST apply its provider-specific filters before returning
+tasks. This prevents ineligible tasks from allocating workspaces or runtimes.
+
+Candidate discovery MUST include every non-cancelled, non-archived task that has
+a durable active Ensemble execution, even when its current workflow status would
+not otherwise be runnable. This is required for restart recovery while still
+respecting explicit provider-side cancellation.
+
+Discovery is a coarse provider-side filter. Final eligibility, retry policy, and
+role selection remain Scheduler responsibilities.
+
+### Durable Execution State
+
+Provider Adapters expose execution state through portable, provider-independent
+records equivalent to:
+
+```typescript
+interface ActiveExecution {
+    id: string;
+    role: string;
+    startedAt: string;
+}
+
+interface ExecutionRecord {
+    id: string;
+    role: string;
+    outcome: string;
+    summary: string;
+    nextRole?: string;
+    finishedAt: string;
+}
+
+interface ProviderExecutionState {
+    active?: ActiveExecution;
+    history: readonly ExecutionRecord[];
+    nextRole?: string;
+}
+```
+
+Returned state MUST be validated, immutable to consumers, and ordered by
+`finishedAt`, using execution ID as the deterministic tie-breaker.
+
+The execution ID is the idempotency key for provider mutations:
+
+* `beginExecution` MUST atomically create an active marker and running status,
+  or return the already-active execution.
+* `completeExecution` MUST atomically persist the history record, comments,
+  artifacts, next role, and resulting status, then clear the active marker.
+* `failExecution` MUST atomically persist the failed record and diagnostic
+  comment, apply the failed status, and clear the active marker.
+* Repeating completion or failure for an already-recorded execution ID MUST be
+  safe and MUST NOT duplicate side effects.
+
+Adapters MAY represent this state using native provider fields, comments,
+labels, or another provider-owned mechanism. Ensemble MUST NOT require a local
+durable database.
 
 ---
 
@@ -480,12 +563,37 @@ Workflow transitions MUST be based on structured results, never on free-form tex
 After a restart Ensemble reconstructs execution by:
 
 1. Polling the task provider.
-2. Discovering active tasks.
-3. Reading repository configuration.
-4. Restoring workspaces.
-5. Launching a new runtime session.
+2. Discovering workflow candidates, including tasks with active executions.
+3. Reading the task's durable provider execution state.
+4. Reading repository configuration.
+5. Restoring or creating a workspace.
+6. Launching a new runtime session.
+
+When an active execution exists, the Scheduler MUST reuse its provider-stored
+execution ID and role. Active recovery takes precedence over current task
+status, configured runnable statuses, next-role state, and retry exhaustion.
+The runtime session itself is new unless that runtime can safely resume from its
+own provider-visible checkpoint.
 
 Hidden runtime memory MUST NOT be required.
+
+## 15.1 Role Selection and Eligibility
+
+When there is no active execution, the Scheduler selects the role in this
+order:
+
+1. the provider-stored next role
+2. the role of the most recent failed execution
+3. the repository-configured initial role
+
+A task with no most-recent failure is eligible only when its status is listed
+in `statuses.runnable`. A task whose most recent execution failed is eligible
+while the number of failed executions for the selected role is less than
+`retry.maxFailedAttemptsPerRole`.
+
+Failures are counted separately per role. A value of `0` permits the initial
+execution but disables retries. An active execution is always recoverable and
+does not consume another retry attempt merely because Ensemble restarted.
 
 ---
 
@@ -517,6 +625,34 @@ Repository configuration lives inside:
 Secrets NEVER live inside repositories.
 
 Secrets are supplied by the Ensemble deployment.
+
+Repository execution policy is defined by `.ensemble/config.yaml`. The portable
+configuration keys are:
+
+```yaml
+runtime:
+  name: codex
+  config: {}
+initialRole: planner
+terminalOutcomes: [approved, completed]
+statuses:
+  runnable: [todo, in_progress]
+  running: in_progress
+  completed: done
+  failed: failed
+retry:
+  maxFailedAttemptsPerRole: 3
+```
+
+`runtime.name` selects a registered Runtime. `runtime.config` is opaque to the
+Scheduler and Execution Engine and is interpreted only by that Runtime.
+
+`initialRole` MUST name a role present in `.ensemble/roles`. Every non-terminal
+structured result MUST provide a `nextRole`, and that role MUST also exist.
+
+`retry.maxFailedAttemptsPerRole` MUST be a non-negative integer and defaults to
+`3`. Status and outcome strings are repository-defined rather than hard-coded
+by the Scheduler.
 
 Example:
 
