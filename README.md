@@ -45,6 +45,12 @@ src/
 - `RepositoryConfigLoader` reads `.ensemble/config.yaml`, `WORKFLOW.md`, role
   files, and `AGENTS.md`.
 
+Repository configuration uses strict YAML 1.2. Nested mappings, block and flow
+lists, quoted strings, multiline strings, anchors, and bounded aliases are
+supported. Duplicate keys, multiple documents, custom or explicit tags, merge
+keys, cyclic/excessive aliases, non-mapping roots, and prototype-sensitive keys
+are rejected before typed configuration validation.
+
 The stable public API is re-exported from `src/index.ts`. `InMemoryProvider` and
 `ScriptedRuntime` are executable reference adapters suitable for tests and local
 experiments. `GitRepositoryDriver` materializes isolated repository checkouts;

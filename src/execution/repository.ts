@@ -1,5 +1,6 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { isScalar, parseAllDocuments, visit } from "yaml";
 import type {
   FailureKind,
   RepositoryConfiguration,
@@ -14,6 +15,9 @@ export interface RepositoryConfigSource {
 }
 
 type ConfigObject = Record<string, unknown>;
+
+const MAX_YAML_ALIASES = 100;
+const unsafeConfigKeys = new Set(["__proto__", "constructor", "prototype", "<<"]);
 
 const retryableFailureKinds = ["startup", "provider", "runtime", "timeout", "stalled"] as const satisfies readonly FailureKind[];
 const failureKinds = new Set<FailureKind>([
@@ -173,47 +177,67 @@ function hookAt(value: ConfigObject, key: string): WorkspaceHook | undefined {
   return { executable, args };
 }
 
-// Deliberately small YAML subset for repository configuration: mappings, scalar
-// values, and inline lists. It rejects ambiguous input rather than guessing.
 export function parseSimpleYaml(source: string): ConfigObject {
-  const root: ConfigObject = {};
-  const stack: Array<{ indent: number; value: ConfigObject }> = [{ indent: -1, value: root }];
-  for (const [index, raw] of source.split(/\r?\n/u).entries()) {
-    const withoutComment = raw.replace(/\s+#.*$/u, "");
-    if (!withoutComment.trim()) continue;
-    if (/\t/u.test(raw)) throw new Error(`Tabs are not allowed in config.yaml (line ${index + 1})`);
-    const indent = withoutComment.length - withoutComment.trimStart().length;
-    const match = withoutComment.trim().match(/^([A-Za-z][\w-]*):(?:\s+(.*))?$/u);
-    if (!match) throw new Error(`Unsupported YAML on line ${index + 1}`);
-    while (stack.at(-1)!.indent >= indent) stack.pop();
-    const parent = stack.at(-1)?.value;
-    if (!parent) throw new Error(`Invalid indentation on line ${index + 1}`);
-    const key = match[1]!;
-    const encoded = match[2];
-    if (encoded === undefined) {
-      const child: ConfigObject = {};
-      parent[key] = child;
-      stack.push({ indent, value: child });
-    } else {
-      parent[key] = parseScalar(encoded.trim());
-    }
+  const documents = parseAllDocuments(source, {
+    version: "1.2",
+    schema: "core",
+    strict: true,
+    uniqueKeys: true,
+    merge: false,
+    resolveKnownTags: false,
+    logLevel: "silent",
+  });
+  if (documents.length !== 1) throw new Error("Expected one YAML document in config.yaml");
+  const document = documents[0]!;
+  const issue = document.errors[0] ?? document.warnings[0];
+  if (issue) throw new Error(`Invalid config.yaml: ${issue.message.split("\n", 1)[0]}`);
+  if (document.directives?.yaml.explicit || /^%(?:YAML|TAG)\b/mu.test(source)) {
+    throw new Error("Unsupported YAML directive in config.yaml");
   }
-  return root;
+  visit(document, {
+    Node: (_key, node) => {
+      if (node.tag !== undefined) throw new Error("Unsupported YAML tag in config.yaml");
+    },
+    Pair: (_key, pair) => {
+      if (!isScalar(pair.key) || typeof pair.key.value !== "string") {
+        throw new Error("Expected string YAML mapping key in config.yaml");
+      }
+    },
+  });
+  const value: unknown = document.toJS({ mapAsMap: false, maxAliasCount: MAX_YAML_ALIASES });
+  const copied = copyConfigValue(value, "config.yaml", new WeakSet());
+  if (!isConfigObject(copied)) throw new Error("Expected mapping root: config.yaml");
+  return copied;
 }
 
-function parseScalar(value: string): unknown {
-  if (value.startsWith("[") && value.endsWith("]")) {
-    const body = value.slice(1, -1).trim();
-    return body ? body.split(",").map((item) => parseScalar(item.trim())) : [];
+function copyConfigValue(value: unknown, path: string, ancestors: WeakSet<object>): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(`Expected finite YAML number: ${path}`);
+    return value;
   }
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-    return value.slice(1, -1);
+  if (typeof value !== "object") throw new Error(`Unsupported YAML value: ${path}`);
+  if (ancestors.has(value)) throw new Error(`Cyclic YAML alias: ${path}`);
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item, index) => copyConfigValue(item, `${path}[${index}]`, ancestors));
+    }
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) throw new Error(`Unsupported YAML object: ${path}`);
+    const copied: ConfigObject = Object.create(null) as ConfigObject;
+    for (const [key, child] of Object.entries(value)) {
+      if (unsafeConfigKeys.has(key)) throw new Error(`Unsafe YAML key: ${path}.${key}`);
+      copied[key] = copyConfigValue(child, `${path}.${key}`, ancestors);
+    }
+    return copied;
+  } finally {
+    ancestors.delete(value);
   }
-  if (value === "true") return true;
-  if (value === "false") return false;
-  if (value === "null") return null;
-  const number = Number(value);
-  return Number.isNaN(number) ? value : number;
+}
+
+function isConfigObject(value: unknown): value is ConfigObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function objectAt(value: ConfigObject, key: string, required = true): ConfigObject {

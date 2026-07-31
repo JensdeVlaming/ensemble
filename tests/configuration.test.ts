@@ -3,29 +3,140 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { RepositoryConfigLoader } from "../src/index.ts";
+import { parseSimpleYaml, RepositoryConfigLoader } from "../src/index.ts";
 import type { RepositoryRef } from "../src/index.ts";
 
 const repository: RepositoryRef = { id: "configuration", url: "local://configuration" };
 
 async function fixture(configuration: readonly string[]): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "ensemble-configuration-"));
-  await mkdir(join(root, ".ensemble", "roles"), { recursive: true });
-  await writeFile(join(root, "AGENTS.md"), "Test configuration.");
-  await writeFile(join(root, ".ensemble", "WORKFLOW.md"), "Execute safely.");
-  await writeFile(join(root, ".ensemble", "roles", "implementation.md"), "Implement.");
-  await writeFile(join(root, ".ensemble", "config.yaml"), [
+  return fixtureSource([
     "runtime:",
     "  name: scripted",
     "initialRole: implementation",
     ...configuration,
   ].join("\n"));
+}
+
+async function fixtureSource(source: string): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "ensemble-configuration-"));
+  await mkdir(join(root, ".ensemble", "roles"), { recursive: true });
+  await writeFile(join(root, "AGENTS.md"), "Test configuration.");
+  await writeFile(join(root, ".ensemble", "WORKFLOW.md"), "Execute safely.");
+  await writeFile(join(root, ".ensemble", "roles", "implementation.md"), "Implement.");
+  await writeFile(join(root, ".ensemble", "config.yaml"), source);
   return root;
 }
 
 async function load(configuration: readonly string[]) {
   return new RepositoryConfigLoader().load(repository, await fixture(configuration));
 }
+
+async function loadSource(source: string) {
+  return new RepositoryConfigLoader().load(repository, await fixtureSource(source));
+}
+
+test("complete YAML supports nested block lists, hook argv, and multiline runtime configuration", async () => {
+  const config = await loadSource(`
+runtime:
+  name: scripted
+  config:
+    instructions: |-
+      first line
+      second # literal
+    nested:
+      values:
+        - one
+        - "two: with spaces"
+initialRole: implementation
+terminalOutcomes:
+  - approved
+  - completed
+statuses:
+  runnable:
+    - ready
+    - running
+workspace:
+  hooks:
+    beforeRun:
+      executable: npm
+      args:
+        - install
+        - "--flag=value with spaces"
+        - "https://example.test/a:b#fragment"
+`);
+
+  assert.deepEqual(config.terminalOutcomes, ["approved", "completed"]);
+  assert.deepEqual(config.runnableStatuses, ["ready", "running"]);
+  assert.equal(config.runtime.config.instructions, "first line\nsecond # literal");
+  const nested = config.runtime.config.nested as Readonly<Record<string, unknown>>;
+  assert.deepEqual(nested.values, ["one", "two: with spaces"]);
+  assert.deepEqual(config.workspace.hooks.beforeRun, {
+    executable: "npm",
+    args: ["install", "--flag=value with spaces", "https://example.test/a:b#fragment"],
+  });
+});
+
+test("complete YAML rejects duplicate keys, tags, merge keys, directives, multiple documents, and complex keys", () => {
+  const invalid = [
+    "runtime: one\nruntime: two",
+    "value: !custom tagged",
+    "value: !!str tagged",
+    "value: !!timestamp 2026-01-01",
+    "base: &base { value: one }\nmerged: { <<: *base }",
+    "%YAML 1.2\n---\nruntime: {}",
+    "%TAG !e! tag:example.test,2026:\n---\nvalue: plain",
+    "runtime: {}\n---\nruntime: {}",
+    "? [one, two]\n: value",
+    "1: value",
+    "true: value",
+    "null: value",
+    "key: &key named\n*key: value",
+    "runtime:\n\tname: scripted",
+  ];
+  for (const source of invalid) assert.throws(() => parseSimpleYaml(source), /config\.yaml|YAML/u);
+
+  const quoted = parseSimpleYaml('"1": numeric\n"true": boolean\n"null": nullable');
+  assert.deepEqual({ ...quoted }, { "1": "numeric", true: "boolean", null: "nullable" });
+});
+
+test("complete YAML enforces mapping roots and safe portable values", () => {
+  for (const source of ["null", "value", "[one, two]", "42"]) {
+    assert.throws(() => parseSimpleYaml(source), /mapping root/u);
+  }
+  assert.throws(() => parseSimpleYaml("value: .inf"), /finite YAML number/u);
+  assert.throws(() => parseSimpleYaml("value: -.Inf"), /finite YAML number/u);
+});
+
+test("complete YAML rejects cyclic or excessive aliases but safely copies bounded shared aliases", () => {
+  assert.throws(() => parseSimpleYaml("root: &root\n  self: *root"), /Cyclic YAML alias/u);
+  const exponential = [
+    "a: &a [one, one, one, one, one, one, one, one, one]",
+    "b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]",
+    "c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]",
+    "d: [*c, *c, *c, *c, *c, *c, *c, *c, *c]",
+  ].join("\n");
+  assert.throws(() => parseSimpleYaml(exponential), /alias/u);
+
+  const parsed = parseSimpleYaml([
+    "shared: &shared",
+    "  nested: safe",
+    "first: *shared",
+    "second: *shared",
+  ].join("\n"));
+  assert.equal((parsed.first as Readonly<Record<string, unknown>>).nested, "safe");
+  assert.equal((parsed.second as Readonly<Record<string, unknown>>).nested, "safe");
+  assert.notEqual(parsed.first, parsed.second);
+});
+
+test("complete YAML rejects prototype-sensitive keys at every configuration depth", async () => {
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    assert.throws(() => parseSimpleYaml(`${key}: unsafe`), /Unsafe YAML key/u);
+    await assert.rejects(loadSource(`runtime:\n  name: scripted\n  config:\n    ${key}: unsafe\ninitialRole: implementation`), /Unsafe YAML key/u);
+  }
+  const parsed = parseSimpleYaml("runtime:\n  name: scripted");
+  assert.equal(Object.getPrototypeOf(parsed), null);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "toString"), false);
+});
 
 test("repository configuration exposes every section 17 policy as typed values", async () => {
   const config = await load([

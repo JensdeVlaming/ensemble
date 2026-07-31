@@ -142,8 +142,8 @@ test("configuration is completely repository-defined", async () => {
   assert.match(config.agents, /strict TypeScript/u);
 });
 
-test("simple YAML rejects unsupported syntax", () => {
-  assert.throws(() => parseSimpleYaml("items:\n  - one"), /Unsupported YAML/u);
+test("repository YAML accepts block sequences through the stable parser export", () => {
+  assert.deepEqual(parseSimpleYaml("items:\n  - one\n  - two").items, ["one", "two"]);
 });
 
 test("scheduler is deterministic and synchronizes structured results", async () => {
