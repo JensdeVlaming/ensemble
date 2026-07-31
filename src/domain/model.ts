@@ -72,12 +72,72 @@ export interface RepositoryConfiguration {
   readonly runningStatus: string;
   readonly completedStatus: string;
   readonly failedStatus: string;
+  readonly blockedStatus: string;
+  readonly service: ServicePolicy;
+  readonly concurrency: ConcurrencyPolicy;
   readonly retry: RetryPolicy;
+  readonly timeouts: TimeoutPolicy;
+  readonly shutdown: ShutdownPolicy;
+  readonly workspace: WorkspacePolicy;
 }
+
+export interface ServicePolicy {
+  readonly pollIntervalMs: number;
+}
+
+export interface ConcurrencyPolicy {
+  readonly global: number;
+  readonly byStatus: Readonly<Record<string, number>>;
+}
+
+export type FailureKind =
+  | "startup"
+  | "provider"
+  | "configuration"
+  | "runtime"
+  | "timeout"
+  | "stalled"
+  | "reconciliation"
+  | "shutdown";
 
 export interface RetryPolicy {
   /** Maximum failed executions retained per role before further retries stop. */
   readonly maxFailedAttemptsPerRole: number;
+  readonly initialDelayMs: number;
+  readonly maxDelayMs: number;
+  readonly multiplier: number;
+  readonly jitterRatio: number;
+  readonly retryableFailureKinds: readonly FailureKind[];
+}
+
+export interface TimeoutPolicy {
+  readonly startupMs: number;
+  readonly providerMs: number;
+  readonly runtimeStartMs: number;
+  readonly turnMs: number;
+  readonly stallMs: number;
+  readonly cancellationMs: number;
+}
+
+export interface ShutdownPolicy {
+  readonly drainTimeoutMs: number;
+}
+
+export interface WorkspaceHook {
+  readonly executable: string;
+  readonly args: readonly string[];
+}
+
+export interface WorkspaceHooks {
+  readonly afterCreate?: WorkspaceHook;
+  readonly beforeRun?: WorkspaceHook;
+  readonly afterRun?: WorkspaceHook;
+  readonly beforeRemove?: WorkspaceHook;
+}
+
+export interface WorkspacePolicy {
+  readonly hooks: WorkspaceHooks;
+  readonly hookTimeoutMs: number;
 }
 
 export interface RuntimeSelection {

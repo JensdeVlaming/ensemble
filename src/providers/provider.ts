@@ -1,4 +1,4 @@
-import type { Artifact, Task, TaskComment, TaskId } from "../domain/model.ts";
+import type { Artifact, FailureKind, Task, TaskComment, TaskId } from "../domain/model.ts";
 
 export interface TaskQuery {
   /** Provider adapters map their own assignment/archive/terminal concepts here. */
@@ -15,8 +15,6 @@ export interface ExecutionRecord {
   readonly failure?: FailureDetail;
   readonly blockingRequest?: BlockingRequest;
 }
-
-export type FailureKind = "startup" | "provider" | "configuration" | "runtime" | "timeout" | "stalled" | "reconciliation" | "shutdown";
 
 export interface FailureDetail {
   readonly kind: FailureKind;
