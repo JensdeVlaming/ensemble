@@ -145,14 +145,48 @@ test("failures in an earlier role do not exhaust a later role", async () => {
   assert.equal((await scheduler(provider, runtime, new CountingWorkspaces(root)).poll())[0]?.role, "reviewer");
 });
 
-test("durable active execution bypasses status and retry eligibility", async () => {
+test("authoritative ineligibility cancels durable active work before workspace allocation", async () => {
   const root = await fixture(0);
   const provider = new InMemoryProvider([task("recover", "archived")]);
   const active = await provider.beginExecution("recover", "reviewer", "archived");
   const runtime = new ScriptedRuntime("scripted", { outcome: "approved", summary: "recovered", comments: [], artifacts: [] });
-  const [report] = await scheduler(provider, runtime, new CountingWorkspaces(root)).poll();
+  const workspaces = new CountingWorkspaces(root);
+  const [report] = await scheduler(provider, runtime, workspaces).poll();
   assert.equal(report?.role, "reviewer");
-  assert.equal((await provider.getExecutionState("recover")).history[0]?.id, active.id);
+  assert.equal(report?.outcome, "failed");
+  assert.match(report?.error ?? "", /not runnable/u);
+  const state = await provider.getExecutionState("recover");
+  assert.equal(state.active, undefined);
+  assert.equal(state.history[0]?.id, active.id);
+  assert.deepEqual(state.history[0]?.failure, { kind: "reconciliation", retryable: false });
+  assert.equal(workspaces.created, 0);
+  assert.equal(runtime.contexts.length, 0);
+});
+
+test("live reconciliation cancels the ExecutionEngine handle and cleans its workspace", async () => {
+  const root = await fixture();
+  const delegate = new InMemoryProvider([task("terminal")]);
+  let runtimeCancellations = 0;
+  const runtime: Runtime = {
+    name: "scripted",
+    prepare: async (context) => ({ id: "terminal", context, payload: null }),
+    start: async () => ({
+      id: "terminal",
+      events: (async function* () {})(),
+      result: new Promise<never>(() => undefined),
+    }),
+    resume: async (session) => session,
+    cancel: async () => { runtimeCancellations += 1; },
+  };
+  const workspaces = new CountingWorkspaces(root);
+  const active = scheduler(delegate, runtime, workspaces);
+
+  assert.deepEqual((await active.tick()).dispatchedTaskIds, ["terminal"]);
+  await delegate.updateStatus("terminal", "done");
+  assert.deepEqual((await active.tick()).dispatchedTaskIds, []);
+  await waitFor(() => runtimeCancellations === 1 && workspaces.cleaned === 1);
+  const state = await delegate.getExecutionState("terminal");
+  assert.deepEqual(state.history[0]?.failure, { kind: "reconciliation", retryable: false });
 });
 
 test("scheduler rejects ineligible, provider-read, and configuration failures before workspace allocation", async () => {
@@ -266,3 +300,11 @@ test("retry configuration rejects negative and fractional values", async () => {
     await assert.rejects(new RepositoryConfigLoader().load(repository, root), /non-negative integer/u);
   }
 });
+
+async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error("Condition was not reached");
+}

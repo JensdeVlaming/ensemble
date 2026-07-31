@@ -1,7 +1,7 @@
 import { ExecutionCancelledError } from "../execution/engine.ts";
 import type { ConfiguredExecution, RunningExecution, TaskExecutionService } from "../execution/engine.ts";
 import { ProviderClaimConflict } from "../providers/provider.ts";
-import type { ExecutionRecord, ProviderAdapter, ProviderExecutionState } from "../providers/provider.ts";
+import type { ExecutionRecord, ProviderAdapter, ProviderExecutionState, TaskRefreshResult } from "../providers/provider.ts";
 import type { RepositoryConfiguration, RuntimeResult, Task } from "../domain/model.ts";
 
 export interface ScheduleReport {
@@ -34,10 +34,26 @@ export interface SchedulerShutdownReport {
 interface WorkerReservation {
   readonly taskId: string;
   readonly configuration: RepositoryConfiguration;
+  readonly completion: Deferred<ScheduleReport | undefined>;
   status: string;
   executionId?: string;
   role?: string;
   running?: RunningExecution;
+  reconciliation?: ReconciliationQuarantine;
+}
+
+interface ReconciliationQuarantine {
+  readonly taskId: string;
+  readonly executionId: string;
+  readonly role: string;
+  readonly configuration: RepositoryConfiguration;
+  readonly reservation: WorkerReservation;
+  readonly summary: string;
+  readonly settled: Deferred<void>;
+  durableSettled: boolean;
+  localSettled: boolean;
+  providerAttempt?: Promise<void>;
+  lastReport?: ScheduleReport;
 }
 
 interface DispatchEntry {
@@ -53,6 +69,7 @@ interface Deferred<T> {
 
 export class Scheduler {
   readonly #workers = new Map<string, WorkerReservation>();
+  readonly #quarantines = new Map<string, ReconciliationQuarantine>();
   readonly #idleWaiters = new Set<() => void>();
   #tickInProgress?: Promise<readonly DispatchEntry[]>;
   #pollDispatchTail: Promise<void> = Promise.resolve();
@@ -76,7 +93,7 @@ export class Scheduler {
       await this.executions.withConfiguration(task, async () => undefined);
       validated.push(task.id);
     }
-    await this.#reconcileForStartup();
+    await this.#reconcileActiveWork();
     return Object.freeze({ validatedTaskIds: Object.freeze(validated) });
   }
 
@@ -121,11 +138,13 @@ export class Scheduler {
 
   async #dispatchTick(): Promise<readonly DispatchEntry[]> {
     if (!this.#accepting) return Object.freeze([]);
+    const reconciledTaskIds = await this.#reconcileActiveWork();
+    if (!this.#accepting) return Object.freeze([]);
     const tasks = await this.provider.discoverTasks({ scope: "workflow_candidates" });
     const entries: DispatchEntry[] = [];
     for (const discovered of [...tasks].sort(compareCandidates)) {
       if (!this.#accepting) break;
-      if (this.#workers.has(discovered.id)) continue;
+      if (reconciledTaskIds.has(discovered.id) || this.#workers.has(discovered.id) || this.#quarantines.has(discovered.id)) continue;
       const entry = await this.#dispatchCandidate(discovered);
       if (entry) entries.push(entry);
     }
@@ -140,10 +159,11 @@ export class Scheduler {
       return settledEntry(discovered.id, failureReport(discovered.id, "unknown", error));
     }
     if (!this.#accepting) return undefined;
-    if (this.#workers.has(task.id)) return undefined;
+    if (this.#workers.has(task.id) || this.#quarantines.has(task.id)) return undefined;
     try {
       return await this.executions.withConfiguration(task, async (execution) => {
-        if (!this.#accepting || this.#workers.has(task.id) || !this.#hasCapacity(execution.configuration, task.status)) return undefined;
+        if (!this.#accepting || this.#workers.has(task.id) || this.#quarantines.has(task.id)
+          || !this.#hasCapacity(execution.configuration, task.status)) return undefined;
         return this.#reserveAndDispatch(task, execution);
       });
     } catch (error) {
@@ -170,6 +190,7 @@ export class Scheduler {
     const reservation: WorkerReservation = {
       taskId: task.id,
       configuration: execution.configuration,
+      completion,
       status: task.status,
     };
     this.#workers.set(task.id, reservation);
@@ -179,13 +200,24 @@ export class Scheduler {
     try {
       const state = await this.provider.getExecutionState(task.id);
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
+      const selectedRole = selectRole(state, execution.configuration);
+      roleName = selectedRole;
+      if (state.active) {
+        executionId = state.active.id;
+        roleName = state.active.role;
+        reservation.executionId = state.active.id;
+        reservation.role = state.active.role;
+        const reason = reconciliationReason(task, execution.configuration);
+        if (reason) {
+          this.#beginReconciliationCancellation(reservation, reason, task.status, true);
+          return entry(false);
+        }
+      }
       if (task.dispatchable === false) {
         this.#release(reservation);
         completion.resolve(undefined);
         return entry(false);
       }
-      const selectedRole = selectRole(state, execution.configuration);
-      roleName = selectedRole;
       if (!state.active && !isEligible(task, state, selectedRole, execution.configuration)) {
         this.#release(reservation);
         completion.resolve(undefined);
@@ -218,10 +250,14 @@ export class Scheduler {
         void running.cancel("shutdown").catch(() => undefined);
       }
       void this.#completeWorker(task, reservation, roleName, active.id, running).then(
-        completion.resolve,
+        (report) => {
+          if (!reservation.reconciliation) completion.resolve(report);
+        },
         (error: unknown) => {
-          this.#release(reservation);
-          completion.resolve(failureReport(task.id, roleName, error));
+          if (!reservation.reconciliation) {
+            this.#release(reservation);
+            completion.resolve(failureReport(task.id, roleName, error));
+          }
         },
       );
       return entry(this.#accepting);
@@ -247,16 +283,18 @@ export class Scheduler {
   ): Promise<ScheduleReport> {
     try {
       const report = await running.result;
+      if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
       await this.#synchronize(task, reservation.configuration, roleName, executionId, report.result);
       const terminal = reservation.configuration.terminalOutcomes.includes(report.result.outcome);
       return { taskId: task.id, outcome: terminal ? "completed" : "advanced", role: roleName, nextRole: report.result.nextRole };
     } catch (error) {
+      if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
       if (error instanceof ExecutionCancelledError && error.reason === "shutdown") {
         return this.#recordCancellation(task.id, reservation.configuration, roleName, executionId);
       }
       return this.#recordFailure(task, reservation.configuration, roleName, executionId, error);
     } finally {
-      this.#release(reservation);
+      if (!reservation.reconciliation) this.#release(reservation);
     }
   }
 
@@ -297,7 +335,7 @@ export class Scheduler {
   }
 
   async #performShutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport> {
-    if (this.#workers.size === 0 && this.#tickInProgress === undefined) {
+    if (this.#workers.size === 0 && this.#quarantines.size === 0 && this.#tickInProgress === undefined) {
       return Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
     }
     const drained = await waitWithin(this.#waitForIdle(), options.drainTimeoutMs);
@@ -305,12 +343,14 @@ export class Scheduler {
       return Object.freeze({ drained: true, cancelledTaskIds: Object.freeze([]), remainingTaskIds: Object.freeze([]) });
     }
 
-    const cancelledTaskIds = [...this.#workers.values()]
-      .filter((reservation) => reservation.executionId !== undefined)
-      .map((reservation) => reservation.taskId)
-      .sort();
+    const cancelledTaskIds = [...new Set([
+      ...[...this.#workers.values()]
+        .filter((reservation) => reservation.executionId !== undefined)
+        .map((reservation) => reservation.taskId),
+      ...this.#quarantines.keys(),
+    ])].sort();
     for (const reservation of this.#workers.values()) {
-      if (reservation.executionId && reservation.role) {
+      if (!reservation.reconciliation && reservation.executionId && reservation.role) {
         void this.#recordCancellation(
           reservation.taskId,
           reservation.configuration,
@@ -318,34 +358,178 @@ export class Scheduler {
           reservation.executionId,
         );
       }
-      if (reservation.running) {
+      if (!reservation.reconciliation && reservation.running) {
         void reservation.running.cancel("shutdown").catch(() => undefined);
         void reservation.running.result.catch(() => undefined);
       }
     }
+    for (const quarantine of this.#quarantines.values()) {
+      if (!quarantine.reservation.running) continue;
+      void quarantine.reservation.running.cancel("shutdown").catch(() => undefined);
+      void quarantine.reservation.running.result.catch(() => undefined);
+    }
     await waitWithin(this.#waitForIdle(), options.cancellationTimeoutMs);
     return Object.freeze({
-      drained: this.#workers.size === 0 && this.#tickInProgress === undefined,
+      drained: this.#workers.size === 0 && this.#quarantines.size === 0 && this.#tickInProgress === undefined,
       cancelledTaskIds: Object.freeze(cancelledTaskIds),
-      remainingTaskIds: Object.freeze([...this.#workers.keys()].sort()),
+      remainingTaskIds: Object.freeze([...new Set([...this.#workers.keys(), ...this.#quarantines.keys()])].sort()),
     });
   }
 
   #waitForIdle(): Promise<void> {
-    if (this.#workers.size === 0 && this.#tickInProgress === undefined) return Promise.resolve();
+    if (this.#workers.size === 0 && this.#quarantines.size === 0 && this.#tickInProgress === undefined) return Promise.resolve();
     return new Promise((resolve) => { this.#idleWaiters.add(resolve); });
   }
 
   #notifyIdle(): void {
-    if (this.#workers.size !== 0 || this.#tickInProgress !== undefined) return;
+    if (this.#workers.size !== 0 || this.#quarantines.size !== 0 || this.#tickInProgress !== undefined) return;
     for (const resolve of this.#idleWaiters) resolve();
     this.#idleWaiters.clear();
   }
 
-  async #reconcileForStartup(): Promise<void> {
-    const liveTaskIds = [...this.#workers.keys()].sort();
-    if (liveTaskIds.length === 0) return;
-    await this.provider.refreshTasks(liveTaskIds);
+  async #reconcileActiveWork(): Promise<ReadonlySet<string>> {
+    const taskIds = [...new Set([...this.#workers.keys(), ...this.#quarantines.keys()])].sort();
+    const excluded = new Set(this.#quarantines.keys());
+    if (taskIds.length === 0) return excluded;
+    const refreshed = await this.provider.refreshTasks(taskIds);
+    for (const taskId of taskIds) {
+      const result = refreshed.get(taskId);
+      if (!result || result.kind === "unreadable") continue;
+      const quarantine = this.#quarantines.get(taskId);
+      if (quarantine) {
+        this.#reconcileQuarantine(quarantine, result);
+        continue;
+      }
+      const reservation = this.#workers.get(taskId);
+      if (!reservation || reservation.reconciliation) continue;
+      if (result.kind === "missing") {
+        this.#beginReconciliationCancellation(
+          reservation,
+          "Ensemble execution cancelled during reconciliation: task is authoritatively missing",
+          undefined,
+          false,
+        );
+        excluded.add(taskId);
+        continue;
+      }
+      reservation.status = result.task.status;
+      const reason = reconciliationReason(result.task, reservation.configuration);
+      if (reason) {
+        this.#beginReconciliationCancellation(reservation, reason, result.task.status, true);
+        excluded.add(taskId);
+      }
+    }
+    return excluded;
+  }
+
+  #reconcileQuarantine(
+    quarantine: ReconciliationQuarantine,
+    result: Exclude<TaskRefreshResult, { readonly kind: "unreadable" }>,
+  ): void {
+    if (result.kind === "missing") {
+      quarantine.durableSettled = true;
+      this.#maybeClearQuarantine(quarantine);
+      return;
+    }
+    void this.#confirmOrRetryCancellation(quarantine, result.task.status).catch(() => undefined);
+  }
+
+  async #confirmOrRetryCancellation(quarantine: ReconciliationQuarantine, status: string): Promise<void> {
+    if (quarantine.durableSettled) {
+      this.#maybeClearQuarantine(quarantine);
+      return;
+    }
+    if (quarantine.providerAttempt) return;
+    try {
+      const state = await this.provider.getExecutionState(quarantine.taskId);
+      if (state.active?.id !== quarantine.executionId) {
+        quarantine.durableSettled = true;
+        this.#maybeClearQuarantine(quarantine);
+        return;
+      }
+    } catch {
+      return;
+    }
+    await this.#attemptReconciliationPersistence(quarantine, status);
+  }
+
+  #beginReconciliationCancellation(
+    reservation: WorkerReservation,
+    summary: string,
+    status: string | undefined,
+    persist: boolean,
+  ): void {
+    if (reservation.reconciliation || !reservation.executionId || !reservation.role) return;
+    const quarantine: ReconciliationQuarantine = {
+      taskId: reservation.taskId,
+      executionId: reservation.executionId,
+      role: reservation.role,
+      configuration: reservation.configuration,
+      reservation,
+      summary,
+      settled: deferred<void>(),
+      durableSettled: !persist,
+      localSettled: reservation.running === undefined,
+    };
+    reservation.reconciliation = quarantine;
+    this.#quarantines.set(reservation.taskId, quarantine);
+
+    if (persist && status !== undefined) void this.#attemptReconciliationPersistence(quarantine, status);
+    if (reservation.running) this.#observeLocalReconciliation(quarantine, reservation.running);
+    this.#maybeClearQuarantine(quarantine);
+    void this.#releaseReconciliationCapacity(quarantine);
+  }
+
+  #observeLocalReconciliation(quarantine: ReconciliationQuarantine, running: RunningExecution): void {
+    const resultSettled = running.result.then(() => undefined, () => undefined);
+    const cancellationSettled = Promise.resolve().then(() => running.cancel("reconciliation")).then(
+      () => undefined,
+      () => resultSettled,
+    );
+    void Promise.race([resultSettled, cancellationSettled]).then(() => {
+      quarantine.localSettled = true;
+      this.#maybeClearQuarantine(quarantine);
+    });
+  }
+
+  async #attemptReconciliationPersistence(quarantine: ReconciliationQuarantine, status: string): Promise<void> {
+    if (quarantine.durableSettled) return;
+    if (quarantine.providerAttempt) return quarantine.providerAttempt;
+    let attempt!: Promise<void>;
+    attempt = this.#persistCancellation(
+      quarantine.taskId,
+      quarantine.role,
+      quarantine.executionId,
+      "reconciliation",
+      status,
+      quarantine.summary,
+    ).then(
+      (report) => {
+        quarantine.lastReport = report;
+        quarantine.durableSettled = true;
+      },
+      (error: unknown) => {
+        quarantine.lastReport = failureReport(quarantine.taskId, quarantine.role, error);
+      },
+    ).finally(() => {
+      if (quarantine.providerAttempt === attempt) quarantine.providerAttempt = undefined;
+      this.#maybeClearQuarantine(quarantine);
+    });
+    quarantine.providerAttempt = attempt;
+    return attempt;
+  }
+
+  async #releaseReconciliationCapacity(quarantine: ReconciliationQuarantine): Promise<void> {
+    await waitWithin(quarantine.settled.promise, quarantine.configuration.timeouts.cancellationMs);
+    quarantine.reservation.completion.resolve(reconciliationReport(quarantine));
+    this.#release(quarantine.reservation);
+  }
+
+  #maybeClearQuarantine(quarantine: ReconciliationQuarantine): void {
+    if (!quarantine.durableSettled || !quarantine.localSettled) return;
+    if (this.#quarantines.get(quarantine.taskId) === quarantine) this.#quarantines.delete(quarantine.taskId);
+    quarantine.settled.resolve();
+    this.#notifyIdle();
   }
 
   async #stopReservation(
@@ -372,22 +556,40 @@ export class Scheduler {
   ): Promise<ScheduleReport> {
     const summary = "Ensemble execution cancelled during shutdown";
     try {
-      await this.provider.cancelExecution(taskId, executionId, {
-        record: {
-          id: executionId,
-          role: roleName,
-          outcome: "cancelled",
-          summary,
-          finishedAt: new Date().toISOString(),
-          failure: { kind: "shutdown", retryable: false },
-        },
-        status: configuration.failedStatus,
-        comment: summary,
-      });
-      return { taskId, outcome: "failed", role: roleName, error: summary };
+      return await this.#persistCancellation(
+        taskId,
+        roleName,
+        executionId,
+        "shutdown",
+        configuration.failedStatus,
+        summary,
+      );
     } catch (error) {
       return failureReport(taskId, roleName, error);
     }
+  }
+
+  async #persistCancellation(
+    taskId: string,
+    roleName: string,
+    executionId: string,
+    kind: "reconciliation" | "shutdown",
+    status: string,
+    summary: string,
+  ): Promise<ScheduleReport> {
+    await this.provider.cancelExecution(taskId, executionId, {
+      record: {
+        id: executionId,
+        role: roleName,
+        outcome: "cancelled",
+        summary,
+        finishedAt: new Date().toISOString(),
+        failure: { kind, retryable: false },
+      },
+      status,
+      comment: summary,
+    });
+    return { taskId, outcome: "failed", role: roleName, error: summary };
   }
 
   async #synchronize(task: Task, config: RepositoryConfiguration, role: string, executionId: string, result: RuntimeResult): Promise<void> {
@@ -436,6 +638,33 @@ function isEligible(task: Task, state: ProviderExecutionState, role: string, con
   if (!retrying) return config.runnableStatuses.includes(task.status);
   const failures = state.history.filter((record: ExecutionRecord) => record.role === role && record.outcome === "failed").length;
   return failures < config.retry.maxFailedAttemptsPerRole;
+}
+
+function reconciliationReason(task: Task, config: RepositoryConfiguration): string | undefined {
+  const prefix = "Ensemble execution cancelled during reconciliation:";
+  if (!sameRepository(task, config)) return `${prefix} task moved outside the captured repository route`;
+  if (task.blockers?.some((blocker) => !blocker.resolved)) return `${prefix} task has an unresolved blocker`;
+  if (task.dispatchable === false) return `${prefix} provider marked task ineligible`;
+  if (!config.runnableStatuses.includes(task.status)) return `${prefix} status '${task.status}' is not runnable`;
+  return undefined;
+}
+
+function sameRepository(task: Task, config: RepositoryConfiguration): boolean {
+  const current = task.repository;
+  const captured = config.repository;
+  return current.id === captured.id
+    && current.url === captured.url
+    && current.defaultBranch === captured.defaultBranch
+    && current.branch === captured.branch;
+}
+
+function reconciliationReport(quarantine: ReconciliationQuarantine): ScheduleReport {
+  return quarantine.lastReport ?? {
+    taskId: quarantine.taskId,
+    outcome: "failed",
+    role: quarantine.role,
+    error: quarantine.summary,
+  };
 }
 
 function deferred<T>(): Deferred<T> {
