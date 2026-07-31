@@ -1,4 +1,5 @@
 import type { ExecutionEnvironment, TaskExecutionService } from "../execution/engine.ts";
+import { ProviderClaimConflict } from "../providers/provider.ts";
 import type { ExecutionRecord, ProviderAdapter, ProviderExecutionState } from "../providers/provider.ts";
 import type { RepositoryConfiguration, RuntimeResult, Task } from "../domain/model.ts";
 
@@ -51,6 +52,7 @@ export class Scheduler {
     } catch (error) {
       return { taskId: task.id, outcome: "failed", role: "unknown", error: errorMessage(error) };
     }
+    if (task.dispatchable === false) return undefined;
     const selectedRole = selectRole(state, config);
     if (!state.active && !isEligible(task, state, selectedRole, config)) return undefined;
 
@@ -71,6 +73,7 @@ export class Scheduler {
       const terminal = config.terminalOutcomes.includes(report.result.outcome);
       return { taskId: task.id, outcome: terminal ? "completed" : "advanced", role: roleName, nextRole: report.result.nextRole };
     } catch (error) {
+      if (error instanceof ProviderClaimConflict) return undefined;
       const message = errorMessage(error);
       if (executionId) {
         await this.provider.failExecution(task.id, executionId, {
@@ -115,6 +118,7 @@ function selectRole(state: ProviderExecutionState, config: RepositoryConfigurati
 }
 
 function isEligible(task: Task, state: ProviderExecutionState, role: string, config: RepositoryConfiguration): boolean {
+  if (task.dispatchable === false || task.blockers?.some((blocker) => !blocker.resolved)) return false;
   const latest = state.history.at(-1);
   const retrying = latest?.outcome === "failed";
   if (!retrying) return config.runnableStatuses.includes(task.status);

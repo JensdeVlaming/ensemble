@@ -23,7 +23,8 @@ src/
 ├── domain/                 portable data contracts
 ├── providers/
 │   ├── provider.ts         provider adapter contract
-│   └── memory/             reference adapter
+│   ├── memory/             reference adapter
+│   └── vikunja/            production Vikunja API v1 adapter
 ├── orchestration/          deterministic scheduling policy
 ├── execution/              workspace and runtime lifecycle
 └── runtimes/
@@ -55,8 +56,62 @@ launcher is injectable for deterministic tests.
 Provider adapters expose durable execution history through
 `getExecutionState`. `discoverTasks({ scope: "workflow_candidates" })` means the
 adapter applies provider-specific assignment, archive, and terminal filters
-before the Scheduler allocates a workspace. Production provider adapters are
-deliberately outside this repository's scope.
+before the Scheduler allocates a workspace. The Vikunja adapter additionally
+supports paginated discovery, bounded API retries, targeted reconciliation,
+provider-owned execution journals, deterministic competing claims, and
+idempotent lifecycle synchronization.
+
+## Vikunja provider
+
+`VikunjaProvider` targets Vikunja's v1 API, including Vikunja 2.3 installations.
+Credentials are constructor/deployment inputs and are never stored in task
+metadata or repository configuration.
+
+```typescript
+const provider = new VikunjaProvider({
+  baseUrl: process.env.VIKUNJA_BASE_URL!,
+  token: process.env.VIKUNJA_API_TOKEN!,
+  projectId: 3,
+  viewId: 9,
+  repository: {
+    id: "ensemble",
+    url: "https://example.test/ensemble.git",
+    defaultBranch: "main",
+  },
+});
+
+await provider.validateConfiguration();
+```
+
+`requiredAssignee` and `requiredLabels` MAY be added when assignment or labels
+should further restrict dispatch.
+
+The adapter uses these labels by default:
+
+```text
+ensemble:ready
+ensemble:running
+ensemble:blocked
+ensemble:failed
+ensemble:completed
+```
+
+Tasks are unmanaged until one of these labels is attached. Repository statuses
+must use the corresponding portable names:
+
+```yaml
+statuses:
+  runnable: [ready, running]
+  running: running
+  completed: completed
+  failed: failed
+```
+
+Vikunja has no task custom fields. Ensemble therefore stores a machine-readable
+execution journal in reserved task comments and filters those comments out of
+agent context. Human comments and artifact links remain ordinary portable
+provider data. Completion is implemented as an idempotent journaled operation,
+so a retry repairs missing labels or comments without duplicating them.
 
 ## Repository retry policy
 

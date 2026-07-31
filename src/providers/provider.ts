@@ -12,6 +12,23 @@ export interface ExecutionRecord {
   readonly summary: string;
   readonly nextRole?: string;
   readonly finishedAt: string;
+  readonly failure?: FailureDetail;
+  readonly blockingRequest?: BlockingRequest;
+}
+
+export type FailureKind = "startup" | "provider" | "configuration" | "runtime" | "timeout" | "stalled" | "reconciliation" | "shutdown";
+
+export interface FailureDetail {
+  readonly kind: FailureKind;
+  readonly retryable: boolean;
+  readonly nextAttemptAt?: string;
+}
+
+export interface BlockingRequest {
+  readonly kind: "approval" | "user_input" | "tool_elicitation";
+  readonly summary: string;
+  readonly requestId?: string;
+  readonly createdAt: string;
 }
 
 export interface ActiveExecution {
@@ -33,9 +50,33 @@ export interface ExecutionCompletion {
   readonly status: string;
 }
 
+export type TaskRefreshResult =
+  | { readonly kind: "current"; readonly task: Task }
+  | { readonly kind: "missing" }
+  | { readonly kind: "unreadable"; readonly error: string };
+
+export interface ExecutionCancellation {
+  readonly record: ExecutionRecord;
+  readonly status: string;
+  readonly comment: string;
+}
+
+export class ProviderClaimConflict extends Error {
+  readonly taskId: TaskId;
+  readonly activeExecution: ActiveExecution;
+
+  constructor(taskId: TaskId, activeExecution: ActiveExecution) {
+    super(`Task ${taskId} is already claimed by execution ${activeExecution.id}`);
+    this.name = "ProviderClaimConflict";
+    this.taskId = taskId;
+    this.activeExecution = activeExecution;
+  }
+}
+
 export interface ProviderAdapter {
   readonly name: string;
   discoverTasks(query: TaskQuery): Promise<readonly Task[]>;
+  refreshTasks(ids: readonly TaskId[]): Promise<ReadonlyMap<TaskId, TaskRefreshResult>>;
   getTask(id: TaskId): Promise<Task>;
   getComments(id: TaskId): Promise<readonly TaskComment[]>;
   getArtifacts(id: TaskId): Promise<readonly Artifact[]>;
@@ -49,4 +90,8 @@ export interface ProviderAdapter {
   completeExecution(id: TaskId, executionId: string, completion: ExecutionCompletion): Promise<void>;
   /** Atomically and idempotently records a failed execution. */
   failExecution(id: TaskId, executionId: string, record: ExecutionRecord, status: string, comment: string): Promise<void>;
+  /** Atomically and idempotently records a reconciliation or shutdown cancellation. */
+  cancelExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void>;
+  /** Atomically and idempotently records work that requires operator action. */
+  blockExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void>;
 }

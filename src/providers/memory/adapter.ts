@@ -3,9 +3,11 @@ import type {
   ActiveExecution,
   ExecutionCompletion,
   ExecutionRecord,
+  ExecutionCancellation,
   ProviderAdapter,
   ProviderExecutionState,
   TaskQuery,
+  TaskRefreshResult,
 } from "../provider.ts";
 
 /** Reference adapter used by tests and local experiments. */
@@ -24,6 +26,15 @@ export class InMemoryProvider implements ProviderAdapter {
   async discoverTasks(query: TaskQuery): Promise<readonly Task[]> {
     if (query.scope !== "workflow_candidates") throw new Error(`Unsupported task query scope: ${String(query.scope)}`);
     return [...this.#tasks.values()].filter(this.#isWorkflowCandidate);
+  }
+
+  async refreshTasks(ids: readonly TaskId[]): Promise<ReadonlyMap<TaskId, TaskRefreshResult>> {
+    const refreshed = new Map<TaskId, TaskRefreshResult>();
+    for (const id of ids) {
+      const task = this.#tasks.get(id);
+      refreshed.set(id, task ? { kind: "current", task: { ...task } } : { kind: "missing" });
+    }
+    return refreshed;
   }
 
   async getTask(id: TaskId): Promise<Task> {
@@ -53,7 +64,7 @@ export class InMemoryProvider implements ProviderAdapter {
     if (nextRoleValue !== undefined && typeof nextRoleValue !== "string") throw new Error(`Invalid next role for task ${id}`);
     return Object.freeze({
       active: active && Object.freeze({ ...active }),
-      history: Object.freeze(history.map((record) => Object.freeze({ ...record }))),
+      history: Object.freeze(history.map(freezeExecutionRecord)),
       nextRole: nextRoleValue,
     });
   }
@@ -111,6 +122,16 @@ export class InMemoryProvider implements ProviderAdapter {
   async failExecution(id: TaskId, executionId: string, record: ExecutionRecord, status: string, comment: string): Promise<void> {
     await this.completeExecution(id, executionId, { record, comments: [comment], artifacts: [], status });
   }
+
+  async cancelExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void> {
+    await this.completeExecution(id, executionId, {
+      record: cancellation.record, comments: [cancellation.comment], artifacts: [], status: cancellation.status,
+    });
+  }
+
+  async blockExecution(id: TaskId, executionId: string, cancellation: ExecutionCancellation): Promise<void> {
+    await this.cancelExecution(id, executionId, cancellation);
+  }
 }
 
 function isActiveExecution(value: unknown): value is ActiveExecution {
@@ -128,8 +149,22 @@ function validateExecutionRecord(value: unknown): ExecutionRecord {
   const record = value as Partial<ExecutionRecord>;
   if (typeof record.id !== "string" || typeof record.role !== "string" || typeof record.outcome !== "string"
     || typeof record.summary !== "string" || typeof record.finishedAt !== "string"
-    || (record.nextRole !== undefined && typeof record.nextRole !== "string")) throw new Error("Invalid execution record");
+    || (record.nextRole !== undefined && typeof record.nextRole !== "string")
+    || (record.failure !== undefined && (!record.failure || typeof record.failure.kind !== "string"
+      || typeof record.failure.retryable !== "boolean" || (record.failure.nextAttemptAt !== undefined && typeof record.failure.nextAttemptAt !== "string")))
+    || (record.blockingRequest !== undefined && (!record.blockingRequest || typeof record.blockingRequest.kind !== "string"
+      || typeof record.blockingRequest.summary !== "string" || typeof record.blockingRequest.createdAt !== "string"))) {
+    throw new Error("Invalid execution record");
+  }
   return record as ExecutionRecord;
+}
+
+function freezeExecutionRecord(record: ExecutionRecord): ExecutionRecord {
+  return Object.freeze({
+    ...record,
+    failure: record.failure && Object.freeze({ ...record.failure }),
+    blockingRequest: record.blockingRequest && Object.freeze({ ...record.blockingRequest }),
+  });
 }
 
 function compareExecutionRecords(left: ExecutionRecord, right: ExecutionRecord): number {

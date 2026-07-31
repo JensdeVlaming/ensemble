@@ -9,8 +9,19 @@ export interface Task {
   readonly status: string;
   readonly labels: readonly string[];
   readonly assignees: readonly string[];
+  /** Adapter-derived eligibility after provider-specific routing and blocker checks. */
+  readonly dispatchable?: boolean;
+  /** Portable priority where lower values are dispatched first. */
+  readonly priority?: number;
+  readonly blockers?: readonly TaskBlocker[];
   readonly repository: RepositoryRef;
   readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+export interface TaskBlocker {
+  readonly id: TaskId;
+  readonly status?: string;
+  readonly resolved: boolean;
 }
 
 export interface RepositoryRef {
