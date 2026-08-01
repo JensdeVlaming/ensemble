@@ -64,6 +64,18 @@ test("host configuration is strict, immutable, and keeps runtime selection opera
   assert.throws(() => parseHostConfiguration(host().replace("level: info", "level: trace")), /logging\.level/u);
 });
 
+test("host configuration registers Codex App Server independently from the CLI fallback", () => {
+  const source = host().replace("type: codex-cli", "type: codex-app-server")
+    .replace("executionArguments: [--sandbox, workspace-write]", "serverArguments: [app-server, --listen, stdio://]\n    requestTimeoutMs: 45000");
+  const configuration = parseHostConfiguration(source);
+  const runtime = configuration.runtimes[0];
+  assert.equal(runtime?.type, "codex-app-server");
+  if (runtime?.type === "codex-app-server") {
+    assert.deepEqual(runtime.serverArguments, ["app-server", "--listen", "stdio://"]);
+    assert.equal(runtime.requestTimeoutMs, 45_000);
+  }
+});
+
 test("environment files are non-shell, bounded, duplicate-free, and permission checked", async () => {
   const root = await mkdtemp(join(tmpdir(), "ensemble-host-env-"));
   const path = join(root, "ensemble.env");

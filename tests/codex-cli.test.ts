@@ -55,7 +55,7 @@ test("Codex CLI transport builds argv, normalizes JSONL, extracts results, and r
   const launcher = new FakeLauncher([successful("thread-1"), successful("thread-2", "resumed")]);
   const transport = new CodexCliTransport({ executable: "codex-test", launcher,
     executionArguments: ["--sandbox", "workspace-write"], environment: { PATH: "/bin", CODEX_HOME: "/codex" } });
-  const first = await transport.start({ id: "request", cwd: "/workspace", prompt: "do work", config: { model: "configured-model" } });
+  const first = await transport.start({ id: "request", cwd: "/workspace", prompt: "do work", config: { model: "configured-model" }, tools: [] });
   const messages = [];
   for await (const message of first.messages) messages.push(message);
   assert.deepEqual(messages, [
@@ -79,20 +79,20 @@ test("Codex CLI transport rejects malformed JSONL and non-zero exits", async () 
   const malformed = new CodexCliTransport({ launcher: new FakeLauncher([new FakeProcess([
     JSON.stringify({ type: "thread.started", thread_id: "bad-json" }), "not-json",
   ])]) });
-  const badSession = await malformed.start({ id: "x", cwd: "/w", prompt: "x", config: {} });
+  const badSession = await malformed.start({ id: "x", cwd: "/w", prompt: "x", config: {}, tools: [] });
   await assert.rejects(badSession.result, /malformed JSONL/u);
 
   const failed = new CodexCliTransport({ launcher: new FakeLauncher([new FakeProcess([
     JSON.stringify({ type: "thread.started", thread_id: "bad-exit" }),
   ], new Error("exit 7"))]) });
-  const failedSession = await failed.start({ id: "x", cwd: "/w", prompt: "x", config: {} });
+  const failedSession = await failed.start({ id: "x", cwd: "/w", prompt: "x", config: {}, tools: [] });
   await assert.rejects(failedSession.result, /exit 7/u);
 });
 
 test("Codex CLI transport cancellation terminates the active process", async () => {
   const process = new FakeProcess([JSON.stringify({ type: "thread.started", thread_id: "cancel-me" })], undefined, true);
   const transport = new CodexCliTransport({ launcher: new FakeLauncher([process]) });
-  const session = await transport.start({ id: "x", cwd: "/w", prompt: "x", config: {} });
+  const session = await transport.start({ id: "x", cwd: "/w", prompt: "x", config: {}, tools: [] });
   await transport.cancel(session);
   assert.equal(process.killed, true);
 });

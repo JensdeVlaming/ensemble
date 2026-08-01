@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ResumeContext, RuntimeContext, RuntimeResult } from "../../domain/model.ts";
+import type { BlockingRequest, ResumeContext, RuntimeContext, RuntimeResult, RuntimeTool } from "../../domain/model.ts";
 import type { PreparedRun, Runtime, RuntimeEvent, RuntimeSession } from "../runtime.ts";
 
 export interface CodexRunRequest {
@@ -7,6 +7,7 @@ export interface CodexRunRequest {
   readonly cwd: string;
   readonly prompt: string;
   readonly config: Readonly<Record<string, unknown>>;
+  readonly tools: readonly RuntimeTool[];
 }
 
 export interface CodexTransportSession {
@@ -18,9 +19,12 @@ export interface CodexTransportSession {
 // The transport is the only surface that needs to understand a concrete Codex
 // invocation (CLI, SDK, hosted process, or a future protocol).
 export interface CodexTransport {
+  readonly defaultMaxTurns?: number;
+  validateConfiguration?(config: Readonly<Record<string, unknown>>): void;
   start(request: CodexRunRequest): Promise<CodexTransportSession>;
   resume(session: CodexTransportSession, prompt: string): Promise<CodexTransportSession>;
   cancel(session: CodexTransportSession): Promise<void>;
+  close?(session: CodexTransportSession): Promise<void>;
 }
 
 export class CodexContextBuilder {
@@ -88,6 +92,18 @@ export class CodexEventParser {
         return typeof message.body === "string" ? { type: "comment_requested", at, executionId, body: message.body } : undefined;
       case "next_agent_requested":
         return typeof message.role === "string" ? { type: "next_agent_requested", at, executionId, role: message.role } : undefined;
+      case "approval_requested": case "user_input_requested": case "tool_elicitation_requested":
+        return isBlockingRequest(message.request) ? { type: message.type, at, executionId, request: message.request } : undefined;
+      case "usage_updated":
+        return nonnegativeInteger(message.inputTokens) && nonnegativeInteger(message.outputTokens) && nonnegativeInteger(message.totalTokens)
+          ? { type: message.type, at, executionId, inputTokens: message.inputTokens,
+            outputTokens: message.outputTokens, totalTokens: message.totalTokens }
+          : undefined;
+      case "rate_limit_updated":
+        return typeof message.limitId === "string" ? { type: message.type, at, executionId, limitId: message.limitId,
+          ...(typeof message.usedPercent === "number" ? { usedPercent: message.usedPercent } : {}),
+          ...(typeof message.resetsAt === "string" ? { resetsAt: message.resetsAt } : {}) } : undefined;
+      case "heartbeat": return { type: message.type, at, executionId };
       default:
         return undefined;
     }
@@ -119,7 +135,7 @@ export class CodexResultBuilder {
 
 export class CodexRuntime implements Runtime {
   readonly name: string;
-  readonly #sessions = new WeakMap<RuntimeSession, CodexTransportSession>();
+  readonly #sessions = new WeakMap<RuntimeSession, CodexSessionState>();
 
   constructor(
     privateTransport: CodexTransport,
@@ -146,6 +162,8 @@ export class CodexRuntime implements Runtime {
 
   validateConfiguration(config: Readonly<Record<string, unknown>>): void {
     codexOperatorRequestPolicy(config);
+    codexMaxTurns(config, this.transport.defaultMaxTurns ?? 1);
+    this.transport.validateConfiguration?.(config);
   }
 
   async prepare(context: RuntimeContext): Promise<PreparedRun> {
@@ -164,50 +182,109 @@ export class CodexRuntime implements Runtime {
       cwd: prepared.context.workspace.repositoryPath,
       prompt: prepared.payload,
       config: prepared.context.runtimeConfig,
+      tools: prepared.context.tools,
     });
-    return this.wrap(transportSession, prepared.context.executionId);
+    return this.wrap({ current: transportSession,
+      maxTurns: codexMaxTurns(prepared.context.runtimeConfig, this.transport.defaultMaxTurns ?? 1), turnsUsed: 0 },
+    prepared.context.executionId);
   }
 
   async resume(session: RuntimeSession, context: ResumeContext): Promise<RuntimeSession> {
-    const transportSession = this.#sessions.get(session);
-    if (!transportSession) throw new Error(`Cannot resume unknown Codex session: ${session.id}`);
-    return this.wrap(await this.transport.resume(transportSession, this.promptBuilder.buildResume(context)), sessionExecutionId(session));
+    const state = this.#sessions.get(session);
+    if (!state) throw new Error(`Cannot resume unknown Codex session: ${session.id}`);
+    if (state.turnsUsed >= state.maxTurns) throw new Error(`Codex exhausted ${state.maxTurns} turns`);
+    state.current = await this.transport.resume(state.current, this.promptBuilder.buildResume(context));
+    return this.wrap(state, sessionExecutionId(session));
   }
 
   async cancel(session: RuntimeSession): Promise<void> {
-    const transportSession = this.#sessions.get(session);
-    if (!transportSession) return;
-    await this.transport.cancel(transportSession);
+    const state = this.#sessions.get(session);
+    if (!state) return;
+    await this.transport.cancel(state.current);
     this.#sessions.delete(session);
   }
 
-  private wrap(transportSession: CodexTransportSession, executionId: string): RuntimeSession {
+  private wrap(state: CodexSessionState, executionId: string): RuntimeSession {
     const parser = this.eventParser;
-    const result = transportSession.result.then((value) => this.resultBuilder.build(value));
-    const messages = transportSession.messages;
+    const resultBuilder = this.resultBuilder;
+    const transport = this.transport;
+    const result = deferredResult();
+    void result.promise.catch(() => undefined);
+    const sessionId = state.current.id;
     const events = async function* (): AsyncIterable<RuntimeEvent> {
-      yield { type: "run_started", at: new Date().toISOString(), executionId, sessionId: transportSession.id };
-      for await (const message of messages) {
-        const event = parser.parse(message, executionId);
-        if (event) yield event;
-      }
-      try {
-        const completed = await result;
-        yield { type: "run_completed", at: new Date().toISOString(), executionId, result: completed };
-      } catch (error) {
-        yield { type: "run_failed", at: new Date().toISOString(), executionId, error: error instanceof Error ? error.message : String(error) };
+      yield { type: "run_started", at: new Date().toISOString(), executionId, sessionId };
+      while (state.turnsUsed < state.maxTurns) {
+        state.turnsUsed += 1;
+        const turn = state.turnsUsed;
+        try {
+          for await (const message of state.current.messages) {
+            const event = parser.parse(message, executionId);
+            if (event) yield event;
+          }
+          const raw = await state.current.result;
+          try {
+            const completed = resultBuilder.build(raw);
+            result.resolve(completed);
+            yield { type: "run_completed", at: new Date().toISOString(), executionId, result: completed };
+            return;
+          } catch (error) {
+            if (turn >= state.maxTurns) throw new Error(`Codex exhausted ${state.maxTurns} turns without a valid structured result`, { cause: error });
+            yield { type: "progress_updated", at: new Date().toISOString(), executionId,
+              message: `Codex returned an invalid structured result; requesting correction (${turn + 1}/${state.maxTurns})` };
+            state.current = await transport.resume(state.current, correctiveResultPrompt(error));
+          }
+        } catch (error) {
+          result.reject(error);
+          yield { type: "run_failed", at: new Date().toISOString(), executionId,
+            error: error instanceof Error ? error.message : "Codex runtime failed" };
+          return;
+        }
       }
     };
-    const session = { id: transportSession.id, events: events(), result, executionId } as RuntimeSession & { readonly executionId: string };
-    this.#sessions.set(session, transportSession);
+    const session = { id: sessionId, events: events(), result: result.promise, executionId } as RuntimeSession & { readonly executionId: string };
+    this.#sessions.set(session, state);
     return session;
   }
 }
+
+interface CodexSessionState { current: CodexTransportSession; readonly maxTurns: number; turnsUsed: number }
 
 function codexOperatorRequestPolicy(config: Readonly<Record<string, unknown>>): "auto" | "reject" | "block" {
   const value = config.operatorRequests ?? "reject";
   if (value !== "auto" && value !== "reject" && value !== "block") throw new Error("Invalid Codex operatorRequests policy");
   return value;
+}
+
+function codexMaxTurns(config: Readonly<Record<string, unknown>>, fallback: number): number {
+  const value = config.maxTurns ?? fallback;
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 20) {
+    throw new Error("Invalid Codex maxTurns policy");
+  }
+  return value as number;
+}
+
+function correctiveResultPrompt(error: unknown): string {
+  const reason = error instanceof Error ? error.message : "invalid structured result";
+  return [
+    "Your previous response did not satisfy Ensemble's RuntimeResult contract.",
+    `Validation failed: ${reason.slice(0, 1_024)}`,
+    "Return only a structured result with outcome, summary, optional nextRole, comments, and artifacts.",
+  ].join("\n");
+}
+
+interface ResultDeferred {
+  readonly promise: Promise<RuntimeResult>;
+  resolve(value: RuntimeResult): void;
+  reject(error: unknown): void;
+}
+
+function deferredResult(): ResultDeferred {
+  let settled = false;
+  let resolvePromise!: (value: RuntimeResult) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<RuntimeResult>((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
+  return { promise, resolve(value) { if (!settled) { settled = true; resolvePromise(value); } },
+    reject(error) { if (!settled) { settled = true; rejectPromise(error); } } };
 }
 
 function sessionExecutionId(session: RuntimeSession): string {
@@ -230,4 +307,14 @@ function isArtifact(value: unknown): value is RuntimeResult["artifacts"][number]
 
 function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
+}
+
+function nonnegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function isBlockingRequest(value: unknown): value is BlockingRequest {
+  return isObject(value) && (value.kind === "approval" || value.kind === "user_input" || value.kind === "tool_elicitation")
+    && typeof value.summary === "string" && typeof value.createdAt === "string"
+    && (value.requestId === undefined || typeof value.requestId === "string");
 }

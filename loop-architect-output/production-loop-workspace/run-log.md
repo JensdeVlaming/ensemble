@@ -114,3 +114,55 @@
   blocking reconstruction, portable tool/event boundaries, race settlement,
   idempotency, architecture boundaries, and focused regression coverage.
 - Next boundary: commit milestone 1, then begin Codex App Server milestone 2.
+
+## 2026-08-01 — milestone 2 started
+
+- Committed milestone 1 as `875f990` (`feat(runtime): add portable blocking and
+  tool contracts`).
+- Began the Codex App Server transport and continuation milestone using the
+  current official JSON-RPC/thread/turn/server-request protocol reference.
+
+## 2026-08-01 — milestone 2 delivery revision 1
+
+- Added the bounded stdio JSON-RPC connection and App Server process transport.
+- Added Runtime-owned corrective turns on one live thread with max-turn
+  exhaustion, separate execution/thread/turn correlation, and cancellation.
+- Added blocking request policies, dynamic portable tools, item lifecycle,
+  usage/rate events, strict host registration, and retained CLI fallback.
+- Verification passed: 171 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 2 delivery judge.
+
+## 2026-08-01 — milestone 2 delivery revision 2
+
+- Independent judge verdict: `revise` with six App Server interoperability
+  blockers hidden by the initial fake fixtures.
+- Generated the TypeScript protocol schema from the installed Codex App Server
+  and aligned fixtures/implementation with its exact dynamic-tool, token-usage,
+  rate-limit, delta, and permission-response shapes.
+- Required thread and turn correlation on all scoped requests/events before tool
+  invocation or blocking projection.
+- Preserved resumable live threads during a bounded idle window and made the
+  original max-turn budget non-resetting across corrective and explicit resume
+  turns.
+- Added payload-free heartbeat projection for agent/reasoning/command/file
+  deltas and exact tests for official telemetry and permission denial.
+- Verification passed: 172 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 2 delivery judge revision 2.
+
+## 2026-08-01 — milestone 2 delivery revision 3
+
+- Independent judge found one remaining official-protocol edge: MCP elicitation
+  requires a thread correlation but may explicitly carry `turnId: null`.
+- Elicitation now requires the turn field, accepts null as specified, and checks
+  an exact active turn whenever a non-null ID is supplied. Other server requests
+  continue to require exact non-null thread and turn IDs.
+- Focused App Server tests, typecheck, and diff integrity pass.
+- Next boundary: final milestone 2 delivery judge.
+
+## 2026-08-01 — milestone 2 delivery gate passed
+
+- Independent judge verdict: `pass`, no blocking issues, confidence `0.99`.
+- Judge confirmed current official App Server interoperability, strict
+  correlations, continuation budgets, request policies, dynamic tools,
+  telemetry, activity, cancellation, and host/runtime boundaries.
+- Next boundary: commit milestone 2, then begin Vikunja-native tool milestone 3.

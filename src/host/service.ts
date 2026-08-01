@@ -16,6 +16,7 @@ import { Scheduler } from "../orchestration/scheduler.ts";
 import { VikunjaProvider } from "../providers/vikunja/adapter.ts";
 import { RuntimeRegistry } from "../runtimes/runtime.ts";
 import { CodexCliTransport } from "../runtimes/codex/cli-transport.ts";
+import { CodexAppServerTransport } from "../runtimes/codex/app-server-transport.ts";
 import { CodexRuntime } from "../runtimes/codex/runtime.ts";
 
 export interface HostControllerOptions {
@@ -159,12 +160,13 @@ function createRuntime(
   runtime: HostRuntimeConfiguration,
   environment: Readonly<Record<string, string | undefined>>,
 ): CodexRuntime {
-  if (runtime.type !== "codex-cli") throw new Error(`Unsupported runtime type: ${runtime.type}`);
-  return new CodexRuntime(new CodexCliTransport({
-    executable: runtime.executable,
-    executionArguments: runtime.executionArguments,
-    environment: runtimeEnvironment(runtime.environment.inherit, environment),
-  }), undefined, undefined, undefined, undefined, runtime.name);
+  const selectedEnvironment = runtimeEnvironment(runtime.environment.inherit, environment);
+  const transport = runtime.type === "codex-cli"
+    ? new CodexCliTransport({ executable: runtime.executable, executionArguments: runtime.executionArguments,
+      environment: selectedEnvironment })
+    : new CodexAppServerTransport({ executable: runtime.executable, arguments: runtime.serverArguments,
+      requestTimeoutMs: runtime.requestTimeoutMs, environment: selectedEnvironment });
+  return new CodexRuntime(transport, undefined, undefined, undefined, undefined, runtime.name);
 }
 
 async function executable(path: string, name: string): Promise<void> {
