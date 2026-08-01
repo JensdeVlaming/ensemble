@@ -1,12 +1,34 @@
 {
   "name": "ensemble",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "Runtime- and provider-independent orchestration for autonomous software engineering agents.",
+  "license": "UNLICENSED",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "ensemble": "./dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "SPEC.md",
+    "LICENSE",
+    "docs/",
+    "examples/"
+  ],
   "scripts": {
     "test": "node --test --experimental-strip-types tests/*.test.ts",
-    "check": "tsc --project tsconfig.json"
+    "check": "tsc --project tsconfig.json",
+    "build": "tsc --project tsconfig.build.json",
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "22.13.1",

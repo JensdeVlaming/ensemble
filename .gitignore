@@ -1,4 +1,6 @@
 node_modules/
+dist/
+ensemble-*.tgz
 __pycache__/
 *.py[cod]
 .codex/ralph-loop/

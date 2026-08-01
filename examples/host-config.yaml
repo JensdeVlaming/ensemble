@@ -1,0 +1,29 @@
+version: 1
+service:
+  startupTimeoutMs: 30000
+  stopTimeoutSeconds: 60
+logging:
+  level: info
+workspace:
+  root: /var/lib/ensemble/workspaces
+  preserve: true
+  gitExecutable: /usr/bin/git
+runtimes:
+  - name: codex
+    type: codex-cli
+    executable: /usr/local/bin/codex
+    executionArguments: [--sandbox, workspace-write, --skip-git-repo-check]
+    environment:
+      inherit: [PATH, HOME, CODEX_HOME, TMPDIR, LANG, LC_ALL]
+repositories:
+  - id: ensemble
+    url: https://github.com/example/ensemble.git
+    branch: main
+    configurationPath: /srv/ensemble
+    provider:
+      type: vikunja
+      baseUrl: https://vikunja.example.test
+      token: $VIKUNJA_API_TOKEN
+      projectId: 1
+      viewId: 1
+      requiredLabels: []
