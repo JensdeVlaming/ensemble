@@ -202,3 +202,48 @@
   cross-instance duplicate reconciliation, and aggregate portable output bounds.
 - Next boundary: commit milestone 3, then begin workspace identity and
   containment milestone 4.
+
+## 2026-08-01 — milestone 4 started
+
+- Committed milestone 3 as `fa26c6f` (`feat(vikunja): add credential-safe agent
+  tools`).
+- Began collision-safe workspace identity, manifests, legacy classification,
+  and containment hardening.
+
+## 2026-08-01 — milestone 4 delivery revision 1
+
+- Added namespaced hashed paths, strict identity manifests, opaque legacy
+  classification/migration, and containment revalidation before runtime use.
+- Verification passed: 181 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 4 delivery judge.
+
+## 2026-08-01 — milestone 4 delivery revision 2
+
+- Independent judge identified tautological final manifest validation and
+  pathname-only TOCTOU gaps for the base root, workspaces, legacy handles, and
+  cleanup.
+- The manager now retains the allocation's expected manifest, pins base,
+  workspace, and legacy device/inode identities, validates ownership and
+  non-writable directory boundaries, and rejects replacements at every public
+  action and before/after filesystem transitions.
+- Verification passed: 182 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 4 re-review.
+
+## 2026-08-01 — milestone 4 delivery revision 3
+
+- Independent judge requested identity pinning for repository/runtime directory
+  entries and safe configured-root ownership/modes.
+- Workspace registrations now pin and recheck all three component identities;
+  existing bases must be owned by the service user and reject group/other write
+  access on every boundary check.
+- Verification passed: 183 tests, typecheck, production build, diff integrity.
+- Next boundary: final milestone 4 delivery judge.
+
+## 2026-08-01 — milestone 4 delivery gate passed
+
+- Independent judge verdict: `pass`, no blocking issues, confidence `0.99`.
+- Judge confirmed complete component identity pinning, immutable manifest
+  validation, safe configured-root ownership/modes, opaque legacy operations,
+  and practical Node.js containment guarantees.
+- Next boundary: commit milestone 4, then begin repository refresh and lifecycle
+  hooks milestone 5.

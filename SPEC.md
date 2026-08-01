@@ -948,6 +948,15 @@ Workspaces are disposable.
 
 The repository and task provider remain the persistent sources of truth.
 
+New workspace directory names MUST combine a readable task prefix with a stable
+hash of the provider/repository namespace and the exact opaque task ID. Each
+workspace MUST contain a mode-restricted `.ensemble-runtime/workspace.json`
+manifest recording the schema version, namespace, exact task ID, and immutable
+repository identity. Restoration MUST validate that manifest before exposing a
+runtime working directory. Legacy directories without a manifest MUST never be
+restored directly; migration classifies them through opaque handles and requires
+an exact, unambiguous caller-supplied task identity before use.
+
 The configured workspace root MUST resolve to an absolute path before service
 startup. Every derived workspace path MUST be collision-resistant, MUST remain
 strictly contained by that root after normalization and symbolic-link checks,

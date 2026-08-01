@@ -116,6 +116,7 @@ export async function buildHostController(
       workspaceRoot,
       new GitRepositoryDriver(configuration.workspace.gitExecutable),
       configuration.workspace.preserve,
+      `${provider.name}:${registration.id}`,
     );
     const engine = new ExecutionEngine(runtimes, workspaces, configurations, () => undefined, 100,
       () => new Date().toISOString(), logger);

@@ -221,6 +221,7 @@ export class ExecutionEngine implements TaskExecutionService {
 
   async #start(workspace: Workspace, configuration: RepositoryConfiguration, request: RuntimeExecutionRequest): Promise<RunningExecution> {
     try {
+      await this.workspaces.validate?.(workspace);
       const runtime = this.runtimes.get(configuration.runtime.name);
       this.#emit(request.task, contextEvent(request, "runtime.prepare_started", "debug"));
       const prepared = await runtime.prepare({

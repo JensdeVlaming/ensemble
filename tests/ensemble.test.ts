@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { leaseClaim } from "./lease-helpers.ts";
@@ -86,16 +86,24 @@ test("local workspaces create, restore, and apply cleanup policy", async () => {
   };
   const preserved = new LocalWorkspaceManager(base, repositories);
   const created = await preserved.create(task("Task / 42"));
-  assert.equal(created.root, join(base, "task-42"));
+  assert.equal(dirname(created.root), base);
+  assert.match(basename(created.root), /^task-42--[a-f0-9]{20}$/u);
   assert.deepEqual(materialized, [created.repositoryPath]);
   assert.equal(await readFile(join(created.repositoryPath, "README.md"), "utf8"), "materialized");
   assert.equal((await stat(created.runtimePath)).isDirectory(), true);
+  const manifestPath = join(created.runtimePath, "workspace.json");
+  assert.deepEqual(JSON.parse(await readFile(manifestPath, "utf8")), {
+    schemaVersion: 1, namespace: "local", taskId: "Task / 42", repository,
+  });
+  assert.equal((await stat(manifestPath)).mode & 0o777, 0o600);
   assert.deepEqual(await preserved.restore(task("Task / 42")), created);
   await preserved.cleanup(created);
   assert.equal((await stat(created.root)).isDirectory(), true);
 
   const disposable = new LocalWorkspaceManager(base, repositories, false);
-  await disposable.cleanup(created);
+  const disposableRestore = await disposable.restore(task("Task / 42"));
+  assert.ok(disposableRestore);
+  await disposable.cleanup(disposableRestore);
   assert.equal(await disposable.restore(task("Task / 42")), undefined);
 });
 
@@ -123,6 +131,155 @@ test("local workspace cleanup rejects paths outside its absolute root", async ()
   }), /direct child/u);
   assert.equal((await stat(outside)).isDirectory(), true);
   assert.throws(() => new LocalWorkspaceManager("relative", { materialize: async () => undefined }), /absolute/u);
+});
+
+test("workspace identities resist normalized collisions and separate namespaces", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-identity-"));
+  const repositories = { materialize: async (_reference: RepositoryRef, target: string) => { await mkdir(target); } };
+  const firstManager = new LocalWorkspaceManager(base, repositories, true, "vikunja:ensemble");
+  const first = await firstManager.create(task("A/B"));
+  const collision = await firstManager.create(task("A B"));
+  const otherNamespace = await new LocalWorkspaceManager(base, repositories, true, "github:ensemble").create(task("A/B"));
+  assert.equal(new Set([first.root, collision.root, otherNamespace.root]).size, 3);
+  assert.match(basename(first.root), /^a-b--[a-f0-9]{20}$/u);
+  assert.deepEqual(await firstManager.restore(task("A/B")), first);
+  assert.deepEqual(await new LocalWorkspaceManager(base, repositories, true, "github:ensemble").restore(task("A/B")), otherNamespace);
+});
+
+test("workspace manifests fail closed on tampering, permissions, size, and symlinks", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-manifest-"));
+  const repositories = { materialize: async (_reference: RepositoryRef, target: string) => { await mkdir(target); } };
+
+  const tamperedManager = new LocalWorkspaceManager(base, repositories, true, "vikunja:tampered");
+  const tampered = await tamperedManager.create(task("tampered"));
+  const tamperedManifest = join(tampered.runtimePath, "workspace.json");
+  await writeFile(tamperedManifest, JSON.stringify({ schemaVersion: 1, namespace: "wrong", taskId: "tampered", repository, extra: true }));
+  await assert.rejects(tamperedManager.restore(task("tampered")), /manifest/u);
+
+  const modeManager = new LocalWorkspaceManager(base, repositories, true, "vikunja:mode");
+  const unsafeMode = await modeManager.create(task("mode"));
+  await chmod(join(unsafeMode.runtimePath, "workspace.json"), 0o644);
+  await assert.rejects(modeManager.restore(task("mode")), /unsafe/u);
+
+  const largeManager = new LocalWorkspaceManager(base, repositories, true, "vikunja:large");
+  const oversized = await largeManager.create(task("large"));
+  await writeFile(join(oversized.runtimePath, "workspace.json"), "x".repeat(16_385), { mode: 0o600 });
+  await assert.rejects(largeManager.restore(task("large")), /unsafe|large/u);
+
+  const linkManager = new LocalWorkspaceManager(base, repositories, true, "vikunja:link");
+  const linked = await linkManager.create(task("link"));
+  const outside = join(await mkdtemp(join(tmpdir(), "ensemble-manifest-outside-")), "workspace.json");
+  await writeFile(outside, JSON.stringify({ schemaVersion: 1, namespace: "vikunja:link", taskId: "link", repository }));
+  await unlink(join(linked.runtimePath, "workspace.json"));
+  await symlink(outside, join(linked.runtimePath, "workspace.json"));
+  await assert.rejects(linkManager.restore(task("link")), /unsafe/u);
+});
+
+test("workspace validation and deletion reject repository symlink replacement", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-symlink-"));
+  const outside = await mkdtemp(join(tmpdir(), "ensemble-workspace-safe-outside-"));
+  await writeFile(join(outside, "keep"), "safe");
+  const manager = new LocalWorkspaceManager(base, {
+    materialize: async (_reference, target) => { await mkdir(target); },
+  }, false, "vikunja:symlink");
+  const workspace = await manager.create(task("symlink"));
+  await rename(workspace.repositoryPath, `${workspace.repositoryPath}-original`);
+  await symlink(outside, workspace.repositoryPath);
+  await assert.rejects(manager.validate(workspace), /invalid directory|symbolic link|filesystem identity changed/u);
+  await assert.rejects(manager.cleanup(workspace), /invalid directory|symbolic link|filesystem identity changed/u);
+  assert.equal(await readFile(join(outside, "keep"), "utf8"), "safe");
+  assert.equal((await lstat(workspace.root)).isDirectory(), true);
+});
+
+test("workspace validation pins the allocated manifest, root, and configured root identities", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "ensemble-workspace-pinned-"));
+  const base = join(parent, "workspaces");
+  const repositories = { materialize: async (_reference: RepositoryRef, target: string) => { await mkdir(target); } };
+  const manager = new LocalWorkspaceManager(base, repositories, false, "vikunja:pinned");
+  const workspace = await manager.create(task("pinned"));
+  const manifestPath = join(workspace.runtimePath, "workspace.json");
+  await writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, namespace: "vikunja:pinned", taskId: "pinned",
+    repository: { ...repository, url: "local://replacement" } }), { mode: 0o600 });
+  await assert.rejects(manager.validate(workspace), /identity changed/u);
+
+  await writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, namespace: "vikunja:pinned", taskId: "pinned", repository }), { mode: 0o600 });
+  const originalRoot = `${workspace.root}-original`;
+  await rename(workspace.root, originalRoot);
+  await mkdir(workspace.repositoryPath, { recursive: true });
+  await mkdir(workspace.runtimePath);
+  await writeFile(manifestPath, JSON.stringify({ schemaVersion: 1, namespace: "vikunja:pinned", taskId: "pinned", repository }), { mode: 0o600 });
+  await assert.rejects(manager.validate(workspace), /filesystem identity changed/u);
+  await assert.rejects(manager.cleanup(workspace), /filesystem identity changed/u);
+
+  const rootManager = new LocalWorkspaceManager(base, repositories, true, "vikunja:base-pinned");
+  await rootManager.create(task("base-pinned"));
+  await rename(base, `${base}-original`);
+  await mkdir(base);
+  await assert.rejects(rootManager.restore(task("base-pinned")), /root identity changed/u);
+});
+
+test("workspace validation pins repository/runtime entries and rejects an unsafe configured root", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-components-"));
+  const repositories = { materialize: async (_reference: RepositoryRef, target: string) => { await mkdir(target); } };
+  const manager = new LocalWorkspaceManager(base, repositories, true, "vikunja:components");
+  const repositoryWorkspace = await manager.create(task("repository-component"));
+  await rename(repositoryWorkspace.repositoryPath, `${repositoryWorkspace.repositoryPath}-original`);
+  await mkdir(repositoryWorkspace.repositoryPath, { mode: 0o755 });
+  await assert.rejects(manager.validate(repositoryWorkspace), /filesystem identity changed/u);
+
+  const runtimeWorkspace = await manager.create(task("runtime-component"));
+  const manifest = await readFile(join(runtimeWorkspace.runtimePath, "workspace.json"));
+  await rename(runtimeWorkspace.runtimePath, `${runtimeWorkspace.runtimePath}-original`);
+  await mkdir(runtimeWorkspace.runtimePath, { mode: 0o700 });
+  await writeFile(join(runtimeWorkspace.runtimePath, "workspace.json"), manifest, { mode: 0o600 });
+  await assert.rejects(manager.validate(runtimeWorkspace), /filesystem identity changed/u);
+
+  const unsafeBase = await mkdtemp(join(tmpdir(), "ensemble-workspace-unsafe-base-"));
+  await chmod(unsafeBase, 0o777);
+  const unsafe = new LocalWorkspaceManager(unsafeBase, repositories, true, "vikunja:unsafe");
+  await assert.rejects(unsafe.classifyLegacy([]), /ownership or permissions are unsafe/u);
+});
+
+test("legacy workspaces are opaque, classified exactly, migrated before use, and quarantined safely", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-legacy-"));
+  const legacyRoot = join(base, "a-b");
+  await mkdir(join(legacyRoot, "repository"), { recursive: true });
+  await mkdir(join(legacyRoot, ".ensemble-runtime"));
+  const repositories = { materialize: async (_reference: RepositoryRef, target: string) => { await mkdir(target); } };
+  const manager = new LocalWorkspaceManager(base, repositories, true, "vikunja:ensemble");
+
+  assert.equal(await manager.restore(task("A/B")), undefined);
+  const [ambiguous] = await manager.classifyLegacy([task("A/B"), task("A B")]);
+  assert.equal(ambiguous?.kind, "ambiguous");
+  assert.doesNotMatch(JSON.stringify(ambiguous), new RegExp(base, "u"));
+
+  const [unique] = await manager.classifyLegacy([task("A/B")]);
+  assert.equal(unique?.kind, "unique");
+  assert.ok(unique?.kind === "unique");
+  const migrated = await manager.migrateLegacy(unique, task("A/B"));
+  assert.notEqual(migrated.root, legacyRoot);
+  assert.deepEqual(await manager.restore(task("A/B")), migrated);
+  await assert.rejects(manager.migrateLegacy(unique, task("A/B")), /already used/u);
+
+  const orphan = join(base, "orphan");
+  await mkdir(join(orphan, "repository"), { recursive: true });
+  await mkdir(join(orphan, ".ensemble-runtime"));
+  const unmatched = (await manager.classifyLegacy([task("A/B")])).find((match) => match.kind === "unmatched");
+  assert.ok(unmatched);
+  await manager.quarantineLegacy(unmatched.handle);
+  assert.equal((await readdir(base)).some((name) => name.startsWith(".ensemble-quarantine-")), true);
+  await assert.rejects(manager.quarantineLegacy(unmatched.handle), /already used/u);
+
+  const replacedRoot = join(base, "replace-me");
+  await mkdir(join(replacedRoot, "repository"), { recursive: true });
+  await mkdir(join(replacedRoot, ".ensemble-runtime"));
+  const replaced = (await manager.classifyLegacy([])).find((match) => match.kind === "unmatched"
+    && match.handle.id !== unmatched.handle.id);
+  assert.ok(replaced);
+  await rename(replacedRoot, `${replacedRoot}-original`);
+  await mkdir(replacedRoot);
+  await assert.rejects(manager.removeLegacy(replaced.handle), /filesystem identity changed/u);
+  assert.equal((await lstat(replacedRoot)).isDirectory(), true);
 });
 
 test("git repository materialization selects the configured branch", async () => {

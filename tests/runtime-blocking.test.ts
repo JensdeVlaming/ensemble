@@ -54,12 +54,15 @@ async function fixture(operatorRequests: string | null = "block"): Promise<strin
 
 class FixedWorkspaces implements WorkspaceManager {
   cleaned = 0;
+  validated = 0;
+  validationError?: Error;
   readonly repositoryPath: string;
   constructor(repositoryPath: string) { this.repositoryPath = repositoryPath; }
   async create(item: Task): Promise<Workspace> {
     return { root: `/blocking/${item.id}`, repositoryPath: this.repositoryPath, runtimePath: `/blocking/${item.id}/runtime` };
   }
   async restore(): Promise<Workspace | undefined> { return undefined; }
+  async validate(): Promise<void> { this.validated += 1; if (this.validationError) throw this.validationError; }
   async cleanup(): Promise<void> { this.cleaned += 1; }
 }
 
@@ -97,6 +100,29 @@ function engine(root: string, runtime: Runtime, workspaces = new FixedWorkspaces
 const at = "2026-08-01T10:00:00.000Z";
 const executionId = "event-execution";
 const approved: RuntimeResult = { outcome: "approved", summary: "Done", comments: [], artifacts: [] };
+
+test("ExecutionEngine revalidates workspace containment immediately before runtime preparation", async () => {
+  const root = await fixture();
+  const workspaces = new FixedWorkspaces(root);
+  workspaces.validationError = new Error("workspace boundary changed");
+  let prepared = false;
+  const runtime: Runtime = {
+    name: "controlled",
+    validateConfiguration: () => undefined,
+    prepare: async (context) => { prepared = true; return { id: "prepared", context, payload: null }; },
+    start: async () => { throw new Error("must not start"); },
+    resume: async (session) => session,
+    cancel: async () => undefined,
+  };
+  const service = engine(root, runtime, workspaces);
+  await assert.rejects(service.withEnvironment(task(), (environment) => environment.start({
+    task: task(), role: { name: "implementation", instructions: "" }, comments: [], artifacts: [], executionId,
+  })), /workspace boundary changed/u);
+  assert.equal(workspaces.validated, 1);
+  assert.equal(prepared, false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(workspaces.cleaned, 1);
+});
 
 function request(id = "approval-1") {
   return { kind: "approval" as const, summary: "Approve repository write", requestId: id, createdAt: at };
