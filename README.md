@@ -4,9 +4,116 @@ Ensemble is a small, runtime- and provider-independent orchestration core for
 autonomous software engineering agents. The task provider owns workflow state;
 Ensemble retains only ephemeral process and workspace state.
 
+New adopters should start with the detailed [Starter Guide](docs/STARTER_GUIDE.md).
+
 ## Requirements
 
-- Node.js 22.6 or newer (the implementation uses Node's type stripping)
+- Node.js 22.6 or newer
+- Git for repository workspace materialization
+- A configured task-provider adapter; see the [provider guides](docs/providers/README.md)
+- Any executable or endpoint required by a selected optional runtime; see the
+  [runtime guides](docs/runtimes/README.md)
+
+## Run Ensemble continuously
+
+Ensemble ships a compiled `ensemble` CLI. Linux with systemd is the primary
+service platform; macOS launchd is also supported. Windows can use foreground
+mode where its Node.js dependencies work, but Windows Service installation is
+not included.
+
+Build and install the local package:
+
+```sh
+npm install
+npm run build
+npm pack
+npm install --global ./ensemble-0.1.0.tgz
+```
+
+Initialize platform-default configuration, edit the generated YAML and protected
+environment file, validate it without dispatching work, then install the service:
+
+```sh
+ensemble init
+ensemble validate
+ensemble service install
+ensemble service start
+ensemble service status
+ensemble service logs
+```
+
+On Linux these setup commands use `/etc/ensemble` and `/var/lib/ensemble` and
+must be run with the permissions required to create the dedicated `ensemble`
+system user and systemd unit. On macOS they use `~/Library/Application Support/Ensemble`
+and install a user LaunchAgent. `ensemble run` runs the identical service in the
+foreground on either platform. `SIGINT` and `SIGTERM` stop intake, drain live
+workers within repository bounds, persist cancellations, and release the
+single-instance guard.
+
+The protected environment file is deliberately not shell syntax:
+
+```text
+TASK_PROVIDER_TOKEN=replace-me
+```
+
+It must be a regular non-symlink. macOS and same-owner Linux files require mode
+`0600`; a root-owned Linux file may be mode `0640` when its group is the
+`ensemble` service group. Secrets are resolved only by the controller and are
+registered with structured-log redaction.
+
+Host configuration is separate from repository-owned `.ensemble` workflow
+configuration. A complete registration has this shape:
+
+```yaml
+version: 1
+service:
+  startupTimeoutMs: 30000
+  stopTimeoutSeconds: 60
+logging:
+  level: info
+workspace:
+  root: /var/lib/ensemble/workspaces
+  preserve: true
+  gitExecutable: /usr/bin/git
+runtimes:
+  - name: agent-runtime
+    # Replace with the exact block from docs/runtimes/ for the selected
+    # adapter.
+    type: runtime-specific
+repositories:
+  - id: ensemble
+    url: https://github.com/example/ensemble.git
+    branch: main
+    configurationPath: /srv/ensemble
+    provider:
+      # Replace with the exact block from docs/providers/ for the selected
+      # adapter.
+      type: provider-specific
+```
+
+The package also includes a Vikunja-and-Codex-based example at
+`examples/host-config.yaml` plus a non-secret
+`examples/ensemble.env.example` template. Follow the dedicated
+[Vikunja guide](docs/providers/VIKUNJA.md) and
+[Codex CLI guide](docs/runtimes/CODEX_CLI.md) for those adapter fields.
+
+Polling, worker, retry, turn, stall, cancellation, and drain bounds remain in
+the repository-owned workflow configuration so they hot-reload atomically with
+the workflow they govern. Host logging level and supervisor stop bounds live in
+the host file.
+
+Runtime registrations are optional. A repository selecting a runtime is
+rejected during validation unless a host runtime with that logical name exists.
+Runtime children receive only the explicitly allowlisted environment.
+Credential-like variables and all provider credential variables are rejected
+even if an operator attempts to allowlist them. Authentication and protocol
+setup are documented separately for each runtime.
+
+Git is available inside preserved task workspaces, so repository workflow
+instructions may request local commits. Pushing is opt-in. Passing
+`SSH_AUTH_SOCK` gives the runtime access to that agent socket and should only be
+done with a dedicated repository-scoped key. Ensemble itself does not own
+commits, pushes, pull requests, CI, or deployment.
 
 ## Run the tests
 
@@ -68,71 +175,21 @@ remain deployment inputs and must not be written into `.ensemble`.
 
 The stable public API is re-exported from `src/index.ts`. `InMemoryProvider` and
 `ScriptedRuntime` are executable reference adapters suitable for tests and local
-experiments. `GitRepositoryDriver` materializes isolated repository checkouts;
-`CodexRuntime` contains Codex-specific context, prompt, event, and result handling.
-`CodexCliTransport` is the concrete process-backed reference transport for the
-documented `codex exec --json` and `codex exec resume` protocol; its process
-launcher is injectable for deterministic tests.
+experiments. `GitRepositoryDriver` materializes isolated repository checkouts.
+Concrete runtime behavior and setup are documented in the
+[runtime guides](docs/runtimes/README.md).
 
 Provider adapters expose durable execution history through
 `getExecutionState`. `discoverTasks({ scope: "workflow_candidates" })` means the
 adapter applies provider-specific assignment, archive, and terminal filters
-before the Scheduler allocates a workspace. The Vikunja adapter additionally
-supports paginated discovery, bounded API retries, targeted reconciliation,
-provider-owned execution journals, deterministic competing claims, and
-idempotent lifecycle synchronization.
+before the Scheduler allocates a workspace.
 
-## Vikunja provider
+## Task providers
 
-`VikunjaProvider` targets Vikunja's v1 API, including Vikunja 2.3 installations.
-Credentials are constructor/deployment inputs and are never stored in task
-metadata or repository configuration.
-
-```typescript
-const provider = new VikunjaProvider({
-  baseUrl: process.env.VIKUNJA_BASE_URL!,
-  token: process.env.VIKUNJA_API_TOKEN!,
-  projectId: 3,
-  viewId: 9,
-  repository: {
-    id: "ensemble",
-    url: "https://example.test/ensemble.git",
-    defaultBranch: "main",
-  },
-});
-
-await provider.validateConfiguration();
-```
-
-`requiredAssignee` and `requiredLabels` MAY be added when assignment or labels
-should further restrict dispatch.
-
-The adapter uses these labels by default:
-
-```text
-ensemble:ready
-ensemble:running
-ensemble:blocked
-ensemble:failed
-ensemble:completed
-```
-
-Tasks are unmanaged until one of these labels is attached. Repository statuses
-must use the corresponding portable names:
-
-```yaml
-statuses:
-  runnable: [ready, running]
-  running: running
-  completed: completed
-  failed: failed
-```
-
-Vikunja has no task custom fields. Ensemble therefore stores a machine-readable
-execution journal in reserved task comments and filters those comments out of
-agent context. Human comments and artifact links remain ordinary portable
-provider data. Completion is implemented as an idempotent journaled operation,
-so a retry repairs missing labels or comments without duplicating them.
+Provider adapters have separate installation and task-preparation instructions.
+See the [task-provider guides](docs/providers/README.md), including the detailed
+[Vikunja guide](docs/providers/VIKUNJA.md). Provider-specific operational setup
+is kept out of the Starter Guide.
 
 ## Repository retry policy
 
@@ -148,15 +205,13 @@ The value counts failed executions separately for each role. It defaults to
 active executions always recover with their provider-stored role and execution
 ID, regardless of status or retry exhaustion.
 
-## Codex transport
+## Runtimes
 
-Construct the reference runtime with `new CodexRuntime(new CodexCliTransport())`.
-The transport uses argv arrays (never a shell command), does not embed a model or
-credentials, normalizes documented command events, extracts the final structured
-JSON result, supports resume by Codex thread ID, and cancels the child process.
-Authentication remains deployment configuration. A repository may select a
-model through `runtime.config.model`; the transport validates it and emits the
-documented `--model` argv pair without hard-coding any model name.
+Runtime adapters have separate installation, authentication, environment and
+protocol instructions. See the [runtime guides](docs/runtimes/README.md),
+including the detailed [Codex CLI guide](docs/runtimes/CODEX_CLI.md). The main
+Starter Guide describes only the shared Runtime contract and portable role
+lifecycle; adapter-specific setup stays in its runtime guide.
 
 ## Operational logs
 
