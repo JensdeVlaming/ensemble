@@ -1,31 +1,17 @@
-# Ensemble architecture refactor loop
+# Ensemble production-readiness loop
 
-This directory contains a portable, review-gated loop for assessing and
-refactoring Ensemble against [`../SPEC.md`](../SPEC.md).
+This directory contains the Loop Architect definition for completing Ensemble's
+remaining production-readiness work against `../SPEC.md`.
 
-The default execution path is the current Codex session using
-`RUN_IN_SESSION.md`. The external Python runner is available for an explicitly
-approved advanced run.
+The editable source is `loop.yaml`; `loop.resolved.json`, `LOOP.md`, and
+`RUN_IN_SESSION.md` are generated from it. The optional `run-loop.py` runner is
+kept portable. New plans, delivery evidence, judge verdicts, state, and logs are
+written under `production-loop-workspace/`. The earlier `loop-workspace/`
+directory remains as historical evidence from the completed architecture loop.
 
-## Artifacts
+The current session executes the loop and uses an isolated read-only Codex
+subagent as the independent judge. Secret-bearing files, generated packages,
+Git metadata, dependencies, and local Codex state are excluded from review.
 
-- `loop.yaml`: human-editable source design
-- `loop.resolved.json`: validated compiled specification
-- `LOOP.md`: rendered design summary
-- `RUN_IN_SESSION.md`: recommended execution handoff
-- `run-loop.py`: portable external runner
-- `loop-workspace/`: resumable state, assessments, plans, reviews, and reports
-
-## Validate or recompile
-
-```sh
-python3 /Users/jensdevlaming/.agents/skills/loop-architect/scripts/looper.py compile \
-  loop.yaml \
-  --out loop.resolved.json \
-  --render LOOP.md \
-  --session-prompt RUN_IN_SESSION.md
-```
-
-Do not place credentials in this directory. Both non-local council members
-require consent before their first send, and configured redaction globs apply.
-
+Commits are explicitly authorized. Pushes, pull requests, deployments,
+provider writes, registry publication, and hosted release creation are not.

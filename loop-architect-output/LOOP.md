@@ -1,30 +1,28 @@
-# ensemble-spec-architecture-refactor
+# ensemble-production-readiness
 
-Review and refactor Ensemble against SPEC.md with separate architecture review and structured specification-judge gates.
+Complete Ensemble's remaining specification work through dependency-ordered, independently judged implementation milestones.
 
 ## Goal
 
-Review and refactor Ensemble's implementation to conform to ../SPEC.md. Produce an architecture assessment, an approved implementation plan, focused code changes, tests, and a final compliance report. Preserve provider, runtime, repository, and workspace replaceability. Exclude production provider adapters, deployment infrastructure, UI, and features not required by the specification.
+Bring Ensemble from its current usable Vikunja and Codex CLI service to the production-ready state required by SPEC.md: portable runtime tools and operational events, Codex App Server support, resumable blocked work, credential-safe Vikunja-native tools, complete workspace lifecycle and containment, immutable operational snapshots and read-only endpoints, accurate operator documentation and backlog state, deployable release artifacts, and conformance evidence. Implement and commit coherent dependency-ordered milestones without weakening provider/runtime boundaries, durable provider truth, secret isolation, or cross-platform behavior.
 
 ## Definition of Done
 
-loop-workspace/architecture-assessment.md maps every material SPEC.md requirement to current evidence or a concrete gap; loop-workspace/plan.md contains an architecture-judge-approved implementation plan; the required in-scope refactor and focused tests are implemented in the Ensemble repository; npm test and npm run check pass; and loop-workspace/compliance-report.md provides requirement-by-requirement evidence with no unresolved in-scope blockers or TBDs.
+Every in-scope MUST requirement in SPEC.md has implementation and focused deterministic test evidence; Codex CLI remains an optional fallback while App Server supports continuation, tools, approvals, input, usage, and rate events; blocked work round-trips durably through ProviderAdapter; Vikunja tools execute on the host without credential egress; workspace hooks, restore verification, refresh, containment, and cleanup are bounded and safe; immutable snapshots and configured read-only health/status endpoints expose no secrets; npm test, npm run check, npm run build, npm pack --dry-run, git diff --check, artifact credential scans, and the v0.3 conformance suite pass; Linux and macOS service artifacts are verified, with any real-host or publication step that cannot be performed locally documented as an external acceptance item; each milestone is independently judged and committed.
 
 ## Verification
 
-- `unit-and-integration-tests` (programmatic)
-- `strict-typescript` (programmatic)
-- `required-artifacts` (programmatic)
-- `plan-spec-traceability` (judge)
-- `plan-boundary-safety` (judge)
-- `delivery-spec-compliance` (judge)
-- `delivery-change-traceability` (judge)
-- `delivery-test-quality` (judge)
+- `tests` (programmatic)
+- `types` (programmatic)
+- `build` (programmatic)
+- `diff-integrity` (programmatic)
+- `milestone-traceability` (judge)
+- `architecture-and-security` (judge)
+- `test-quality` (judge)
 
 ## Council
 
-- `architecture-reviewer`: reviewer via codex (default)
-- `spec-judge`: judge via codex (default)
+- `independent-judge`: judge via codex-subagent (gpt-5.6-sol)
 
 ## Gates
 
@@ -33,15 +31,15 @@ loop-workspace/architecture-assessment.md maps every material SPEC.md requiremen
 
 ## Loop Control
 
-- Max iterations: 8
-- Budget: `{"tokens": 800000, "wall_clock_min": 90}`
-- No-progress: `{"action": "human_checkpoint", "max_stalled_iterations": 2, "signals": ["the same blocking issue repeats without new evidence", "source and test behavior have no material change", "verifier output and compliance evidence are unchanged"]}`
+- Max iterations: 16
+- Budget: `{"tokens": 2000000, "wall_clock_min": 480}`
+- No-progress: `{"action": "human_checkpoint", "max_stalled_iterations": 2, "signals": ["the same blocking issue repeats without new evidence", "a delivery revision contains no material source or test change", "deterministic verifier output is unchanged after a claimed fix"]}`
 
 ## Execution Boundary
 
 - Mode: `in_session`
 - Isolation: `current_workspace`
-- Side effects: `{"allowed_writes": ["../src/**", "../tests/**", "../README.md", "../package.json", "../package-lock.json", "../tsconfig.json", "../.ensemble/**", "./loop-workspace/**"], "commits_pushes_prs_deployments": "forbidden_without_explicit_user_approval", "duplicate_action_check": true, "excluded_work": ["production provider adapters", "deployment infrastructure", "UI", "unrelated features"], "requires_approval": true}`
+- Side effects: `{"allowed_writes": ["../src/**", "../tests/**", "../docs/**", "../examples/**", "../README.md", "../SPEC.md", "../package.json", "../package-lock.json", "../tsconfig*.json", "../.ensemble/**", "./production-loop-workspace/**"], "commits": "explicitly_authorized", "duplicate_action_check": true, "excluded_work": ["Docker workers", "Windows Service integration", "mutable dashboard UI", "automatic source-control delivery", "publishing to registries or creating hosted releases without separate approval"], "pushes_prs_deployments": "forbidden_without_explicit_user_approval", "requires_approval": false}`
 
 ## Observability
 
@@ -66,7 +64,7 @@ loop-workspace/architecture-assessment.md maps every material SPEC.md requiremen
                v
 +--------------------------------+
 | 3. Plan gate                   |
-| verdict: spec-judge            |
+| verdict: independent-judge     |
 +--------------------------------+
                | needs work -> revise <= 3 -> step 2
                | pass
@@ -79,9 +77,9 @@ loop-workspace/architecture-assessment.md maps every material SPEC.md requiremen
                v
 +--------------------------------+
 | 5. Delivery gate               |
-| verdict: spec-judge            |
+| verdict: independent-judge     |
 +--------------------------------+
-               | needs work -> revise <= 4 -> step 4
+               | needs work -> revise <= 3 -> step 4
                | pass
                v
 +--------------------------------+
@@ -89,5 +87,5 @@ loop-workspace/architecture-assessment.md maps every material SPEC.md requiremen
 | all gates clean                |
 +--------------------------------+
 
-Stops: pass gates | max 8 iterations | no progress x2 | budget 90m, 800000 tokens
+Stops: pass gates | max 16 iterations | no progress x2 | budget 480m, 2000000 tokens
 ```

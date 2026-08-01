@@ -1,14 +1,13 @@
 {
   "$schema": "https://github.com/ksimback/looper/schema/loop.resolved.v1.json",
-  "compiled_at": "2026-07-31T08:35:37+00:00",
+  "compiled_at": "2026-08-01T12:11:29+00:00",
   "council": [
     {
-      "cli": "codex",
-      "id": "architecture-reviewer",
+      "cli": "codex-subagent",
+      "id": "independent-judge",
       "invoke": [
         "codex",
         "exec",
-        "--skip-git-repo-check",
         "--ignore-user-config",
         "--sandbox",
         "read-only",
@@ -16,45 +15,22 @@
         ".."
       ],
       "local": false,
-      "model": "default",
-      "role": "reviewer",
-      "scope": [
-        "plan",
-        "delivery"
-      ],
-      "timeout_sec": 900
-    },
-    {
-      "cli": "codex",
-      "id": "spec-judge",
-      "invoke": [
-        "codex",
-        "exec",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--sandbox",
-        "read-only",
-        "--add-dir",
-        ".."
-      ],
-      "local": false,
-      "model": "default",
+      "model": "gpt-5.6-sol",
       "role": "judge",
       "scope": [
         "plan",
         "delivery"
       ],
-      "timeout_sec": 900
+      "timeout_sec": 1200
     }
   ],
   "council_by_id": {
-    "architecture-reviewer": {
-      "cli": "codex",
-      "id": "architecture-reviewer",
+    "independent-judge": {
+      "cli": "codex-subagent",
+      "id": "independent-judge",
       "invoke": [
         "codex",
         "exec",
-        "--skip-git-repo-check",
         "--ignore-user-config",
         "--sandbox",
         "read-only",
@@ -62,75 +38,70 @@
         ".."
       ],
       "local": false,
-      "model": "default",
-      "role": "reviewer",
-      "scope": [
-        "plan",
-        "delivery"
-      ],
-      "timeout_sec": 900
-    },
-    "spec-judge": {
-      "cli": "codex",
-      "id": "spec-judge",
-      "invoke": [
-        "codex",
-        "exec",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--sandbox",
-        "read-only",
-        "--add-dir",
-        ".."
-      ],
-      "local": false,
-      "model": "default",
+      "model": "gpt-5.6-sol",
       "role": "judge",
       "scope": [
         "plan",
         "delivery"
       ],
-      "timeout_sec": 900
+      "timeout_sec": 1200
     }
   },
   "criteria_by_id": {
-    "delivery-change-traceability": {
-      "id": "delivery-change-traceability",
-      "rubric": "At least one material implementation or test improvement must exist relative to loop-workspace/context.md. Every changed behavior must trace to an assessment finding and approved plan item. Reject unrelated rewrites, excluded features, duplicated provider state, runtime leakage, or changes made only to satisfy superficial checks.\n",
+    "architecture-and-security": {
+      "id": "architecture-and-security",
+      "rubric": "Provider-specific behavior and credentials remain behind ProviderAdapter and host tool handlers; runtime-specific protocol stays behind Runtime; orchestration policy remains in Scheduler; workspace ownership remains in ExecutionEngine; durable state remains provider owned. Runtime processes, prompts, workspaces, logs, snapshots, build artifacts, and review artifacts must not contain provider credentials. Any cross-layer leakage, unsafe path handling, shell command construction, or hidden durable controller state is blocking.\n",
       "type": "judge"
     },
-    "delivery-spec-compliance": {
-      "id": "delivery-spec-compliance",
-      "rubric": "Inspect SPEC.md, loop-workspace/context.md as the pre-change baseline, the current ../src and ../tests trees, the approved plan, and loop-workspace/compliance-report.md. The implementation must satisfy the material specification invariants: deterministic scheduling, provider-owned recoverable workflow state, runtime/provider independence, execution-engine-owned workspace lifecycle, common structured runtime events/results, repository-defined execution, and Codex encapsulation. Every compliance claim must cite observable code or test evidence. Any material mismatch or unsupported claim is blocking.\n",
-      "type": "judge"
-    },
-    "delivery-test-quality": {
-      "id": "delivery-test-quality",
-      "rubric": "Tests must cover each changed architectural behavior and its meaningful failure or restart path where applicable. Passing commands alone are not sufficient if their assertions do not exercise the claimed invariant. Flaky, network-dependent, or implementation-trivial tests are blocking.\n",
-      "type": "judge"
-    },
-    "plan-boundary-safety": {
-      "id": "plan-boundary-safety",
-      "rubric": "The plan must keep provider-specific behavior behind ProviderAdapter, runtime-specific behavior behind Runtime, workspace/repository lifecycle inside the execution boundary, and durable workflow state in the task provider. It must not add production provider adapters, deployment infrastructure, UI, hidden durable orchestrator state, or unrelated features. Any proposed coupling or scope expansion is blocking.\n",
-      "type": "judge"
-    },
-    "plan-spec-traceability": {
-      "id": "plan-spec-traceability",
-      "rubric": "Inspect loop-workspace/architecture-assessment.md and plan.md. Every material requirement in SPEC.md must map to concrete current evidence, a specific implementation change, or an explicit out-of-scope reason consistent with the goal. The plan must identify affected boundaries, tests, failure/recovery behavior, migration risk, and an objective done state. Missing requirements, vague actions, or unsupported compliance claims are blocking issues.\n",
-      "type": "judge"
-    },
-    "required-artifacts": {
+    "build": {
       "check": [
-        "python3",
-        "-c",
-        "from pathlib import Path; paths = [Path('loop-workspace/architecture-assessment.md'), Path('loop-workspace/plan.md'), Path('loop-workspace/compliance-report.md')]; raise SystemExit(0 if all(path.is_file() and path.stat().st_size > 0 for path in paths) else 1)"
+        "npm",
+        "--prefix",
+        "..",
+        "run",
+        "build"
       ],
       "expect": "exit_zero",
-      "id": "required-artifacts",
-      "timeout_sec": 30,
+      "id": "build",
+      "timeout_sec": 600,
       "type": "programmatic"
     },
-    "strict-typescript": {
+    "diff-integrity": {
+      "check": [
+        "git",
+        "-C",
+        "..",
+        "diff",
+        "--check"
+      ],
+      "expect": "exit_zero",
+      "id": "diff-integrity",
+      "timeout_sec": 60,
+      "type": "programmatic"
+    },
+    "milestone-traceability": {
+      "id": "milestone-traceability",
+      "rubric": "Review the current milestone plan or delivery against SPEC.md and the production-readiness goal. Every claim must cite observable source or deterministic test evidence. Blocking issues include missing required behavior, incomplete failure/restart/cancellation coverage, stale public contracts or documentation, unbounded waits, and unsupported compliance claims. External-only release or second-platform operations may remain only when clearly documented with reproducible acceptance steps.\n",
+      "type": "judge"
+    },
+    "test-quality": {
+      "id": "test-quality",
+      "rubric": "Each changed behavior has focused deterministic tests for success and meaningful malformed, timeout, cancellation, retry, restart, or cleanup behavior as applicable. Tests must assert externally meaningful contracts and must not require network access, a real provider, or real Codex credentials.\n",
+      "type": "judge"
+    },
+    "tests": {
+      "check": [
+        "npm",
+        "--prefix",
+        "..",
+        "test"
+      ],
+      "expect": "exit_zero",
+      "id": "tests",
+      "timeout_sec": 1200,
+      "type": "programmatic"
+    },
+    "types": {
       "check": [
         "npm",
         "--prefix",
@@ -139,19 +110,7 @@
         "check"
       ],
       "expect": "exit_zero",
-      "id": "strict-typescript",
-      "timeout_sec": 600,
-      "type": "programmatic"
-    },
-    "unit-and-integration-tests": {
-      "check": [
-        "npm",
-        "--prefix",
-        "..",
-        "test"
-      ],
-      "expect": "exit_zero",
-      "id": "unit-and-integration-tests",
+      "id": "types",
       "timeout_sec": 600,
       "type": "programmatic"
     }
@@ -163,55 +122,59 @@
       "allowed_writes": [
         "../src/**",
         "../tests/**",
+        "../docs/**",
+        "../examples/**",
         "../README.md",
+        "../SPEC.md",
         "../package.json",
         "../package-lock.json",
-        "../tsconfig.json",
+        "../tsconfig*.json",
         "../.ensemble/**",
-        "./loop-workspace/**"
+        "./production-loop-workspace/**"
       ],
-      "commits_pushes_prs_deployments": "forbidden_without_explicit_user_approval",
+      "commits": "explicitly_authorized",
       "duplicate_action_check": true,
       "excluded_work": [
-        "production provider adapters",
-        "deployment infrastructure",
-        "UI",
-        "unrelated features"
+        "Docker workers",
+        "Windows Service integration",
+        "mutable dashboard UI",
+        "automatic source-control delivery",
+        "publishing to registries or creating hosted releases without separate approval"
       ],
-      "requires_approval": true
+      "pushes_prs_deployments": "forbidden_without_explicit_user_approval",
+      "requires_approval": false
     }
   },
   "gates": {
     "delivery_gate": {
       "criteria": [
-        "unit-and-integration-tests",
-        "strict-typescript",
-        "required-artifacts",
-        "delivery-spec-compliance",
-        "delivery-change-traceability",
-        "delivery-test-quality"
+        "tests",
+        "types",
+        "build",
+        "diff-integrity",
+        "milestone-traceability",
+        "architecture-and-security",
+        "test-quality"
       ],
-      "max_revisions": 4,
+      "max_revisions": 3,
       "members": [
-        "architecture-reviewer",
-        "spec-judge"
+        "independent-judge"
       ],
       "verdict_policy": "revise_until_clean",
-      "verdict_source": "spec-judge",
+      "verdict_source": "independent-judge",
       "when": "after_each_delivery"
     },
     "plan_gate": {
       "criteria": [
-        "plan-spec-traceability",
-        "plan-boundary-safety"
+        "milestone-traceability",
+        "architecture-and-security"
       ],
       "max_revisions": 3,
       "members": [
-        "architecture-reviewer",
-        "spec-judge"
+        "independent-judge"
       ],
       "verdict_policy": "revise_until_clean",
-      "verdict_source": "spec-judge",
+      "verdict_source": "independent-judge",
       "when": "after_plan"
     }
   },
@@ -230,21 +193,30 @@
         "file": "../package.json"
       },
       {
-        "file": "../tsconfig.json"
+        "file": "../.ensemble/config.yaml"
       },
       {
         "cmd": [
           "rg",
-          "-n",
-          ".",
+          "--files",
           "../src",
-          "../tests"
+          "../tests",
+          "../docs",
+          "../examples"
         ],
         "timeout_sec": 60
+      },
+      {
+        "cmd": [
+          "git",
+          "status",
+          "--short"
+        ],
+        "timeout_sec": 30
       }
     ],
-    "definition_of_done": "loop-workspace/architecture-assessment.md maps every material SPEC.md requirement to current evidence or a concrete gap; loop-workspace/plan.md contains an architecture-judge-approved implementation plan; the required in-scope refactor and focused tests are implemented in the Ensemble repository; npm test and npm run check pass; and loop-workspace/compliance-report.md provides requirement-by-requirement evidence with no unresolved in-scope blockers or TBDs.\n",
-    "statement": "Review and refactor Ensemble's implementation to conform to ../SPEC.md. Produce an architecture assessment, an approved implementation plan, focused code changes, tests, and a final compliance report. Preserve provider, runtime, repository, and workspace replaceability. Exclude production provider adapters, deployment infrastructure, UI, and features not required by the specification.\n",
+    "definition_of_done": "Every in-scope MUST requirement in SPEC.md has implementation and focused deterministic test evidence; Codex CLI remains an optional fallback while App Server supports continuation, tools, approvals, input, usage, and rate events; blocked work round-trips durably through ProviderAdapter; Vikunja tools execute on the host without credential egress; workspace hooks, restore verification, refresh, containment, and cleanup are bounded and safe; immutable snapshots and configured read-only health/status endpoints expose no secrets; npm test, npm run check, npm run build, npm pack --dry-run, git diff --check, artifact credential scans, and the v0.3 conformance suite pass; Linux and macOS service artifacts are verified, with any real-host or publication step that cannot be performed locally documented as an external acceptance item; each milestone is independently judged and committed.\n",
+    "statement": "Bring Ensemble from its current usable Vikunja and Codex CLI service to the production-ready state required by SPEC.md: portable runtime tools and operational events, Codex App Server support, resumable blocked work, credential-safe Vikunja-native tools, complete workspace lifecycle and containment, immutable operational snapshots and read-only endpoints, accurate operator documentation and backlog state, deployable release artifacts, and conformance evidence. Implement and commit coherent dependency-ordered milestones without weakening provider/runtime boundaries, durable provider truth, secret isolation, or cross-platform behavior.\n",
     "verification": [
       {
         "check": [
@@ -254,8 +226,8 @@
           "test"
         ],
         "expect": "exit_zero",
-        "id": "unit-and-integration-tests",
-        "timeout_sec": 600,
+        "id": "tests",
+        "timeout_sec": 1200,
         "type": "programmatic"
       },
       {
@@ -267,44 +239,49 @@
           "check"
         ],
         "expect": "exit_zero",
-        "id": "strict-typescript",
+        "id": "types",
         "timeout_sec": 600,
         "type": "programmatic"
       },
       {
         "check": [
-          "python3",
-          "-c",
-          "from pathlib import Path; paths = [Path('loop-workspace/architecture-assessment.md'), Path('loop-workspace/plan.md'), Path('loop-workspace/compliance-report.md')]; raise SystemExit(0 if all(path.is_file() and path.stat().st_size > 0 for path in paths) else 1)"
+          "npm",
+          "--prefix",
+          "..",
+          "run",
+          "build"
         ],
         "expect": "exit_zero",
-        "id": "required-artifacts",
-        "timeout_sec": 30,
+        "id": "build",
+        "timeout_sec": 600,
         "type": "programmatic"
       },
       {
-        "id": "plan-spec-traceability",
-        "rubric": "Inspect loop-workspace/architecture-assessment.md and plan.md. Every material requirement in SPEC.md must map to concrete current evidence, a specific implementation change, or an explicit out-of-scope reason consistent with the goal. The plan must identify affected boundaries, tests, failure/recovery behavior, migration risk, and an objective done state. Missing requirements, vague actions, or unsupported compliance claims are blocking issues.\n",
+        "check": [
+          "git",
+          "-C",
+          "..",
+          "diff",
+          "--check"
+        ],
+        "expect": "exit_zero",
+        "id": "diff-integrity",
+        "timeout_sec": 60,
+        "type": "programmatic"
+      },
+      {
+        "id": "milestone-traceability",
+        "rubric": "Review the current milestone plan or delivery against SPEC.md and the production-readiness goal. Every claim must cite observable source or deterministic test evidence. Blocking issues include missing required behavior, incomplete failure/restart/cancellation coverage, stale public contracts or documentation, unbounded waits, and unsupported compliance claims. External-only release or second-platform operations may remain only when clearly documented with reproducible acceptance steps.\n",
         "type": "judge"
       },
       {
-        "id": "plan-boundary-safety",
-        "rubric": "The plan must keep provider-specific behavior behind ProviderAdapter, runtime-specific behavior behind Runtime, workspace/repository lifecycle inside the execution boundary, and durable workflow state in the task provider. It must not add production provider adapters, deployment infrastructure, UI, hidden durable orchestrator state, or unrelated features. Any proposed coupling or scope expansion is blocking.\n",
+        "id": "architecture-and-security",
+        "rubric": "Provider-specific behavior and credentials remain behind ProviderAdapter and host tool handlers; runtime-specific protocol stays behind Runtime; orchestration policy remains in Scheduler; workspace ownership remains in ExecutionEngine; durable state remains provider owned. Runtime processes, prompts, workspaces, logs, snapshots, build artifacts, and review artifacts must not contain provider credentials. Any cross-layer leakage, unsafe path handling, shell command construction, or hidden durable controller state is blocking.\n",
         "type": "judge"
       },
       {
-        "id": "delivery-spec-compliance",
-        "rubric": "Inspect SPEC.md, loop-workspace/context.md as the pre-change baseline, the current ../src and ../tests trees, the approved plan, and loop-workspace/compliance-report.md. The implementation must satisfy the material specification invariants: deterministic scheduling, provider-owned recoverable workflow state, runtime/provider independence, execution-engine-owned workspace lifecycle, common structured runtime events/results, repository-defined execution, and Codex encapsulation. Every compliance claim must cite observable code or test evidence. Any material mismatch or unsupported claim is blocking.\n",
-        "type": "judge"
-      },
-      {
-        "id": "delivery-change-traceability",
-        "rubric": "At least one material implementation or test improvement must exist relative to loop-workspace/context.md. Every changed behavior must trace to an assessment finding and approved plan item. Reject unrelated rewrites, excluded features, duplicated provider state, runtime leakage, or changes made only to satisfy superficial checks.\n",
-        "type": "judge"
-      },
-      {
-        "id": "delivery-test-quality",
-        "rubric": "Tests must cover each changed architectural behavior and its meaningful failure or restart path where applicable. Passing commands alone are not sufficient if their assertions do not exercise the claimed invariant. Flaky, network-dependent, or implementation-trivial tests are blocking.\n",
+        "id": "test-quality",
+        "rubric": "Each changed behavior has focused deterministic tests for success and meaningful malformed, timeout, cancellation, retry, restart, or cleanup behavior as applicable. Tests must assert externally meaningful contracts and must not require network access, a real provider, or real Codex credentials.\n",
         "type": "judge"
       }
     ]
@@ -314,49 +291,48 @@
     "invoke": [
       "codex",
       "exec",
-      "--skip-git-repo-check",
       "--ignore-user-config",
       "--sandbox",
       "workspace-write",
       "--add-dir",
       ".."
     ],
-    "model": "default",
-    "timeout_sec": 1200
+    "model": "gpt-5.6-sol",
+    "timeout_sec": 1800
   },
   "loop_control": {
     "budget": {
-      "tokens": 800000,
-      "wall_clock_min": 90
+      "tokens": 2000000,
+      "wall_clock_min": 480
     },
     "human_checkpoints": [
-      "repeated no-progress or the same blocker twice",
-      "any proposed scope expansion beyond SPEC.md",
-      "any external side effect such as commit, push, PR, deployment, or message",
-      "any need to read or transmit a redacted path"
+      "the same blocker repeats twice",
+      "a required decision would expand scope beyond SPEC.md or this goal",
+      "a step requires publishing, pushing, deployment, destructive cleanup, or provider writes",
+      "a reviewer needs a redacted secret-bearing path"
     ],
-    "max_iterations": 8,
+    "max_iterations": 16,
     "no_progress": {
       "action": "human_checkpoint",
       "max_stalled_iterations": 2,
       "signals": [
         "the same blocking issue repeats without new evidence",
-        "source and test behavior have no material change",
-        "verifier output and compliance evidence are unchanged"
+        "a delivery revision contains no material source or test change",
+        "deterministic verifier output is unchanged after a claimed fix"
       ]
     },
     "stop_conditions": [
-      "plan and delivery gates both pass clean",
+      "every milestone delivery gate and the final conformance gate pass",
       "max_iterations or a gate revision cap is reached",
-      "no-progress threshold is reached pending human direction",
-      "wall-clock or advisory token budget is reached",
+      "the no-progress threshold is reached pending user direction",
+      "the wall-clock or advisory token budget is reached",
       "the user requests a stop"
     ]
   },
   "meta": {
-    "created": "2026-07-31",
-    "description": "Review and refactor Ensemble against SPEC.md with separate architecture review and structured specification-judge gates.\n",
-    "name": "ensemble-spec-architecture-refactor"
+    "created": "2026-08-01",
+    "description": "Complete Ensemble's remaining specification work through dependency-ordered, independently judged implementation milestones.\n",
+    "name": "ensemble-production-readiness"
   },
   "observability": {
     "checkpoint_granularity": "gate",
@@ -366,7 +342,7 @@
   "privacy": {
     "egress": [
       {
-        "consent": "required",
+        "consent": "granted-for-codex-review",
         "redact": [
           ".env",
           ".env.*",
@@ -374,57 +350,34 @@
           ".codex/**",
           ".git/**",
           "node_modules/**",
+          "dist/**",
+          "*.tgz",
           "secrets/**",
           "**/*.key",
           "**/*.pem",
           "**/*.p12"
         ],
         "sends": [
-          "architecture assessment",
-          "implementation plan",
-          "source and tests on demand",
-          "delivery artifacts",
-          "compliance report"
+          "SPEC and public documentation",
+          "milestone plans",
+          "source and tests",
+          "delivery reports",
+          "verification output"
         ],
-        "to": "architecture-reviewer"
-      },
-      {
-        "consent": "required",
-        "redact": [
-          ".env",
-          ".env.*",
-          ".npmrc",
-          ".codex/**",
-          ".git/**",
-          "node_modules/**",
-          "secrets/**",
-          "**/*.key",
-          "**/*.pem",
-          "**/*.p12"
-        ],
-        "sends": [
-          "architecture assessment",
-          "implementation plan",
-          "source and tests on demand",
-          "delivery artifacts",
-          "compliance report",
-          "verification results"
-        ],
-        "to": "spec-judge"
+        "to": "independent-judge"
       }
     ]
   },
   "source": "/Users/jensdevlaming/Documents/Personal/ensemble/loop-architect-output/loop.yaml",
   "version": 1,
   "workspace": {
-    "dir": "./loop-workspace",
+    "dir": "./production-loop-workspace",
     "layout": [
-      "context.md",
-      "architecture-assessment.md",
+      "assessment.md",
       "plan.md",
-      "delivery-{n}.md",
-      "compliance-report.md",
+      "milestone-{n}.md",
       "review-{n}.md",
+      "compliance-report.md",
       "state.json",
       "run-log.md"
     ]

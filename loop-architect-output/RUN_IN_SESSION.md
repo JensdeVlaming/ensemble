@@ -1,4 +1,4 @@
-# Run `ensemble-spec-architecture-refactor` In This Session
+# Run `ensemble-production-readiness` In This Session
 
 Use this prompt when the user wants to run the Looper-designed loop in the current LLM session.
 This is the default/easy execution path. The Python runner is the advanced path for running later or outside the session.
@@ -27,17 +27,17 @@ Do not use `run-loop.py` unless the user explicitly asks for the advanced extern
 - Source spec: `loop.yaml`
 - Human summary: `LOOP.md`
 - Resolved spec: `loop.resolved.json`
-- Workspace: `./loop-workspace`
+- Workspace: `./production-loop-workspace`
 - State file: `state.json`
 - Run log: `run-log.md`
 
 ## Goal
 
-Review and refactor Ensemble's implementation to conform to ../SPEC.md. Produce an architecture assessment, an approved implementation plan, focused code changes, tests, and a final compliance report. Preserve provider, runtime, repository, and workspace replaceability. Exclude production provider adapters, deployment infrastructure, UI, and features not required by the specification.
+Bring Ensemble from its current usable Vikunja and Codex CLI service to the production-ready state required by SPEC.md: portable runtime tools and operational events, Codex App Server support, resumable blocked work, credential-safe Vikunja-native tools, complete workspace lifecycle and containment, immutable operational snapshots and read-only endpoints, accurate operator documentation and backlog state, deployable release artifacts, and conformance evidence. Implement and commit coherent dependency-ordered milestones without weakening provider/runtime boundaries, durable provider truth, secret isolation, or cross-platform behavior.
 
 ## Definition Of Done
 
-loop-workspace/architecture-assessment.md maps every material SPEC.md requirement to current evidence or a concrete gap; loop-workspace/plan.md contains an architecture-judge-approved implementation plan; the required in-scope refactor and focused tests are implemented in the Ensemble repository; npm test and npm run check pass; and loop-workspace/compliance-report.md provides requirement-by-requirement evidence with no unresolved in-scope blockers or TBDs.
+Every in-scope MUST requirement in SPEC.md has implementation and focused deterministic test evidence; Codex CLI remains an optional fallback while App Server supports continuation, tools, approvals, input, usage, and rate events; blocked work round-trips durably through ProviderAdapter; Vikunja tools execute on the host without credential egress; workspace hooks, restore verification, refresh, containment, and cleanup are bounded and safe; immutable snapshots and configured read-only health/status endpoints expose no secrets; npm test, npm run check, npm run build, npm pack --dry-run, git diff --check, artifact credential scans, and the v0.3 conformance suite pass; Linux and macOS service artifacts are verified, with any real-host or publication step that cannot be performed locally documented as an external acceptance item; each milestone is independently judged and committed.
 
 ## Context Sources
 
@@ -45,29 +45,26 @@ loop-workspace/architecture-assessment.md maps every material SPEC.md requiremen
 - Read file `../AGENTS.md`
 - Read file `../README.md`
 - Read file `../package.json`
-- Read file `../tsconfig.json`
-- Run command `["rg", "-n", ".", "../src", "../tests"]`
+- Read file `../.ensemble/config.yaml`
+- Run command `["rg", "--files", "../src", "../tests", "../docs", "../examples"]`
+- Run command `["git", "status", "--short"]`
 
 ## Verification Criteria
 
-- `unit-and-integration-tests` programmatic: run `["npm", "--prefix", "..", "test"]` and expect `exit_zero`
-- `strict-typescript` programmatic: run `["npm", "--prefix", "..", "run", "check"]` and expect `exit_zero`
-- `required-artifacts` programmatic: run `["python3", "-c", "from pathlib import Path; paths = [Path('loop-workspace/architecture-assessment.md'), Path('loop-workspace/plan.md'), Path('loop-workspace/compliance-report.md')]; raise SystemExit(0 if all(path.is_file() and path.stat().st_size > 0 for path in paths) else 1)"]` and expect `exit_zero`
-- `plan-spec-traceability` judge rubric: Inspect loop-workspace/architecture-assessment.md and plan.md. Every material requirement in SPEC.md must map to concrete current evidence, a specific implementation change, or an explicit out-of-scope reason consistent with the goal. The plan must identify affected boundaries, tests, failure/recovery behavior, migration risk, and an objective done state. Missing requirements, vague actions, or unsupported compliance claims are blocking issues.
+- `tests` programmatic: run `["npm", "--prefix", "..", "test"]` and expect `exit_zero`
+- `types` programmatic: run `["npm", "--prefix", "..", "run", "check"]` and expect `exit_zero`
+- `build` programmatic: run `["npm", "--prefix", "..", "run", "build"]` and expect `exit_zero`
+- `diff-integrity` programmatic: run `["git", "-C", "..", "diff", "--check"]` and expect `exit_zero`
+- `milestone-traceability` judge rubric: Review the current milestone plan or delivery against SPEC.md and the production-readiness goal. Every claim must cite observable source or deterministic test evidence. Blocking issues include missing required behavior, incomplete failure/restart/cancellation coverage, stale public contracts or documentation, unbounded waits, and unsupported compliance claims. External-only release or second-platform operations may remain only when clearly documented with reproducible acceptance steps.
 
-- `plan-boundary-safety` judge rubric: The plan must keep provider-specific behavior behind ProviderAdapter, runtime-specific behavior behind Runtime, workspace/repository lifecycle inside the execution boundary, and durable workflow state in the task provider. It must not add production provider adapters, deployment infrastructure, UI, hidden durable orchestrator state, or unrelated features. Any proposed coupling or scope expansion is blocking.
+- `architecture-and-security` judge rubric: Provider-specific behavior and credentials remain behind ProviderAdapter and host tool handlers; runtime-specific protocol stays behind Runtime; orchestration policy remains in Scheduler; workspace ownership remains in ExecutionEngine; durable state remains provider owned. Runtime processes, prompts, workspaces, logs, snapshots, build artifacts, and review artifacts must not contain provider credentials. Any cross-layer leakage, unsafe path handling, shell command construction, or hidden durable controller state is blocking.
 
-- `delivery-spec-compliance` judge rubric: Inspect SPEC.md, loop-workspace/context.md as the pre-change baseline, the current ../src and ../tests trees, the approved plan, and loop-workspace/compliance-report.md. The implementation must satisfy the material specification invariants: deterministic scheduling, provider-owned recoverable workflow state, runtime/provider independence, execution-engine-owned workspace lifecycle, common structured runtime events/results, repository-defined execution, and Codex encapsulation. Every compliance claim must cite observable code or test evidence. Any material mismatch or unsupported claim is blocking.
-
-- `delivery-change-traceability` judge rubric: At least one material implementation or test improvement must exist relative to loop-workspace/context.md. Every changed behavior must trace to an assessment finding and approved plan item. Reject unrelated rewrites, excluded features, duplicated provider state, runtime leakage, or changes made only to satisfy superficial checks.
-
-- `delivery-test-quality` judge rubric: Tests must cover each changed architectural behavior and its meaningful failure or restart path where applicable. Passing commands alone are not sufficient if their assertions do not exercise the claimed invariant. Flaky, network-dependent, or implementation-trivial tests are blocking.
+- `test-quality` judge rubric: Each changed behavior has focused deterministic tests for success and meaningful malformed, timeout, cancellation, retry, restart, or cleanup behavior as applicable. Tests must assert externally meaningful contracts and must not require network access, a real provider, or real Codex credentials.
 
 
 ## Council
 
-- `architecture-reviewer` reviewer via `["codex", "exec", "--skip-git-repo-check", "--ignore-user-config", "--sandbox", "read-only", "--add-dir", ".."]` (non-local; timeout 900s)
-- `spec-judge` judge via `["codex", "exec", "--skip-git-repo-check", "--ignore-user-config", "--sandbox", "read-only", "--add-dir", ".."]` (non-local; timeout 900s)
+- `independent-judge` judge via `["codex", "exec", "--ignore-user-config", "--sandbox", "read-only", "--add-dir", ".."]` (non-local; timeout 1200s)
 
 ## Gates
 
@@ -75,36 +72,36 @@ loop-workspace/architecture-assessment.md maps every material SPEC.md requiremen
 
 - When: `after_plan`
 - Policy: `revise_until_clean`
-- Verdict source: `spec-judge`
-- Criteria: `plan-spec-traceability, plan-boundary-safety`
+- Verdict source: `independent-judge`
+- Criteria: `milestone-traceability, architecture-and-security`
 - Max revisions: `3`
 
 ### delivery_gate
 
 - When: `after_each_delivery`
 - Policy: `revise_until_clean`
-- Verdict source: `spec-judge`
-- Criteria: `unit-and-integration-tests, strict-typescript, required-artifacts, delivery-spec-compliance, delivery-change-traceability, delivery-test-quality`
-- Max revisions: `4`
+- Verdict source: `independent-judge`
+- Criteria: `tests, types, build, diff-integrity, milestone-traceability, architecture-and-security, test-quality`
+- Max revisions: `3`
 
 ## Loop Control
 
-- Max iterations: `8`
-- Budget: `{"tokens": 800000, "wall_clock_min": 90}`
-- No-progress: `{"action": "human_checkpoint", "max_stalled_iterations": 2, "signals": ["the same blocking issue repeats without new evidence", "source and test behavior have no material change", "verifier output and compliance evidence are unchanged"]}`
-- Human checkpoints: `repeated no-progress or the same blocker twice, any proposed scope expansion beyond SPEC.md, any external side effect such as commit, push, PR, deployment, or message, any need to read or transmit a redacted path`
+- Max iterations: `16`
+- Budget: `{"tokens": 2000000, "wall_clock_min": 480}`
+- No-progress: `{"action": "human_checkpoint", "max_stalled_iterations": 2, "signals": ["the same blocking issue repeats without new evidence", "a delivery revision contains no material source or test change", "deterministic verifier output is unchanged after a claimed fix"]}`
+- Human checkpoints: `the same blocker repeats twice, a required decision would expand scope beyond SPEC.md or this goal, a step requires publishing, pushing, deployment, destructive cleanup, or provider writes, a reviewer needs a redacted secret-bearing path`
 - Stop conditions:
-  - plan and delivery gates both pass clean
+  - every milestone delivery gate and the final conformance gate pass
   - max_iterations or a gate revision cap is reached
-  - no-progress threshold is reached pending human direction
-  - wall-clock or advisory token budget is reached
+  - the no-progress threshold is reached pending user direction
+  - the wall-clock or advisory token budget is reached
   - the user requests a stop
 
 ## Execution Boundary
 
 - Mode: `in_session`
 - Isolation: `current_workspace`
-- Side effects: `{"allowed_writes": ["../src/**", "../tests/**", "../README.md", "../package.json", "../package-lock.json", "../tsconfig.json", "../.ensemble/**", "./loop-workspace/**"], "commits_pushes_prs_deployments": "forbidden_without_explicit_user_approval", "duplicate_action_check": true, "excluded_work": ["production provider adapters", "deployment infrastructure", "UI", "unrelated features"], "requires_approval": true}`
+- Side effects: `{"allowed_writes": ["../src/**", "../tests/**", "../docs/**", "../examples/**", "../README.md", "../SPEC.md", "../package.json", "../package-lock.json", "../tsconfig*.json", "../.ensemble/**", "./production-loop-workspace/**"], "commits": "explicitly_authorized", "duplicate_action_check": true, "excluded_work": ["Docker workers", "Windows Service integration", "mutable dashboard UI", "automatic source-control delivery", "publishing to registries or creating hosted releases without separate approval"], "pushes_prs_deployments": "forbidden_without_explicit_user_approval", "requires_approval": false}`
 
 If the loop needs scheduled runs, child-agent lifecycle management, concurrency control, or restart-safe step retries, stop and tell the user this Looper spec should be handed to a durable orchestrator.
 
@@ -118,8 +115,7 @@ Use `state.json` for the latest resumable status and `run-log.md` for the append
 
 ## Privacy
 
-- Before sending `architecture assessment, implementation plan, source and tests on demand, delivery artifacts, compliance report` to `architecture-reviewer`, confirm consent and apply redactions `.env, .env.*, .npmrc, .codex/**, .git/**, node_modules/**, secrets/**, **/*.key, **/*.pem, **/*.p12`.
-- Before sending `architecture assessment, implementation plan, source and tests on demand, delivery artifacts, compliance report, verification results` to `spec-judge`, confirm consent and apply redactions `.env, .env.*, .npmrc, .codex/**, .git/**, node_modules/**, secrets/**, **/*.key, **/*.pem, **/*.p12`.
+- Before sending `SPEC and public documentation, milestone plans, source and tests, delivery reports, verification output` to `independent-judge`, confirm consent and apply redactions `.env, .env.*, .npmrc, .codex/**, .git/**, node_modules/**, dist/**, *.tgz, secrets/**, **/*.key, **/*.pem, **/*.p12`.
 
 ## Start Now
 
