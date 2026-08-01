@@ -1,4 +1,4 @@
-import type { Artifact, FailureKind, Task, TaskComment, TaskId } from "../../domain/model.ts";
+import type { Artifact, FailureKind, RuntimeTool, Task, TaskComment, TaskId } from "../../domain/model.ts";
 import type {
   ActiveExecution,
   ExecutionLeaseBasis,
@@ -67,6 +67,12 @@ export class InMemoryProvider implements ProviderAdapter {
   async getArtifacts(id: TaskId): Promise<readonly Artifact[]> {
     await this.getTask(id);
     return [...(this.#artifacts.get(id) ?? [])];
+  }
+
+  async getRuntimeTools(id: TaskId, executionId: string, ownerId: string): Promise<readonly RuntimeTool[]> {
+    const state = await this.getExecutionState(id);
+    if (state.active?.id !== executionId || state.active.ownerId !== ownerId) throw new Error(`Execution is not active: ${executionId}`);
+    return Object.freeze([]);
   }
 
   async getExecutionState(id: TaskId): Promise<ProviderExecutionState> {

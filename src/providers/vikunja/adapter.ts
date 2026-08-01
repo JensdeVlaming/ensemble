@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import type { Artifact, FailureKind, RepositoryRef, Task, TaskBlocker, TaskComment, TaskId } from "../../domain/model.ts";
+import type {
+  Artifact, FailureKind, PortableJsonValue, RepositoryRef, RuntimeTool, Task, TaskBlocker, TaskComment, TaskId,
+} from "../../domain/model.ts";
 import type {
   ActiveExecution,
   ExecutionCancellation,
@@ -21,6 +23,10 @@ import type { VikunjaClientOptions } from "./client.ts";
 const STATE_PREFIX = "<!-- ensemble-provider-state:v1\n";
 const STATE_SUFFIX = "\n-->";
 const SIDE_EFFECT_PREFIX = "<!-- ensemble-side-effect:";
+const AGENT_TOOL_PREFIX = "<!-- ensemble-agent-tool:v1:";
+const TOOL_ITEM_LIMIT = 100;
+const TOOL_TEXT_LIMIT = 8_192;
+const TOOL_RESULT_BUDGET = 196_608;
 const failureKinds = new Set<FailureKind>([
   "startup", "provider", "configuration", "runtime", "timeout", "stalled", "reconciliation", "shutdown",
 ]);
@@ -135,6 +141,7 @@ export class VikunjaProvider implements ProviderAdapter {
   readonly #inventoryMaxTasks: number;
   readonly #inventoryConcurrency: number;
   #labelIds?: ReadonlyMap<string, number>;
+  readonly #toolMutations = new Map<string, Promise<void>>();
 
   constructor(options: VikunjaProviderOptions) {
     this.client = new VikunjaClient({ ...options, repositoryId: options.repository.id });
@@ -239,7 +246,7 @@ export class VikunjaProvider implements ProviderAdapter {
       if (body.startsWith(STATE_PREFIX)) return [];
       return [{
         id: String(requiredNumber(comment.id, "comment id")),
-        body: stripSideEffectMarker(body),
+        body: stripAgentToolMarker(stripSideEffectMarker(body)),
         author: comment.author?.username,
         createdAt: requiredDate(comment.created, "comment created"),
       }];
@@ -261,6 +268,66 @@ export class VikunjaProvider implements ProviderAdapter {
       ...[...folded.terminals.values()].flatMap((event) => event.artifacts ?? []),
     ];
     return Object.freeze(artifacts.map((artifact) => Object.freeze({ ...artifact })));
+  }
+
+  async getRuntimeTools(id: TaskId, executionId: string, ownerId: string): Promise<readonly RuntimeTool[]> {
+    await this.#assertActiveToolExecution(id, executionId, ownerId);
+    const emptyInput = Object.freeze({ type: "object", properties: Object.freeze({}),
+      required: Object.freeze([]), additionalProperties: false } as const);
+    const tools: RuntimeTool[] = [
+      {
+        name: "task_read",
+        description: "Read the claimed Vikunja task and its portable workflow fields.",
+        inputSchema: emptyInput,
+        invoke: async () => this.#invokeTool("task_read", async () => {
+          await this.#assertActiveToolExecution(id, executionId, ownerId);
+          return boundedTask(await this.getTask(id));
+        }),
+      },
+      {
+        name: "task_comments_read",
+        description: "Read bounded, ordinary comments for the claimed Vikunja task.",
+        inputSchema: emptyInput,
+        invoke: async () => this.#invokeTool("task_comments_read", async () => {
+          await this.#assertActiveToolExecution(id, executionId, ownerId);
+          return boundedCollection((await this.getComments(id)).slice(-TOOL_ITEM_LIMIT), boundedComment);
+        }),
+      },
+      {
+        name: "task_artifacts_read",
+        description: "Read bounded artifact references for the claimed Vikunja task.",
+        inputSchema: emptyInput,
+        invoke: async () => this.#invokeTool("task_artifacts_read", async () => {
+          await this.#assertActiveToolExecution(id, executionId, ownerId);
+          return boundedCollection((await this.getArtifacts(id)).slice(-TOOL_ITEM_LIMIT), boundedArtifact);
+        }),
+      },
+      {
+        name: "task_comment_add",
+        description: "Add one idempotent comment to the claimed Vikunja task.",
+        inputSchema: Object.freeze({
+          type: "object",
+          properties: Object.freeze({
+            body: Object.freeze({ type: "string", description: "Comment text." }),
+            idempotencyKey: Object.freeze({ type: "string", description: "Stable key reused when retrying this write." }),
+          }),
+          required: Object.freeze(["body", "idempotencyKey"]),
+          additionalProperties: false,
+        }),
+        invoke: async (input) => this.#invokeTool("task_comment_add", async () => {
+          const values = toolCommentInput(input);
+          return this.#serializeToolMutation(`${id}:${executionId}:${values.idempotencyKey}`, async () => {
+            await this.#assertActiveToolExecution(id, executionId, ownerId);
+            const marker = agentToolMarker(executionId, values.idempotencyKey);
+            const existing = await this.#reconcileAgentComments(id, marker, values.body);
+            if (existing) return boundedComment(existing);
+            await this.#createRawComment(id, `${marker}\n${values.body}`);
+            return boundedComment((await this.#reconcileAgentComments(id, marker, values.body))!);
+          });
+        }),
+      },
+    ];
+    return Object.freeze(tools.map((tool) => Object.freeze(tool)));
   }
 
   async getExecutionState(id: TaskId): Promise<ProviderExecutionState> {
@@ -406,6 +473,47 @@ export class VikunjaProvider implements ProviderAdapter {
 
   async #appendEvent(id: TaskId, event: ProviderEvent): Promise<void> {
     await this.#createRawComment(id, `${STATE_PREFIX}${JSON.stringify(event)}${STATE_SUFFIX}`);
+  }
+
+  async #assertActiveToolExecution(id: TaskId, executionId: string, ownerId: string): Promise<void> {
+    const state = stateFromEvents(parseEvents(await this.#comments(id)));
+    if (state.active?.id !== executionId || state.active.ownerId !== ownerId) {
+      throw new Error("Vikunja tool execution is no longer active");
+    }
+  }
+
+  async #reconcileAgentComments(id: TaskId, marker: string, body: string): Promise<TaskComment | undefined> {
+    const matches = (await this.#comments(id)).filter((comment) =>
+      requiredString(comment.comment, "comment").startsWith(`${marker}\n`))
+      .sort((left, right) => requiredNumber(left.id, "comment id") - requiredNumber(right.id, "comment id"));
+    const winner = matches[0];
+    if (!winner) return undefined;
+    const normalized = normalizeOrdinaryComment(winner);
+    for (const duplicate of matches.slice(1)) {
+      try { await this.client.request("DELETE", `tasks/${taskNumber(id)}/comments/${requiredNumber(duplicate.id, "comment id")}`); }
+      catch (error) { if (!(error instanceof VikunjaApiError && error.status === 404)) throw error; }
+    }
+    if (normalized.body !== body) throw new Error("Conflicting comment tool idempotency key");
+    return normalized;
+  }
+
+  async #invokeTool<T extends PortableJsonValue>(name: string, work: () => Promise<T>): Promise<T> {
+    try { return await work(); }
+    catch { throw new Error(`Vikunja tool ${name} failed`); }
+  }
+
+  async #serializeToolMutation<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.#toolMutations.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => current);
+    this.#toolMutations.set(key, queued);
+    await previous;
+    try { return await work(); }
+    finally {
+      release();
+      if (this.#toolMutations.get(key) === queued) this.#toolMutations.delete(key);
+    }
   }
 
   async #statusLabelIds(): Promise<ReadonlyMap<string, number>> {
@@ -786,6 +894,110 @@ function isTerminal(kind: ProviderEvent["kind"]): kind is "complete" | "fail" | 
 
 function stripSideEffectMarker(body: string): string {
   return body.startsWith(SIDE_EFFECT_PREFIX) ? body.slice(body.indexOf("\n") + 1) : body;
+}
+
+function stripAgentToolMarker(body: string): string {
+  return body.startsWith(AGENT_TOOL_PREFIX) ? body.slice(body.indexOf("\n") + 1) : body;
+}
+
+function boundedTask(task: Task): PortableJsonValue {
+  const result: Record<string, PortableJsonValue> = {
+    id: boundedText(task.id, 256),
+    title: boundedText(task.title, TOOL_TEXT_LIMIT),
+    description: boundedText(task.description, TOOL_TEXT_LIMIT),
+    status: boundedText(task.status, 256),
+  };
+  addBoundedProperty(result, "acceptanceCriteria", task.acceptanceCriteria,
+    (criterion) => boundedText(criterion, TOOL_TEXT_LIMIT));
+  addBoundedProperty(result, "labels", task.labels, (label) => boundedText(label, 256));
+  addBoundedProperty(result, "assignees", task.assignees, (assignee) => boundedText(assignee, 256));
+  addBoundedProperty(result, "blockers", task.blockers ?? [], (blocker) => Object.freeze({
+      id: boundedText(blocker.id, 256), resolved: blocker.resolved,
+      ...(blocker.status === undefined ? {} : { status: boundedText(blocker.status, 256) }),
+    }));
+  return Object.freeze(result);
+}
+
+function boundedComment(comment: TaskComment): PortableJsonValue {
+  return Object.freeze({
+    id: boundedText(comment.id, 256),
+    body: boundedText(comment.body, TOOL_TEXT_LIMIT),
+    createdAt: boundedText(comment.createdAt, 256),
+    ...(comment.author === undefined ? {} : { author: boundedText(comment.author, 256) }),
+  });
+}
+
+function boundedArtifact(artifact: Artifact): PortableJsonValue {
+  return Object.freeze({
+    type: boundedText(artifact.type, 256),
+    url: boundedText(artifact.url, 4_096),
+    ...(artifact.name === undefined ? {} : { name: boundedText(artifact.name, 1_024) }),
+  });
+}
+
+function boundedCollection<T>(values: readonly T[], map: (value: T) => PortableJsonValue): readonly PortableJsonValue[] {
+  const result: PortableJsonValue[] = [];
+  for (const value of values.slice(0, TOOL_ITEM_LIMIT)) {
+    const candidate = map(value);
+    if (portableBytes([...result, candidate]) > TOOL_RESULT_BUDGET) break;
+    result.push(candidate);
+  }
+  return Object.freeze(result);
+}
+
+function addBoundedProperty<T>(
+  result: Record<string, PortableJsonValue>,
+  name: string,
+  values: readonly T[],
+  map: (value: T) => PortableJsonValue,
+): void {
+  const selected: PortableJsonValue[] = [];
+  result[name] = selected;
+  for (const value of values.slice(0, TOOL_ITEM_LIMIT)) {
+    const candidate = map(value);
+    result[name] = [...selected, candidate];
+    if (portableBytes(result) > TOOL_RESULT_BUDGET) {
+      result[name] = selected;
+      break;
+    }
+    selected.push(candidate);
+  }
+  result[name] = Object.freeze([...selected]);
+}
+
+function portableBytes(value: PortableJsonValue): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function boundedText(value: string, maximumBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maximumBytes) return value;
+  let end = maximumBytes;
+  while (end > 0 && (bytes[end]! & 0b1100_0000) === 0b1000_0000) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+function toolCommentInput(input: unknown): { readonly body: string; readonly idempotencyKey: string } {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid comment tool input");
+  const values = input as Readonly<Record<string, unknown>>;
+  if (typeof values.body !== "string" || !values.body.trim() || Buffer.byteLength(values.body, "utf8") > TOOL_TEXT_LIMIT
+    || typeof values.idempotencyKey !== "string" || !/^[a-zA-Z0-9._:-]{1,128}$/u.test(values.idempotencyKey)) {
+    throw new Error("Invalid comment tool input");
+  }
+  return Object.freeze({ body: values.body, idempotencyKey: values.idempotencyKey });
+}
+
+function agentToolMarker(executionId: string, idempotencyKey: string): string {
+  return `${AGENT_TOOL_PREFIX}${Buffer.from(executionId, "utf8").toString("base64url")}:${Buffer.from(idempotencyKey, "utf8").toString("base64url")} -->`;
+}
+
+function normalizeOrdinaryComment(comment: VikunjaComment): TaskComment {
+  const body = stripAgentToolMarker(stripSideEffectMarker(requiredString(comment.comment, "comment")));
+  return Object.freeze({
+    id: String(requiredNumber(comment.id, "comment id")), body,
+    ...(comment.author?.username === undefined ? {} : { author: comment.author.username }),
+    createdAt: requiredDate(comment.created, "comment created"),
+  });
 }
 
 function errorMessage(error: unknown): string {

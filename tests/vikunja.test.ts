@@ -7,6 +7,7 @@ import {
   VikunjaClient,
   VikunjaPaginationLimitError,
   VikunjaProvider,
+  validateRuntimeTools,
 } from "../src/index.ts";
 import type { ExecutionCompletion, RepositoryRef, VikunjaClientEvent, VikunjaProviderOptions } from "../src/index.ts";
 
@@ -252,6 +253,109 @@ test("Vikunja execution journal claims once and synchronizes idempotently", asyn
   assert.deepEqual(await provider.getArtifacts("1"), completion.artifacts);
   assert.equal((await provider.getTask("1")).status, "completed");
   assert.equal(api.tasks.get(1)?.done, true);
+});
+
+test("Vikunja agent tools are claim-scoped, bounded, redacted, and durably idempotent", async () => {
+  const credential = "credential-must-never-cross-tool-boundary";
+  const api = new FakeVikunjaApi([{ ...task(1, "Work", [1], 1),
+    description: `Description ${"é".repeat(6_000)}`, secret: credential }]);
+  const provider = providerFor(api, "execution-tools");
+  const active = await provider.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-1"));
+  await provider.createComment("1", "Operator context");
+  await provider.uploadArtifact("1", { type: "report", url: "https://example.test/report",
+    name: "Report", metadata: { credential } });
+
+  const tools = validateRuntimeTools(await provider.getRuntimeTools("1", active.id, active.ownerId!));
+  assert.deepEqual(tools.map((tool) => tool.name), [
+    "task_read", "task_comments_read", "task_artifacts_read", "task_comment_add",
+  ]);
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const taskResult = await byName.get("task_read")!.invoke({});
+  const commentsResult = await byName.get("task_comments_read")!.invoke({});
+  const artifactsResult = await byName.get("task_artifacts_read")!.invoke({});
+  assert.ok(Buffer.byteLength((taskResult as { description: string }).description, "utf8") <= 8_192);
+  assert.deepEqual((commentsResult as Array<{ body: string }>).map((comment) => comment.body), ["Operator context"]);
+  assert.deepEqual(artifactsResult, [{ type: "report", url: "https://example.test/report", name: "Report" }]);
+  assert.doesNotMatch(JSON.stringify({ taskResult, commentsResult, artifactsResult }), new RegExp(credential, "u"));
+
+  const add = byName.get("task_comment_add")!;
+  const writesBeforeInvalid = api.commentWriteCount;
+  await assert.rejects(add.invoke({ body: "Missing key" }), /missing a required property/u);
+  assert.equal(api.commentWriteCount, writesBeforeInvalid);
+  const overlappingProvider = providerFor(api, "unused");
+  const overlappingAdd = validateRuntimeTools(await overlappingProvider.getRuntimeTools("1", active.id, active.ownerId!))
+    .find((tool) => tool.name === "task_comment_add")!;
+  const [first, concurrentRetry] = await Promise.all([
+    add.invoke({ body: "Agent update", idempotencyKey: "update-1" }),
+    overlappingAdd.invoke({ body: "Agent update", idempotencyKey: "update-1" }),
+  ]);
+  assert.deepEqual(concurrentRetry, first);
+
+  const restarted = providerFor(api, "unused");
+  const restartedAdd = validateRuntimeTools(await restarted.getRuntimeTools("1", active.id, active.ownerId!))
+    .find((tool) => tool.name === "task_comment_add")!;
+  assert.deepEqual(await restartedAdd.invoke({ body: "Agent update", idempotencyKey: "update-1" }), first);
+  await assert.rejects(restartedAdd.invoke({ body: "Conflicting update", idempotencyKey: "update-1" }),
+    /Vikunja tool task_comment_add failed/u);
+  assert.equal(api.comments.get(1)?.filter((comment) =>
+    String(comment.comment).startsWith("<!-- ensemble-agent-tool:v1:")).length, 1);
+  assert.deepEqual((await provider.getComments("1")).map((comment) => comment.body), ["Operator context", "Agent update"]);
+
+  api.failTaskIds.add(1);
+  await assert.rejects(byName.get("task_read")!.invoke({}), (error: unknown) => {
+    assert.equal((error as Error).message, "Vikunja tool task_read failed");
+    assert.doesNotMatch(String(error), /broken|test-token/u);
+    return true;
+  });
+  api.failTaskIds.delete(1);
+  await provider.completeExecution("1", active.id, leaseGuard(active), {
+    record: { id: active.id, role: active.role, outcome: "approved", summary: "Done",
+      finishedAt: "2026-07-31T11:00:00.000Z" },
+    comments: [], artifacts: [], status: "completed",
+  });
+  await assert.rejects(add.invoke({ body: "Too late", idempotencyKey: "late" }),
+    /Vikunja tool task_comment_add failed/u);
+});
+
+test("Vikunja tool collections enforce an aggregate serialized result budget", async () => {
+  const api = new FakeVikunjaApi([task(1, "Large comments", [1], 1)]);
+  const provider = providerFor(api, "execution-large-tools");
+  const active = await provider.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-1"));
+  const comments = api.comments.get(1)!;
+  for (let index = 0; index < 100; index += 1) comments.push({
+    id: 1_000 + index,
+    comment: `large-${index}-${"\u0001".repeat(8_192)}`,
+    created: new Date(Date.UTC(2026, 6, 31, 11, 0, index)).toISOString(),
+    author: { id: 7, username: "ensemble-bot" },
+  });
+  const read = validateRuntimeTools(await provider.getRuntimeTools("1", active.id, active.ownerId!))
+    .find((tool) => tool.name === "task_comments_read")!;
+  const result = await read.invoke({});
+  assert.ok(Buffer.byteLength(JSON.stringify(result), "utf8") <= 196_608);
+  assert.ok((result as readonly unknown[]).length < 100);
+});
+
+test("Vikunja tools are revoked when the durable lease owner changes", async () => {
+  const api = new FakeVikunjaApi([task(1, "Lease takeover", [1], 1)]);
+  const provider = providerFor(api, "execution-owner-tools");
+  const active = await provider.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-1"));
+  const read = validateRuntimeTools(await provider.getRuntimeTools("1", active.id, active.ownerId!))
+    .find((tool) => tool.name === "task_read")!;
+  api.comments.get(1)!.push({ ...stateComment(999, {
+    protocol: "ensemble-provider-state/v1",
+    kind: "claim",
+    executionId: active.id,
+    role: active.role,
+    expected: {
+      kind: "leased", executionId: active.id, role: active.role, startedAt: active.startedAt,
+      ownerId: active.ownerId, leaseExpiresAt: active.leaseExpiresAt,
+    },
+    ownerId: "worker-2",
+    leaseExpiresAt: "2101-01-01T00:00:00.000Z",
+    observedAt: "2100-01-01T00:00:00.000Z",
+    createdAt: "2100-01-01T00:00:00.000Z",
+  }), created: "2100-01-01T00:00:00.000Z" });
+  await assert.rejects(read.invoke({}), /Vikunja tool task_read failed/u);
 });
 
 test("Vikunja terminal writers fold concurrent duplicates into one semantic result", async () => {
@@ -573,6 +677,7 @@ class FakeVikunjaApi {
   commentReadGate?: Promise<void>;
   maxConcurrentCommentReads = 0;
   failNextLabelUpdates = 0;
+  commentWriteCount = 0;
   #concurrentCommentReads = 0;
   #commentId = 0;
 
@@ -651,6 +756,7 @@ class FakeVikunjaApi {
         }
       }
       if (method === "PUT") {
+        this.commentWriteCount += 1;
         const body = parseBody(init);
         this.#commentId += 1;
         const comment = {
@@ -664,6 +770,18 @@ class FakeVikunjaApi {
         await Promise.resolve();
         return response(comment, 201);
       }
+    }
+
+    const commentMatch = /^tasks\/(\d+)\/comments\/(\d+)$/u.exec(path);
+    if (commentMatch && method === "DELETE") {
+      const taskId = Number(commentMatch[1]);
+      const commentId = Number(commentMatch[2]);
+      const comments = this.comments.get(taskId) ?? [];
+      const index = comments.findIndex((comment) => comment.id === commentId);
+      if (index < 0) return response({ message: "not found" }, 404);
+      comments.splice(index, 1);
+      this.comments.set(taskId, comments);
+      return response({ message: "deleted" });
     }
 
     const labelsMatch = /^tasks\/(\d+)\/labels\/bulk$/u.exec(path);

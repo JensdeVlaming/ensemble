@@ -397,10 +397,13 @@ export class Scheduler {
       failureKind = "configuration";
       const role = execution.configuration.workflow.roles.find((candidate) => candidate.name === roleName);
       if (!role) throw new Error(`Unknown role '${roleName}' for task ${task.id}`);
+      if (!active.ownerId) throw new Error(`Claimed execution ${active.id} has no lease owner`);
+      const ownerId = active.ownerId;
       failureKind = "provider";
-      const [comments, artifacts] = await Promise.all([
+      const [comments, artifacts, tools] = await Promise.all([
         this.#providerCall(() => this.provider.getComments(task.id)),
         this.#providerCall(() => this.provider.getArtifacts(task.id)),
+        this.#providerCall(() => this.provider.getRuntimeTools(task.id, active.id, ownerId)),
       ]);
       this.#assertLeaseOwned(reservation);
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
@@ -412,6 +415,7 @@ export class Scheduler {
         comments,
         artifacts,
         executionId: active.id,
+        tools,
       }));
       reservation.running = running;
       this.#emitForTask(task, { level: "info", event: "dispatch.runtime_started", role: active.role, executionId: active.id });

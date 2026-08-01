@@ -100,11 +100,11 @@ test("Codex App Server initializes, correlates fragmented thread/turn messages, 
 
 test("Codex App Server invokes only captured dynamic tools and returns bounded portable output", async () => {
   let invoked = 0;
-  const tool: RuntimeTool = { name: "task.read", description: "Read task", inputSchema: { type: "object" },
+  const tool: RuntimeTool = { name: "task_read", description: "Read task", inputSchema: { type: "object" },
     invoke: async (input) => { invoked += 1; return { input: input as never, ok: true }; } };
   const launcher = new Launcher({ onTurn: (server, _request, turnId) => {
     server.send({ id: 90, method: "item/tool/call", params: { threadId: "thread-1", turnId,
-      tool: "task.read", arguments: { include: true } } });
+      tool: "task_read", arguments: { include: true } } });
     server.send({ method: "item/completed", params: { threadId: "thread-1", turnId,
       item: { id: "message-1", type: "agentMessage", text: JSON.stringify(result) } } });
     server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });

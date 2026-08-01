@@ -1,4 +1,4 @@
-import type { Artifact, BlockingRequest, FailureKind, Task, TaskComment, TaskId } from "../domain/model.ts";
+import type { Artifact, BlockingRequest, FailureKind, RuntimeTool, Task, TaskComment, TaskId } from "../domain/model.ts";
 
 export type { BlockingRequest } from "../domain/model.ts";
 
@@ -105,6 +105,8 @@ export interface ProviderAdapter {
   getTask(id: TaskId): Promise<Task>;
   getComments(id: TaskId): Promise<readonly TaskComment[]>;
   getArtifacts(id: TaskId): Promise<readonly Artifact[]>;
+  /** Returns task-scoped host capabilities; credentials stay captured inside the adapter. */
+  getRuntimeTools(id: TaskId, executionId: string, ownerId: string): Promise<readonly RuntimeTool[]>;
   getExecutionState(id: TaskId): Promise<ProviderExecutionState>;
   updateStatus(id: TaskId, status: string): Promise<void>;
   createComment(id: TaskId, body: string): Promise<TaskComment>;

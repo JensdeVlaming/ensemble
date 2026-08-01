@@ -93,6 +93,7 @@ class ControlledExecutions implements TaskExecutionService {
   readonly configured: string[] = [];
   readonly allocated: string[] = [];
   readonly started: string[] = [];
+  readonly startedToolNames = new Map<string, readonly string[]>();
   readonly cancelled: string[] = [];
   readonly #results = new Map<string, Deferred<ExecutionReport>>();
   readonly #environmentFailures = new Map<string, Error>();
@@ -171,6 +172,7 @@ class ControlledExecutions implements TaskExecutionService {
     if (startupFailure) throw startupFailure;
     await this.#startupGates.get(request.task.id)?.promise;
     this.started.push(request.task.id);
+    this.startedToolNames.set(request.task.id, (request.tools ?? []).map((tool) => tool.name));
     const result = deferred<ExecutionReport>();
     this.#results.set(request.task.id, result);
     return {
@@ -206,6 +208,33 @@ test("startup validates ordered repository configuration without allocating work
   assert.deepEqual(executions.configured, ["a", "b"]);
   assert.deepEqual(executions.allocated, []);
   assert.deepEqual(executions.started, []);
+});
+
+test("scheduler discovers provider tools only after claim and passes them to the execution environment", async () => {
+  const delegate = new InMemoryProvider([task("tool-task")]);
+  let claimCompleted = false;
+  const provider = new Proxy(delegate, {
+    get(target, property, receiver) {
+      if (property === "beginExecution") return async (...args: Parameters<ProviderAdapter["beginExecution"]>) => {
+        const active = await target.beginExecution(...args);
+        claimCompleted = true;
+        return active;
+      };
+      if (property === "getRuntimeTools") return async () => {
+        assert.equal(claimCompleted, true);
+        return [{ name: "task_read", description: "Read task", inputSchema: { type: "object" },
+          invoke: async () => ({ ok: true }) }];
+      };
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as ProviderAdapter;
+  const executions = new ControlledExecutions(configuration(1));
+  const poll = new Scheduler(provider, executions).poll();
+  await waitFor(() => executions.started.includes("tool-task"));
+  assert.deepEqual(executions.startedToolNames.get("tool-task"), ["task_read"]);
+  executions.finish("tool-task");
+  assert.equal((await poll)[0]?.outcome, "completed");
 });
 
 test("poll overlaps workers within global capacity and preserves priority ordering", async () => {

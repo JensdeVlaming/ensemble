@@ -166,3 +166,39 @@
   correlations, continuation budgets, request policies, dynamic tools,
   telemetry, activity, cancellation, and host/runtime boundaries.
 - Next boundary: commit milestone 2, then begin Vikunja-native tool milestone 3.
+
+## 2026-08-01 — milestone 3 started
+
+- Committed milestone 2 as `b0f82f3` (`feat(codex): add app server
+  transport`).
+- Began task-scoped provider capability discovery and credential-safe Vikunja
+  read/comment tools.
+
+## 2026-08-01 — milestone 3 delivery revision 1
+
+- Added claim-scoped Vikunja task, comment, and artifact reads plus idempotent
+  comment writes with provider-durable restart recovery.
+- Bounded and redacted every tool boundary and omitted provider/artifact
+  metadata from portable results.
+- Verification passed: 174 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 3 delivery judge.
+
+## 2026-08-01 — milestone 3 delivery revision 2
+
+- Independent judge requested App Server-compatible names, cross-instance
+  comment idempotency, and aggregate result bounds.
+- Replaced dotted names with portable function identifiers, added lease-owner
+  revocation and provider-side duplicate reconciliation using Vikunja's comment
+  deletion endpoint, and enforced a serialized aggregate output budget.
+- Added focused overlap, takeover, function-name, and aggregate-size coverage.
+- Full verification passed: 176 tests, typecheck, production build, diff
+  integrity.
+- Next boundary: independent milestone 3 re-review.
+
+## 2026-08-01 — milestone 3 delivery gate passed
+
+- Independent judge verdict: `pass`, no blocking issues, confidence `0.98`.
+- Judge confirmed App Server-safe identifiers, execution and lease-owner scope,
+  cross-instance duplicate reconciliation, and aggregate portable output bounds.
+- Next boundary: commit milestone 3, then begin workspace identity and
+  containment milestone 4.

@@ -134,7 +134,7 @@ test("portable tools are immutable, bounded, result-validated, and prompt serial
   const secret = "provider-token-sentinel";
   const returned = { title: "safe" };
   const tool: RuntimeTool = {
-    name: "task.read",
+    name: "task_read",
     description: "Read the current task",
     inputSchema: { type: "object", properties: { includeComments: { type: "boolean" } }, additionalProperties: false },
     invoke: async (input) => { invoked.push(input); void secret; return returned; },
@@ -154,7 +154,7 @@ test("portable tools are immutable, bounded, result-validated, and prompt serial
 
   const cyclic: { self?: unknown } = {};
   cyclic.self = cyclic;
-  const invalidResult: RuntimeTool = { ...tool, name: "task.invalid", invoke: async () => cyclic as PortableJsonValue };
+  const invalidResult: RuntimeTool = { ...tool, name: "task_invalid", invoke: async () => cyclic as PortableJsonValue };
   await assert.rejects(validateRuntimeTools([invalidResult])[0]!.invoke({}), /acyclic JSON/u);
   assert.throws(() => validateRuntimeTools([{ ...tool, inputSchema: { type: "array" } }]), /array schema requires items/u);
   assert.throws(() => validateRuntimeTools([{ ...tool, inputSchema: { type: "object", minimum: 1 } as never }]), /Unsupported/u);
@@ -162,12 +162,13 @@ test("portable tools are immutable, bounded, result-validated, and prompt serial
     value: { type: "string", enum: [1] },
   } } as never }]), /does not match its schema/u);
   assert.throws(() => validateRuntimeTools([tool, tool]), /Duplicate runtime tool/u);
-  assert.throws(() => validateRuntimeTools(Array.from({ length: 65 }, (_value, index) => ({ ...tool, name: `task.t${index}` }))), /64 tools/u);
+  assert.throws(() => validateRuntimeTools([{ ...tool, name: "task.read" }]), /Invalid runtime tool name/u);
+  assert.throws(() => validateRuntimeTools(Array.from({ length: 65 }, (_value, index) => ({ ...tool, name: `task_t${index}` }))), /64 tools/u);
   const largeEnum = Array.from({ length: 60 }, (_value, index) => `${index}-${"x".repeat(700)}`);
-  assert.throws(() => validateRuntimeTools(Array.from({ length: 7 }, (_value, index) => ({ ...tool, name: `task.large${index}`,
+  assert.throws(() => validateRuntimeTools(Array.from({ length: 7 }, (_value, index) => ({ ...tool, name: `task_large${index}`,
     inputSchema: { type: "object", properties: { value: { type: "string", enum: largeEnum } } } }))), /aggregate size/u);
   const manyProperties = Object.fromEntries(Array.from({ length: 1_000 }, (_value, index) => [`p${index}`, { type: "boolean" }]));
-  assert.throws(() => validateRuntimeTools(Array.from({ length: 6 }, (_value, index) => ({ ...tool, name: `task.nodes${index}`,
+  assert.throws(() => validateRuntimeTools(Array.from({ length: 6 }, (_value, index) => ({ ...tool, name: `task_nodes${index}`,
     inputSchema: { type: "object", properties: manyProperties } }))), /node count/u);
 
   const context = new CodexContextBuilder().build({
@@ -176,7 +177,7 @@ test("portable tools are immutable, bounded, result-validated, and prompt serial
     role: { name: "implementation", instructions: "Implement" }, runtimeConfig: {}, tools: [validated],
   });
   const serialized = JSON.stringify(context);
-  assert.match(serialized, /task\.read/u);
+  assert.match(serialized, /task_read/u);
   assert.doesNotMatch(serialized, /provider-token-sentinel|invoke/u);
 });
 

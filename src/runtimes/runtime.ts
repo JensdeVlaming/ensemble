@@ -42,7 +42,7 @@ export function validateRuntimeTools(tools: readonly import("../domain/model.ts"
   const aggregateNodes = { nodes: 0 };
   return Object.freeze(tools.map((tool) => {
     if (!tool || typeof tool !== "object") throw new Error("Runtime tool must be an object");
-    if (!/^[a-z][a-z0-9_.-]{0,63}$/u.test(tool.name)) throw new Error(`Invalid runtime tool name: ${tool.name}`);
+    if (!/^[a-z][a-z0-9_-]{0,63}$/u.test(tool.name)) throw new Error(`Invalid runtime tool name: ${tool.name}`);
     if (!tool.description.trim() || Buffer.byteLength(tool.description, "utf8") > 1_024) {
       throw new Error(`Invalid runtime tool description: ${tool.name}`);
     }
