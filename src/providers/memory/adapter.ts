@@ -204,15 +204,31 @@ function validateActiveExecution(value: unknown): ActiveExecution {
 function validateExecutionRecord(value: unknown): ExecutionRecord {
   if (!value || typeof value !== "object") throw new Error("Invalid execution record");
   const record = value as Partial<ExecutionRecord>;
+  const blockingRequest = record.blockingRequest === undefined ? undefined : normalizeBlockingRequest(record.blockingRequest);
   if (typeof record.id !== "string" || typeof record.role !== "string" || typeof record.outcome !== "string"
     || typeof record.summary !== "string" || typeof record.finishedAt !== "string" || Number.isNaN(Date.parse(record.finishedAt))
     || (record.nextRole !== undefined && typeof record.nextRole !== "string")
     || (record.failure !== undefined && !isValidFailure(record.failure))
-    || (record.blockingRequest !== undefined && (!record.blockingRequest || typeof record.blockingRequest.kind !== "string"
-      || typeof record.blockingRequest.summary !== "string" || typeof record.blockingRequest.createdAt !== "string"))) {
+    || (record.outcome === "blocked") !== (blockingRequest !== undefined)) {
     throw new Error("Invalid execution record");
   }
-  return record as ExecutionRecord;
+  return { ...record, ...(blockingRequest === undefined ? {} : { blockingRequest }) } as ExecutionRecord;
+}
+
+function normalizeBlockingRequest(value: unknown): NonNullable<ExecutionRecord["blockingRequest"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    throw new Error("Invalid blocking request");
+  }
+  const request = value as Partial<NonNullable<ExecutionRecord["blockingRequest"]>>;
+  if (Reflect.ownKeys(value).some((key) => typeof key !== "string" || !["kind", "summary", "requestId", "createdAt"].includes(key))
+    || (request.kind !== "approval" && request.kind !== "user_input" && request.kind !== "tool_elicitation")
+    || typeof request.summary !== "string" || request.summary.trim().length === 0
+    || Buffer.byteLength(request.summary, "utf8") > 2_048 || !isCanonicalTimestamp(request.createdAt)
+    || (request.requestId !== undefined && (typeof request.requestId !== "string" || request.requestId.trim().length === 0
+      || Buffer.byteLength(request.requestId, "utf8") > 256))) throw new Error("Invalid blocking request");
+  return Object.freeze({ kind: request.kind, summary: request.summary,
+    ...(request.requestId === undefined ? {} : { requestId: request.requestId }), createdAt: request.createdAt });
 }
 
 function isValidFailure(failure: NonNullable<ExecutionRecord["failure"]>): boolean {

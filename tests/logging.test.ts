@@ -270,8 +270,12 @@ test("throwing and rejecting operational reporters cannot change component outco
 
   const task: Task = { id: "task", title: "t", description: "", acceptanceCriteria: [], status: "ready",
     labels: [], assignees: [], repository: { id: "repo", url: "https://example.test/repo.git" } };
-  const configuration = { repository: task.repository } as RepositoryConfiguration;
-  const engine = new ExecutionEngine(new RuntimeRegistry(), {
+  const configuration = { repository: task.repository, runtime: { name: "validation-only", config: {} } } as RepositoryConfiguration;
+  const validationRuntime: Runtime = {
+    name: "validation-only", prepare: async (context) => ({ id: "unused", context, payload: null }),
+    start: async () => { throw new Error("unused"); }, resume: async (session) => session, cancel: async () => undefined,
+  };
+  const engine = new ExecutionEngine(new RuntimeRegistry([validationRuntime]), {
     restore: async () => undefined,
     create: async () => { throw new Error("unused"); },
     cleanup: async () => undefined,
@@ -319,16 +323,19 @@ test("ExecutionEngine projects every runtime payload variant without raw data an
   const task: Task = { id: "task", title: "title-secret", description: "prompt-secret", acceptanceCriteria: [],
     status: "ready", labels: [], assignees: [], repository: { id: "repo", url: "https://secret.example/repo.git" } };
   const events: RuntimeEvent[] = [
-    { type: "run_started", at: timestamp.toISOString(), sessionId: "session-secret" },
-    { type: "progress_updated", at: timestamp.toISOString(), message: "progress-secret", percent: 50 },
-    { type: "tool_started", at: timestamp.toISOString(), tool: "tool-secret" },
-    { type: "tool_finished", at: timestamp.toISOString(), tool: "tool-secret", success: true },
-    { type: "validation_started", at: timestamp.toISOString(), name: "validation-secret" },
-    { type: "validation_finished", at: timestamp.toISOString(), name: "validation-secret", success: false },
-    { type: "artifact_created", at: timestamp.toISOString(), artifact: { type: "secret", url: "https://artifact-secret" } },
-    { type: "comment_requested", at: timestamp.toISOString(), body: "comment-secret" },
-    { type: "next_agent_requested", at: timestamp.toISOString(), role: "role-secret" },
-    { type: "run_failed", at: timestamp.toISOString(), error: "runtime-error-secret" },
+    { type: "run_started", at: timestamp.toISOString(), executionId: "execution", sessionId: "session-secret" },
+    { type: "progress_updated", at: timestamp.toISOString(), executionId: "execution", message: "progress-secret", percent: 50 },
+    { type: "tool_started", at: timestamp.toISOString(), executionId: "execution", tool: "tool-secret" },
+    { type: "tool_finished", at: timestamp.toISOString(), executionId: "execution", tool: "tool-secret", success: true },
+    { type: "validation_started", at: timestamp.toISOString(), executionId: "execution", name: "validation-secret" },
+    { type: "validation_finished", at: timestamp.toISOString(), executionId: "execution", name: "validation-secret", success: false },
+    { type: "artifact_created", at: timestamp.toISOString(), executionId: "execution", artifact: { type: "secret", url: "https://artifact-secret" } },
+    { type: "comment_requested", at: timestamp.toISOString(), executionId: "execution", body: "comment-secret" },
+    { type: "next_agent_requested", at: timestamp.toISOString(), executionId: "execution", role: "role-secret" },
+    { type: "run_failed", at: timestamp.toISOString(), executionId: "execution", error: "runtime-error-secret" },
+    { type: "usage_updated", at: timestamp.toISOString(), executionId: "execution", inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+    { type: "rate_limit_updated", at: timestamp.toISOString(), executionId: "execution", limitId: "limit-secret", usedPercent: 20 },
+    { type: "heartbeat", at: timestamp.toISOString(), executionId: "execution" },
   ];
   const runtime: Runtime = {
     name: "safe",
@@ -351,7 +358,7 @@ test("ExecutionEngine projects every runtime payload variant without raw data an
   await running.result;
   const serialized = JSON.stringify(observed);
   for (const secret of ["title-secret", "prompt-secret", "session-secret", "progress-secret", "tool-secret", "validation-secret",
-    "artifact-secret", "comment-secret", "role-secret", "runtime-error-secret", "summary-secret", "workflow-secret", "agents-secret",
+    "artifact-secret", "comment-secret", "role-secret", "runtime-error-secret", "limit-secret", "summary-secret", "workflow-secret", "agents-secret",
     "workspace-secret", "repository-secret", "runtime-secret"]) assert.doesNotMatch(serialized, new RegExp(secret, "u"));
   assert.equal(observed.filter((event) => event.event === "runtime.event").length, events.length);
 

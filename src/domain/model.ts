@@ -145,7 +145,25 @@ export interface RuntimeSelection {
   readonly config: Readonly<Record<string, unknown>>;
 }
 
+export type PortableJsonValue = null | boolean | number | string
+  | readonly PortableJsonValue[] | { readonly [key: string]: PortableJsonValue };
+
+export interface RuntimeTool {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Readonly<Record<string, PortableJsonValue>>;
+  invoke(input: unknown): Promise<PortableJsonValue>;
+}
+
+export interface BlockingRequest {
+  readonly kind: "approval" | "user_input" | "tool_elicitation";
+  readonly summary: string;
+  readonly requestId?: string;
+  readonly createdAt: string;
+}
+
 export interface RuntimeContext {
+  readonly executionId: string;
   readonly repository: RepositoryRef;
   readonly workspace: Workspace;
   readonly task: Task;
@@ -155,6 +173,7 @@ export interface RuntimeContext {
   readonly agents: string;
   readonly role: RoleDefinition;
   readonly runtimeConfig: Readonly<Record<string, unknown>>;
+  readonly tools: readonly RuntimeTool[];
 }
 
 export interface ResumeContext {

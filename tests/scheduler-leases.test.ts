@@ -92,7 +92,7 @@ class CompletedExecutions implements TaskExecutionService {
           executionId: request.executionId,
           startedAt: "2026-01-01T00:00:00.000Z",
           lastActivityAt: "2026-01-01T00:00:00.000Z",
-          result: Promise.resolve({ taskId: taskValue.id, role: request.role.name, executionId: request.executionId,
+          result: Promise.resolve({ kind: "completed" as const, taskId: taskValue.id, role: request.role.name, executionId: request.executionId,
             result: { outcome: "completed", summary: "done", comments: [], artifacts: [] } }),
           snapshot: () => { throw new Error("not needed"); }, cancel: async () => undefined,
         }),

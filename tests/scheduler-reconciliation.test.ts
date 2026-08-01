@@ -120,6 +120,7 @@ class ControlledExecutions implements TaskExecutionService {
 
   finish(taskId: string): void {
     this.#result(taskId).resolve({
+      kind: "completed",
       taskId,
       role: "implementation",
       executionId: `execution-${taskId}`,

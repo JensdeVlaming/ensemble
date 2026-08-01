@@ -114,11 +114,11 @@ test("starting returns a live handle that owns activity, diagnostics, and worksp
     start: async () => ({
       id: "runtime-session",
       events: (async function* (): AsyncIterable<RuntimeEvent> {
-        yield { type: "run_started", at: "ignored", sessionId: "runtime-session" };
+        yield { type: "run_started", at: "2026-01-01T00:00:00.000Z", executionId: "execution-non-blocking", sessionId: "runtime-session" };
         await emitProgress.promise;
-        yield { type: "progress_updated", at: "ignored", message: "working" };
+        yield { type: "progress_updated", at: "2026-01-01T00:00:00.000Z", executionId: "execution-non-blocking", message: "working" };
         await finishEvents.promise;
-        yield { type: "run_completed", at: "ignored", result: { outcome: "approved", summary: "done", comments: [], artifacts: [] } };
+        yield { type: "run_completed", at: "2026-01-01T00:00:00.000Z", executionId: "execution-non-blocking", result: { outcome: "approved", summary: "done", comments: [], artifacts: [] } };
       })(),
       result: result.promise,
     }),
@@ -156,7 +156,10 @@ test("starting returns a live handle that owns activity, diagnostics, and worksp
   assert.equal(running.lastActivityAt, "2026-07-31T10:01:00.000Z");
   result.resolve({ outcome: "approved", summary: "done", comments: [], artifacts: [] });
   finishEvents.resolve();
-  assert.equal((await running.result).result.outcome, "approved");
+  const report = await running.result;
+  assert.equal(report.kind, "completed");
+  if (report.kind !== "completed") throw new Error("Expected completed execution");
+  assert.equal(report.result.outcome, "approved");
   assert.equal(workspaces.cleaned, 1);
   assert.deepEqual(running.snapshot(), {
     executionId: "execution-non-blocking",
@@ -171,7 +174,7 @@ test("starting returns a live handle that owns activity, diagnostics, and worksp
   });
 });
 
-test("startup failure before runtime preparation releases transferred workspace ownership", async () => {
+test("runtime lookup fails configuration validation before workspace allocation", async () => {
   const root = await fixture();
   const item = task("unknown-runtime");
   const workspaces = new TrackingWorkspaces(root);
@@ -185,7 +188,7 @@ test("startup failure before runtime preparation releases transferred workspace 
     engine.withEnvironment(item, async (environment) => environment.start(request(item))),
     /Unknown runtime: controlled/u,
   );
-  assert.equal(workspaces.cleaned, 1);
+  assert.equal(workspaces.cleaned, 0);
 });
 
 test("runtime startup is bounded and a late session is cancelled without retaining its workspace", async () => {

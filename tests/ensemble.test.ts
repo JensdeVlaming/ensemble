@@ -332,6 +332,7 @@ test("Codex runtime owns prompt construction, event parsing, and result parsing"
   };
   const runtime = new CodexRuntime(transport);
   const prepared = await runtime.prepare({
+    executionId: "codex-execution",
     repository,
     workspace: { root, repositoryPath: root, runtimePath: join(root, ".runtime") },
     task: task("codex-1"),
@@ -341,6 +342,7 @@ test("Codex runtime owns prompt construction, event parsing, and result parsing"
     agents: config.agents,
     role: config.workflow.roles[0]!,
     runtimeConfig: { model: "configured-by-deployment" },
+    tools: [],
   });
   const session = await runtime.start(prepared);
   const events = [];

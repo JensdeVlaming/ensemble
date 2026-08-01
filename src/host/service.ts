@@ -55,10 +55,9 @@ export class HostController {
   }
 
   async validate(): Promise<void> {
-    await within(Promise.all(this.repositories.map(async ({ provider, configurations }) => {
+    await within(Promise.all(this.repositories.map(async ({ provider, scheduler }) => {
       await provider.validateConfiguration();
-      const loaded = await configurations.reload();
-      this.runtimes.get(loaded.configuration.runtime.name);
+      await scheduler.reloadConfiguration();
     })).then(() => undefined), this.#startupTimeoutMs, "Host validation timed out");
   }
 
@@ -120,10 +119,9 @@ export async function buildHostController(
     const engine = new ExecutionEngine(runtimes, workspaces, configurations, () => undefined, 100,
       () => new Date().toISOString(), logger);
     const scheduler = new Scheduler(provider, engine, { events: logger });
-    let initial: Awaited<ReturnType<RepositoryConfigurationManager["reload"]>> | undefined;
+    let initial: Awaited<ReturnType<Scheduler["reloadConfiguration"]>> | undefined;
     try {
-      initial = await configurations.reload();
-      runtimes.get(initial.configuration.runtime.name);
+      initial = await scheduler.reloadConfiguration();
     } catch (error) {
       if (!(error instanceof ConfigurationReloadError)) throw error;
       // The service owns retrying an initially invalid repository configuration.
@@ -133,10 +131,10 @@ export async function buildHostController(
     registrations.push({
       id: registration.id,
       scheduler,
-      startupTimeoutMs: initial?.configuration.timeouts.startupMs ?? configuration.service.startupTimeoutMs,
-      pollIntervalMs: initial?.configuration.service.pollIntervalMs ?? 30_000,
-      drainTimeoutMs: initial?.configuration.shutdown.drainTimeoutMs ?? 60_000,
-      cancellationTimeoutMs: initial?.configuration.timeouts.cancellationMs ?? 10_000,
+      startupTimeoutMs: initial?.operationalPolicy.startupTimeoutMs ?? configuration.service.startupTimeoutMs,
+      pollIntervalMs: initial?.operationalPolicy.pollIntervalMs ?? 30_000,
+      drainTimeoutMs: initial?.operationalPolicy.drainTimeoutMs ?? 60_000,
+      cancellationTimeoutMs: initial?.operationalPolicy.cancellationTimeoutMs ?? 10_000,
     });
   }
   return new HostController(configuration, new OrchestratorService(registrations, undefined, undefined, logger),

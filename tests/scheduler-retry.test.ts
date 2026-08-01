@@ -102,6 +102,7 @@ class ControlledExecutions implements TaskExecutionService {
         const result = outcome instanceof Error
           ? Promise.reject(outcome)
           : Promise.resolve({
+            kind: "completed" as const,
             taskId: request.task.id,
             role: request.role.name,
             executionId: request.executionId,

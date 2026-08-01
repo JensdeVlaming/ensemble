@@ -453,6 +453,26 @@ test("Vikunja adapter rejects malformed provider-owned execution state", async (
   await assert.rejects(providerFor(api, "execution").getExecutionState("1"), /Malformed Ensemble provider state/u);
 });
 
+test("Vikunja rejects inconsistent and non-exact durable blocking records", async () => {
+  const api = new FakeVikunjaApi([task(1, "Malformed block", [3], 1)]);
+  const base = { id: "blocked-1", role: "implementation", summary: "Approve", nextRole: "implementation",
+    finishedAt: "2026-07-31T10:00:00.000Z" };
+  const request = { kind: "approval", summary: "Approve", requestId: "approval-1",
+    createdAt: "2026-07-31T10:00:00.000Z" };
+  const records = [
+    { ...base, outcome: "blocked" },
+    { ...base, outcome: "completed", blockingRequest: request },
+    { ...base, outcome: "blocked", blockingRequest: { ...request, providerCredential: "secret" } },
+  ];
+  for (const [index, record] of records.entries()) {
+    api.comments.set(1, [stateComment(index + 1, {
+      protocol: "ensemble-provider-state/v1", kind: "block", executionId: record.id,
+      createdAt: record.finishedAt, record,
+    })]);
+    await assert.rejects(providerFor(api, "execution").getExecutionState("1"), /Invalid (Vikunja execution record|blocking request)/u);
+  }
+});
+
 test("Vikunja execution state accepts legacy failures and validates present retry details", async () => {
   const api = new FakeVikunjaApi([task(1, "Failure state", [4], 1)]);
   const record = {

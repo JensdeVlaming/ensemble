@@ -567,13 +567,31 @@ function validateEvent(value: unknown): ProviderEvent {
 }
 
 function validateRecord(record: ExecutionRecord): ExecutionRecord {
+  const blockingRequest = record?.blockingRequest === undefined ? undefined : normalizeBlockingRequest(record.blockingRequest);
   if (!record || typeof record !== "object" || typeof record.id !== "string" || typeof record.role !== "string"
     || typeof record.outcome !== "string" || typeof record.summary !== "string" || typeof record.finishedAt !== "string"
     || Number.isNaN(Date.parse(record.finishedAt)) || (record.nextRole !== undefined && typeof record.nextRole !== "string")
-    || (record.failure !== undefined && !isValidFailure(record.failure))) {
+    || (record.failure !== undefined && !isValidFailure(record.failure))
+    || (record.outcome === "blocked") !== (blockingRequest !== undefined)) {
     throw new Error("Invalid Vikunja execution record");
   }
-  return record;
+  return { ...record, ...(blockingRequest === undefined ? {} : { blockingRequest }) };
+}
+
+function normalizeBlockingRequest(value: unknown): NonNullable<ExecutionRecord["blockingRequest"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    throw new Error("Invalid blocking request");
+  }
+  const request = value as Partial<NonNullable<ExecutionRecord["blockingRequest"]>>;
+  if (Reflect.ownKeys(value).some((key) => typeof key !== "string" || !["kind", "summary", "requestId", "createdAt"].includes(key))
+    || (request.kind !== "approval" && request.kind !== "user_input" && request.kind !== "tool_elicitation")
+    || typeof request.summary !== "string" || request.summary.trim().length === 0
+    || Buffer.byteLength(request.summary, "utf8") > 2_048 || !isCanonicalTimestamp(request.createdAt)
+    || (request.requestId !== undefined && (typeof request.requestId !== "string" || request.requestId.trim().length === 0
+      || Buffer.byteLength(request.requestId, "utf8") > 256))) throw new Error("Invalid blocking request");
+  return Object.freeze({ kind: request.kind, summary: request.summary,
+    ...(request.requestId === undefined ? {} : { requestId: request.requestId }), createdAt: request.createdAt });
 }
 
 function isValidFailure(failure: NonNullable<ExecutionRecord["failure"]>): boolean {

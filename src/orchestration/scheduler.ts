@@ -21,7 +21,7 @@ import { emitOperational } from "../observability/logging.ts";
 
 export interface ScheduleReport {
   readonly taskId: string;
-  readonly outcome: "completed" | "advanced" | "failed";
+  readonly outcome: "completed" | "advanced" | "blocked" | "failed";
   readonly role: string;
   readonly nextRole?: string;
   readonly error?: string;
@@ -468,7 +468,9 @@ export class Scheduler {
       const report = await running.result;
       if (reservation.reconciliation) return reconciliationReport(reservation.reconciliation);
       this.#assertLeaseOwned(reservation);
-      const synchronized = await this.#synchronizeResult(task, reservation, roleName, executionId, report.result);
+      const synchronized = report.kind === "blocked"
+        ? await this.#synchronizeBlocked(task, reservation, roleName, executionId, report.blockingRequest)
+        : await this.#synchronizeResult(task, reservation, roleName, executionId, report.result);
       this.#emitForTask(task, { level: "info", event: "dispatch.completed", role: roleName, executionId,
         data: { success: true } });
       return synchronized;
@@ -486,6 +488,43 @@ export class Scheduler {
       return this.#recordFailure(task, reservation, roleName, executionId, history, kind, error);
     } finally {
       if (!reservation.reconciliation) this.#release(reservation);
+    }
+  }
+
+  async #synchronizeBlocked(
+    task: Task,
+    reservation: WorkerReservation,
+    role: string,
+    executionId: string,
+    blockingRequest: import("../domain/model.ts").BlockingRequest,
+  ): Promise<ScheduleReport> {
+    const record: ExecutionRecord = Object.freeze({
+      id: executionId,
+      role,
+      outcome: "blocked",
+      summary: blockingRequest.summary,
+      nextRole: role,
+      finishedAt: this.#nowDate().toISOString(),
+      blockingRequest: Object.freeze({ ...blockingRequest }),
+    });
+    const cancellation = Object.freeze({ record, status: reservation.configuration.blockedStatus,
+      comment: `Ensemble requires operator action: ${blockingRequest.summary}` });
+    const lease = reservation.lease!;
+    const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.#providerCall(
+      () => this.provider.blockExecution(task.id, executionId, guard, cancellation),
+    );
+    try {
+      this.#emitForTask(task, { level: "debug", event: "synchronization.started", role, executionId });
+      await this.#withLeaseGuard(lease, synchronize);
+      this.#emitForTask(task, { level: "info", event: "synchronization.completed", role, executionId });
+      return { taskId: task.id, outcome: "blocked", role, nextRole: role };
+    } catch (error) {
+      if (error instanceof ProviderClaimConflict) {
+        this.#loseLease(lease, error);
+      } else {
+        this.#registerSynchronization(task, role, executionId, record, synchronize, lease, error);
+      }
+      return failureReport(task.id, role, error);
     }
   }
 
@@ -1311,6 +1350,7 @@ function isEligible(
 ): boolean {
   if (task.dispatchable === false || task.blockers?.some((blocker) => !blocker.resolved)) return false;
   const latest = state.history.at(-1);
+  if (latest?.blockingRequest && latest.outcome === "blocked" && task.status === config.blockedStatus) return false;
   const retrying = latest?.outcome === "failed";
   if (!retrying) return config.runnableStatuses.includes(task.status);
   if (!latest.failure?.retryable || !config.retry.retryableFailureKinds.includes(latest.failure.kind)) return false;

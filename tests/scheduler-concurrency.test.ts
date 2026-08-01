@@ -132,6 +132,7 @@ class ControlledExecutions implements TaskExecutionService {
     const result = this.#results.get(taskId);
     if (!result) throw new Error(`Task was not started: ${taskId}`);
     result.resolve({
+      kind: "completed",
       taskId,
       role: "implementation",
       executionId: `execution-${taskId}`,

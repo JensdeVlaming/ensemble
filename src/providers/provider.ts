@@ -1,4 +1,6 @@
-import type { Artifact, FailureKind, Task, TaskComment, TaskId } from "../domain/model.ts";
+import type { Artifact, BlockingRequest, FailureKind, Task, TaskComment, TaskId } from "../domain/model.ts";
+
+export type { BlockingRequest } from "../domain/model.ts";
 
 export interface TaskQuery {
   /** Provider adapters map their own assignment/archive/terminal concepts here. */
@@ -20,13 +22,6 @@ export interface FailureDetail {
   readonly kind: FailureKind;
   readonly retryable: boolean;
   readonly nextAttemptAt?: string;
-}
-
-export interface BlockingRequest {
-  readonly kind: "approval" | "user_input" | "tool_elicitation";
-  readonly summary: string;
-  readonly requestId?: string;
-  readonly createdAt: string;
 }
 
 export interface ActiveExecution {

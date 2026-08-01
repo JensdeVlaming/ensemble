@@ -269,6 +269,35 @@ test("configuration manager coalesces reloads and atomically retains a redacted 
   );
 });
 
+test("runtime validation is atomic with reload and preserves the last-known-good revision", async () => {
+  const source = new SequencedSource([
+    loaded("a", { ...configuration("valid"), runtime: { name: "validated", config: { operatorRequests: "block" } } }),
+    loaded("b", { ...configuration("invalid"), runtime: { name: "validated", config: { operatorRequests: "sometimes" } } }),
+  ]);
+  const manager = new RepositoryConfigurationManager(source, repository, "/repository");
+  const runtime: Runtime = {
+    name: "validated",
+    validateConfiguration: (config) => {
+      if (config.operatorRequests !== "block") throw new Error("Invalid operator request policy");
+    },
+    prepare: async () => { throw new Error("not used"); },
+    start: async () => { throw new Error("not used"); },
+    resume: async (session) => session,
+    cancel: async () => undefined,
+  };
+  const workspaces: WorkspaceManager = {
+    restore: async () => undefined,
+    create: async () => { throw new Error("not used"); },
+    cleanup: async () => undefined,
+  };
+  const engine = new ExecutionEngine(new RuntimeRegistry([runtime]), workspaces, manager);
+  assert.equal((await engine.reloadConfiguration()).status, "installed");
+  const retained = await engine.reloadConfiguration();
+  assert.equal(retained.status, "retained");
+  assert.match(retained.diagnostic ?? "", /Invalid operator request policy/u);
+  assert.equal((await manager.resolve(task())).workflow.instructions, "workflow-valid");
+});
+
 test("first-load failures redact before rejection and Scheduler hides unsafe reload errors", async () => {
   const secrets = new HostSecretResolver({ CONFIG_SECRET: "first-load-secret" });
   secrets.resolve("$CONFIG_SECRET", "provider.token");

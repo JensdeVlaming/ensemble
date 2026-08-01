@@ -36,7 +36,7 @@ export interface ConfigurationReloadResult {
 }
 
 export interface ReloadableConfigurationResolver extends ConfigurationResolver {
-  reload(): Promise<ConfigurationReloadResult>;
+  reload(validate?: (configuration: RepositoryConfiguration) => void): Promise<ConfigurationReloadResult>;
 }
 
 export interface RepositoryRevisionReader {
@@ -116,9 +116,9 @@ export class RepositoryConfigurationManager implements ReloadableConfigurationRe
     this.#maxDiagnosticLength = maximum;
   }
 
-  reload(): Promise<ConfigurationReloadResult> {
+  reload(validate?: (configuration: RepositoryConfiguration) => void): Promise<ConfigurationReloadResult> {
     if (this.#reloading) return this.#reloading;
-    const reloading = this.#performReload();
+    const reloading = this.#performReload(validate);
     this.#reloading = reloading;
     void reloading.finally(() => {
       if (this.#reloading === reloading) this.#reloading = undefined;
@@ -134,7 +134,7 @@ export class RepositoryConfigurationManager implements ReloadableConfigurationRe
     return this.#current.configuration;
   }
 
-  async #performReload(): Promise<ConfigurationReloadResult> {
+  async #performReload(validate?: (configuration: RepositoryConfiguration) => void): Promise<ConfigurationReloadResult> {
     try {
       const loaded = this.source.loadRevision
         ? await this.source.loadRevision(this.repository, this.repositoryPath)
@@ -146,6 +146,7 @@ export class RepositoryConfigurationManager implements ReloadableConfigurationRe
       if (configuration.repository.id !== this.repository.id || configuration.repository.url !== this.repository.url) {
         throw new Error("Configuration source returned a different repository");
       }
+      validate?.(configuration);
       if (this.#current?.revision === loaded.revision) {
         return Object.freeze({
           status: "unchanged" as const,

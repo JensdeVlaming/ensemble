@@ -24,7 +24,7 @@ export const OPERATIONAL_EVENT_NAMES = Object.freeze([
   "workspace.restore_started", "workspace.restored", "workspace.create_started", "workspace.created",
   "workspace.allocation_failed", "workspace.cleanup_started", "workspace.cleanup_completed",
   "workspace.cleanup_failed", "runtime.prepare_started", "runtime.prepared", "runtime.start_started",
-  "runtime.started", "runtime.event", "runtime.completed", "runtime.failed",
+  "runtime.started", "runtime.event", "runtime.completed", "runtime.blocked", "runtime.failed",
   "runtime.cancellation_started", "runtime.cancellation_completed",
   "provider.rate_limited", "provider.request_retry",
 ] as const);

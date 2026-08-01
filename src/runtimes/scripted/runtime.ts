@@ -13,16 +13,20 @@ export class ScriptedRuntime implements Runtime {
     this.#result = result;
   }
 
+  validateConfiguration(config: Readonly<Record<string, unknown>>): void {
+    operatorRequestPolicy(config);
+  }
+
   async prepare(context: RuntimeContext): Promise<PreparedRun> {
     this.contexts.push(context);
-    return { id: randomUUID(), context, payload: context };
+    return { id: randomUUID(), context, payload: context, operatorRequests: operatorRequestPolicy(context.runtimeConfig) };
   }
 
   async start(prepared: PreparedRun): Promise<RuntimeSession> {
     const result = this.#result;
     const events = async function* (): AsyncIterable<RuntimeEvent> {
-      yield { type: "run_started", at: new Date().toISOString(), sessionId: prepared.id };
-      yield { type: "run_completed", at: new Date().toISOString(), result };
+      yield { type: "run_started", at: new Date().toISOString(), executionId: prepared.context.executionId, sessionId: prepared.id };
+      yield { type: "run_completed", at: new Date().toISOString(), executionId: prepared.context.executionId, result };
     };
     return { id: prepared.id, events: events(), result: Promise.resolve(result) };
   }
@@ -38,4 +42,10 @@ export class ScriptedRuntime implements Runtime {
   get cancelled(): boolean {
     return this.#cancelled;
   }
+}
+
+function operatorRequestPolicy(config: Readonly<Record<string, unknown>>): "auto" | "reject" | "block" {
+  const value = config.operatorRequests ?? "reject";
+  if (value !== "auto" && value !== "reject" && value !== "block") throw new Error("Invalid scripted operatorRequests policy");
+  return value;
 }
