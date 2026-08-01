@@ -122,7 +122,8 @@ class FakeTimers implements ServiceTimerSource {
 }
 
 function registration(id: string, scheduler: OrchestratorScheduler) {
-  return { id, scheduler, pollIntervalMs: 10, drainTimeoutMs: 20, cancellationTimeoutMs: 30 };
+  return { id, scheduler, startupTimeoutMs: 30_000, pollIntervalMs: 10, drainTimeoutMs: 20,
+    cancellationTimeoutMs: 30 };
 }
 
 function reloadReport(
@@ -135,7 +136,7 @@ function reloadReport(
   return {
     status,
     revision: `revision-${pollIntervalMs}`,
-    operationalPolicy: { pollIntervalMs, drainTimeoutMs, cancellationTimeoutMs },
+    operationalPolicy: { startupTimeoutMs: 30_000, pollIntervalMs, drainTimeoutMs, cancellationTimeoutMs },
     ...(diagnostic === undefined ? {} : { diagnostic }),
   };
 }
@@ -182,6 +183,27 @@ test("manual ticks startup-gate concurrent repositories, isolate failures, and r
   assert.deepEqual(second.events.slice(0, 6), ["reload", "startup", "reload", "startup", "reload", "tick"]);
   await service.shutdown();
   await assert.rejects(service.tick(), /while stopped/u);
+});
+
+test("repository startup is bounded and a late completion cannot initialize the service", async () => {
+  const scheduler = new ControlledScheduler();
+  scheduler.startupGate = deferred<void>();
+  const service = new OrchestratorService([{
+    ...registration("repository", scheduler),
+    startupTimeoutMs: 5,
+  }], new FakeSignals(), new FakeTimers());
+
+  const first = await service.tick();
+  assert.equal(first.repositories[0]?.outcome, "failed");
+  assert.equal(first.repositories[0]?.error, "Startup timed out for repository");
+
+  scheduler.startupGate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  scheduler.startupGate = undefined;
+  assert.deepEqual(await service.tick(), {
+    repositories: [{ repositoryId: "repository", outcome: "completed", dispatchedTaskIds: ["task-1"] }],
+  });
+  assert.equal(scheduler.startupCalls, 2);
 });
 
 test("completion-relative recurrence never overlaps or accumulates timer backlog", async () => {

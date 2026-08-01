@@ -32,6 +32,7 @@ export interface SchedulerTickReport {
 }
 
 export interface SchedulerOperationalPolicy {
+  readonly startupTimeoutMs: number;
   readonly pollIntervalMs: number;
   readonly drainTimeoutMs: number;
   readonly cancellationTimeoutMs: number;
@@ -90,6 +91,7 @@ interface WorkerReservation {
   reconciliation?: ReconciliationQuarantine;
   lease?: LeaseController;
   leaseTransferred?: boolean;
+  deadlineCancellation?: "timeout" | "stalled";
 }
 
 interface LeaseController {
@@ -155,6 +157,7 @@ export class Scheduler {
   readonly #leasePolicy: SchedulerLeasePolicy;
   readonly #timers: SchedulerTimerSource;
   readonly #events?: OperationalEventReporter;
+  #providerTimeoutMs = 30_000;
 
   constructor(provider: ProviderAdapter, executions: TaskExecutionService, options: SchedulerOptions = {}) {
     this.provider = provider;
@@ -169,10 +172,12 @@ export class Scheduler {
     try {
       const reload = await this.executions.reloadConfiguration();
       const configuration = reload.configuration;
+      this.#providerTimeoutMs = configuration.timeouts.providerMs;
       return Object.freeze({
         status: reload.status,
         revision: reload.revision,
         operationalPolicy: Object.freeze({
+          startupTimeoutMs: configuration.timeouts.startupMs,
           pollIntervalMs: configuration.service.pollIntervalMs,
           drainTimeoutMs: configuration.shutdown.drainTimeoutMs,
           cancellationTimeoutMs: configuration.timeouts.cancellationMs,
@@ -189,7 +194,7 @@ export class Scheduler {
     if (!this.#accepting) throw new Error("Scheduler intake is closed");
     this.#emit({ level: "info", event: "scheduler.startup_started" });
     let discovered: Task[];
-    try { discovered = [...await this.provider.discoverTasks({ scope: "workflow_candidates" })].sort(compareCandidates); }
+    try { discovered = [...await this.#providerCall(() => this.provider.discoverTasks({ scope: "workflow_candidates" }))].sort(compareCandidates); }
     catch (error) {
       this.#emit({ level: "error", event: "scheduler.startup_failed", data: { errorCategory: "provider" } });
       throw error;
@@ -198,7 +203,7 @@ export class Scheduler {
       const validated: string[] = [];
       for (const candidate of discovered) {
         if (!this.#accepting) throw new Error("Scheduler intake is closed");
-        const task = await this.provider.getTask(candidate.id);
+        const task = await this.#providerCall(() => this.provider.getTask(candidate.id));
         await this.executions.withConfiguration(task, async () => undefined);
         validated.push(task.id);
       }
@@ -262,7 +267,7 @@ export class Scheduler {
     }
     if (!this.#accepting) return Object.freeze([]);
     let tasks: readonly Task[];
-    try { tasks = await this.provider.discoverTasks({ scope: "workflow_candidates" }); }
+    try { tasks = await this.#providerCall(() => this.provider.discoverTasks({ scope: "workflow_candidates" })); }
     catch (error) {
       this.#emit({ level: "error", event: "scheduler.tick_failed", data: { errorCategory: "provider" } });
       throw error;
@@ -287,7 +292,7 @@ export class Scheduler {
   async #dispatchCandidate(discovered: Task): Promise<DispatchEntry | undefined> {
     let task: Task;
     try {
-      task = await this.provider.getTask(discovered.id);
+      task = await this.#providerCall(() => this.provider.getTask(discovered.id));
     } catch (error) {
       return settledEntry(discovered.id, failureReport(discovered.id, "unknown", error));
     }
@@ -337,7 +342,7 @@ export class Scheduler {
     let state: ProviderExecutionState | undefined;
     let failureKind: FailureKind = "provider";
     try {
-      state = await this.provider.getExecutionState(task.id);
+      state = await this.#providerCall(() => this.provider.getExecutionState(task.id));
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
       const selectedRole = selectRole(state, execution.configuration);
       roleName = selectedRole;
@@ -367,9 +372,10 @@ export class Scheduler {
 
       this.#emitForTask(task, { level: "debug", event: "claim.started", role: selectedRole });
       let active: ActiveExecution;
+      const observedActive = state.active;
       try {
-        active = await this.provider.beginExecution(task.id, selectedRole, execution.configuration.runningStatus,
-          this.#leaseClaim(state.active));
+        active = await this.#providerCall(() => this.provider.beginExecution(task.id, selectedRole,
+          execution.configuration.runningStatus, this.#leaseClaim(observedActive)));
       } catch (error) {
         if (!(error instanceof ProviderClaimConflict)) this.#emitForTask(task, { level: "error",
           event: "claim.failed", role: selectedRole, data: { errorCategory: "provider" } });
@@ -393,8 +399,8 @@ export class Scheduler {
       if (!role) throw new Error(`Unknown role '${roleName}' for task ${task.id}`);
       failureKind = "provider";
       const [comments, artifacts] = await Promise.all([
-        this.provider.getComments(task.id),
-        this.provider.getArtifacts(task.id),
+        this.#providerCall(() => this.provider.getComments(task.id)),
+        this.#providerCall(() => this.provider.getArtifacts(task.id)),
       ]);
       this.#assertLeaseOwned(reservation);
       if (!this.#accepting) return await this.#stopReservation(task, reservation, roleName, executionId, completion, entry);
@@ -513,14 +519,9 @@ export class Scheduler {
         data: { failureKind: kind, retryable: false },
       });
       const comment = `Ensemble execution failed: ${message}`;
-      const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.provider.failExecution(
-        task.id,
-        executionId,
-        guard,
-        record,
-        configuration.failedStatus,
-        comment,
-      );
+      const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.#providerCall(() => this.provider.failExecution(
+        task.id, executionId, guard, record, configuration.failedStatus, comment,
+      ));
       try {
         this.#emitForTask(task, { level: "debug", event: "synchronization.started", role: roleName, executionId });
         await this.#withLeaseGuard(reservation.lease, synchronize);
@@ -674,7 +675,8 @@ export class Scheduler {
       return excluded;
     }
     let refreshed: ReadonlyMap<string, TaskRefreshResult>;
-    try { refreshed = await this.provider.refreshTasks(taskIds); }
+    this.#enforceDeadlines();
+    try { refreshed = await this.#providerCall(() => this.provider.refreshTasks(taskIds)); }
     catch (error) {
       this.#emit({ level: "error", event: "reconciliation.failed", data: { errorCategory: "provider" } });
       throw error;
@@ -742,7 +744,7 @@ export class Scheduler {
     }
     let state: ProviderExecutionState;
     try {
-      state = await this.provider.getExecutionState(synchronization.taskId);
+      state = await this.#providerCall(() => this.provider.getExecutionState(synchronization.taskId));
     } catch (error) {
       synchronization.lastError = errorMessage(error);
       this.#emit({ level: "error", event: "synchronization.failed", taskId: synchronization.taskId,
@@ -816,7 +818,7 @@ export class Scheduler {
     }
     if (quarantine.providerAttempt) return;
     try {
-      const state = await this.provider.getExecutionState(quarantine.taskId);
+      const state = await this.#providerCall(() => this.provider.getExecutionState(quarantine.taskId));
       if (state.active?.id !== quarantine.executionId) {
         quarantine.durableSettled = true;
         this.#maybeClearQuarantine(quarantine);
@@ -993,7 +995,9 @@ export class Scheduler {
         finishedAt: this.#nowDate().toISOString(), failure: { kind, retryable: false } as const,
       }, status, comment: summary,
     };
-    await this.#withLeaseGuard(lease, (guard) => this.provider.cancelExecution(taskId, executionId, guard, cancellation));
+    await this.#withLeaseGuard(lease, (guard) => this.#providerCall(
+      () => this.provider.cancelExecution(taskId, executionId, guard, cancellation),
+    ));
     this.#emit({ level: "info", event: "synchronization.completed", repositoryId, taskId, role: roleName, executionId });
     return { taskId, outcome: "failed", role: roleName, error: summary };
   }
@@ -1026,7 +1030,9 @@ export class Scheduler {
       status: terminal ? config.completedStatus : config.runningStatus,
     });
     const lease = reservation.lease!;
-    const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.provider.completeExecution(task.id, executionId, guard, completion);
+    const synchronize = (guard: ExecutionLeaseGuard): Promise<void> => this.#providerCall(
+      () => this.provider.completeExecution(task.id, executionId, guard, completion),
+    );
     try {
       this.#emitForTask(task, { level: "debug", event: "synchronization.started", role, executionId });
       await this.#withLeaseGuard(lease, synchronize);
@@ -1092,11 +1098,11 @@ export class Scheduler {
 
   async #renewLease(lease: LeaseController): Promise<void> {
     try {
-      const renewed = await this.provider.renewExecutionLease(
+      const renewed = await this.#providerCall(() => this.provider.renewExecutionLease(
         lease.reservation.taskId,
         lease.active.id,
         this.#leaseClaim(lease.active),
-      );
+      ));
       if (!renewed.ownerId || !renewed.leaseExpiresAt) throw new Error("Provider returned an invalid renewed lease");
       lease.active = { ...renewed, ownerId: renewed.ownerId, leaseExpiresAt: renewed.leaseExpiresAt };
     } catch (error) {
@@ -1164,6 +1170,57 @@ export class Scheduler {
     if (this.#synchronizations.get(synchronization.taskId) === synchronization) this.#synchronizations.delete(synchronization.taskId);
     this.#stopLease(synchronization.lease);
     this.#notifyIdle();
+  }
+
+  #enforceDeadlines(): void {
+    const now = this.#nowEpoch();
+    for (const reservation of this.#workers.values()) {
+      const running = reservation.running;
+      if (!running || reservation.reconciliation || reservation.deadlineCancellation) continue;
+      let snapshot: ReturnType<RunningExecution["snapshot"]>;
+      try { snapshot = running.snapshot(); }
+      catch { continue; }
+      const turnDeadline = Date.parse(snapshot.startedAt) + reservation.configuration.timeouts.turnMs;
+      const stallDeadline = Date.parse(snapshot.lastActivityAt) + reservation.configuration.timeouts.stallMs;
+      if (!Number.isFinite(turnDeadline) || !Number.isFinite(stallDeadline)) continue;
+      let reason: "timeout" | "stalled" | undefined;
+      if (now >= turnDeadline && turnDeadline <= stallDeadline) reason = "timeout";
+      else if (now >= stallDeadline) reason = "stalled";
+      if (!reason) continue;
+      reservation.deadlineCancellation = reason;
+      this.#emit({ level: "warn", event: "dispatch.failed",
+        repositoryId: reservation.configuration.repository.id, taskId: reservation.taskId,
+        ...(reservation.role ? { role: reservation.role } : {}),
+        ...(reservation.executionId ? { executionId: reservation.executionId } : {}),
+        data: { failureKind: reason, errorCategory: reason } });
+      void running.cancel(reason).catch(() => undefined);
+      void running.result.catch(() => undefined);
+    }
+  }
+
+  #providerCall<T>(operation: () => Promise<T>): Promise<T> {
+    let promise: Promise<T>;
+    try { promise = operation(); }
+    catch (error) { return Promise.reject(error); }
+    const timeoutMs = this.#providerTimeoutMs;
+    if (timeoutMs === 0) {
+      void promise.catch(() => undefined);
+      return Promise.reject(new Error("Provider operation timed out"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback();
+      };
+      const timer = setTimeout(() => finish(() => reject(new Error("Provider operation timed out"))), timeoutMs);
+      void promise.then(
+        (value) => finish(() => resolve(value)),
+        (error: unknown) => finish(() => reject(error)),
+      );
+    });
   }
 
   #emit(event: Omit<OperationalEvent, "provider">): void {

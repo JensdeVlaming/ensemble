@@ -21,6 +21,7 @@ export interface OrchestratorScheduler {
 export interface OrchestratorRegistration {
   readonly id: string;
   readonly scheduler: OrchestratorScheduler;
+  readonly startupTimeoutMs: number;
   readonly pollIntervalMs: number;
   readonly drainTimeoutMs: number;
   readonly cancellationTimeoutMs: number;
@@ -105,6 +106,7 @@ export class OrchestratorService {
       if (!registration.id.trim()) throw new Error("Orchestrator registration ID is required");
       if (ids.has(registration.id)) throw new Error(`Duplicate orchestrator registration: ${registration.id}`);
       ids.add(registration.id);
+      validateBound(registration.startupTimeoutMs, `${registration.id}.startupTimeoutMs`);
       validateBound(registration.pollIntervalMs, `${registration.id}.pollIntervalMs`);
       validateBound(registration.drainTimeoutMs, `${registration.id}.drainTimeoutMs`);
       validateBound(registration.cancellationTimeoutMs, `${registration.id}.cancellationTimeoutMs`);
@@ -112,6 +114,7 @@ export class OrchestratorService {
         registration: Object.freeze({ ...registration }),
         initialized: false,
         operationalPolicy: Object.freeze({
+          startupTimeoutMs: registration.startupTimeoutMs,
           pollIntervalMs: registration.pollIntervalMs,
           drainTimeoutMs: registration.drainTimeoutMs,
           cancellationTimeoutMs: registration.cancellationTimeoutMs,
@@ -238,11 +241,13 @@ export class OrchestratorService {
   #ensureStartup(state: RegistrationState): Promise<void> {
     if (state.initialized) return Promise.resolve();
     if (state.startup) return state.startup;
-    const startup = (async () => {
+    let acceptingResult = true;
+    const operation = (async () => {
       try {
         this.#emit({ level: "info", event: "repository.startup_started", repositoryId: state.registration.id });
         await this.#reloadConfiguration(state);
         await state.registration.scheduler.startup();
+        if (!acceptingResult) throw new Error(`Startup timed out for ${state.registration.id}`);
         if (this.#state === "draining" || this.#state === "stopped") {
           throw new Error(`Startup completed after intake closed for ${state.registration.id}`);
         }
@@ -256,6 +261,9 @@ export class OrchestratorService {
         throw error;
       }
     })();
+    const startup = withDeadline(operation, state.operationalPolicy.startupTimeoutMs, () => {
+      acceptingResult = false;
+    }, `Startup timed out for ${state.registration.id}`);
     state.startup = startup;
     void startup.finally(() => {
       if (state.startup === startup) state.startup = undefined;
@@ -347,6 +355,7 @@ export class OrchestratorService {
       throw error;
     }
     validateBound(reload.operationalPolicy.pollIntervalMs, `${state.registration.id}.pollIntervalMs`);
+    validateBound(reload.operationalPolicy.startupTimeoutMs, `${state.registration.id}.startupTimeoutMs`);
     validateBound(reload.operationalPolicy.drainTimeoutMs, `${state.registration.id}.drainTimeoutMs`);
     validateBound(reload.operationalPolicy.cancellationTimeoutMs, `${state.registration.id}.cancellationTimeoutMs`);
     state.operationalPolicy = Object.freeze({ ...reload.operationalPolicy });
@@ -390,4 +399,27 @@ function boundedMessage(message: string): string {
 
 function isClosedState(state: OrchestratorServiceState): boolean {
   return state === "draining" || state === "stopped";
+}
+
+function withDeadline<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  expire: () => void,
+  message: string,
+): Promise<T> {
+  if (timeoutMs === 0) {
+    expire();
+    void operation.catch(() => undefined);
+    return Promise.reject(new Error(message));
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      expire();
+      reject(new Error(message));
+    }, timeoutMs);
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }

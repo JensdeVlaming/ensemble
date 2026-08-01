@@ -38,6 +38,20 @@ test("structured logger emits immutable, defensively copied, deterministic recor
   assert.ok(Object.isFrozen(records[0]?.data));
 });
 
+test("structured logger enforces the configured minimum level", () => {
+  const records: OperationalLogRecord[] = [];
+  const logger = new StructuredLogger({
+    serviceInstanceId: "instance",
+    minimumLevel: "warn",
+    sink: { write: (record) => { records.push(record); } },
+  });
+  logger.emit({ level: "debug", event: "tick.started" });
+  logger.emit({ level: "info", event: "tick.completed" });
+  logger.emit({ level: "warn", event: "dispatch.failed" });
+  logger.emit({ level: "error", event: "tick.failed" });
+  assert.deepEqual(records.map((record) => record.level), ["warn", "error"]);
+});
+
 test("structured logger bounds Unicode values and fails closed on hostile data", () => {
   const records: OperationalLogRecord[] = [];
   const logger = new StructuredLogger({ serviceInstanceId: "instance", now: () => timestamp,
@@ -229,7 +243,8 @@ test("throwing and rejecting operational reporters cannot change component outco
 
   const serviceScheduler = {
     reloadConfiguration: async () => ({ status: "unchanged" as const, revision: "revision-1",
-      operationalPolicy: { pollIntervalMs: 1, drainTimeoutMs: 1, cancellationTimeoutMs: 1 } }),
+      operationalPolicy: { startupTimeoutMs: 30_000, pollIntervalMs: 1, drainTimeoutMs: 1,
+        cancellationTimeoutMs: 1 } }),
     startup: async () => ({ validatedTaskIds: [] }),
     tick: async () => ({ dispatchedTaskIds: [] }),
     shutdown: async () => ({ drained: true, cancelledTaskIds: [], remainingTaskIds: [] }),
@@ -237,7 +252,8 @@ test("throwing and rejecting operational reporters cannot change component outco
   const signals = { addListener: () => undefined, removeListener: () => undefined };
   const timers = { set: () => 1, clear: () => undefined };
   const serviceEvents: OperationalEvent[] = [];
-  const service = new OrchestratorService([{ id: "repo", scheduler: serviceScheduler, pollIntervalMs: 1,
+  const service = new OrchestratorService([{ id: "repo", scheduler: serviceScheduler, startupTimeoutMs: 30_000,
+    pollIntervalMs: 1,
     drainTimeoutMs: 1, cancellationTimeoutMs: 1 }], signals, timers, { emit: (event) => {
       serviceEvents.push(event); return Promise.reject(new Error("observer-secret"));
     } });
@@ -276,12 +292,14 @@ test("Service failure lifecycle events are stable, correlated, and payload-free"
       reloads += 1;
       if (reloads > 1) throw new Error("configuration-secret");
       return { status: "installed" as const, revision: "r1",
-        operationalPolicy: { pollIntervalMs: 1, drainTimeoutMs: 1, cancellationTimeoutMs: 1 } };
+        operationalPolicy: { startupTimeoutMs: 30_000, pollIntervalMs: 1, drainTimeoutMs: 1,
+          cancellationTimeoutMs: 1 } };
     },
     startup: async () => ({ validatedTaskIds: [] }), tick: async () => ({ dispatchedTaskIds: [] }),
     shutdown: async () => { throw new Error("shutdown-secret"); },
   };
-  const service = new OrchestratorService([{ id: "repo", scheduler, pollIntervalMs: 1, drainTimeoutMs: 1,
+  const service = new OrchestratorService([{ id: "repo", scheduler, startupTimeoutMs: 30_000,
+    pollIntervalMs: 1, drainTimeoutMs: 1,
     cancellationTimeoutMs: 1 }], { addListener: () => undefined, removeListener: () => undefined },
   { set: () => 1, clear: () => undefined }, { emit: (event) => { events.push(event); } });
   const started = service.start();

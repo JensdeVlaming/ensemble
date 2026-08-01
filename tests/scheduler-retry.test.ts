@@ -163,6 +163,20 @@ test("durable due times gate ordinary ticks and reconstruct across Scheduler ins
   assert.equal(first?.failure?.nextAttemptAt, "2026-01-01T00:00:01.000Z");
 });
 
+test("repository provider timeout bounds an uncooperative provider read", async () => {
+  const delegate = new InMemoryProvider([task("provider-timeout")]);
+  const provider = proxyProvider(delegate, {
+    discoverTasks: async () => new Promise<readonly Task[]>(() => undefined),
+  });
+  const executions = new ControlledExecutions(configuration(), []);
+  const scheduler = new Scheduler(provider, executions);
+  await scheduler.reloadConfiguration();
+  await assert.rejects(Promise.race([
+    scheduler.tick(),
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("scheduler did not enforce provider timeout")), 100)),
+  ]), /Provider operation timed out/u);
+});
+
 test("retry number, exponential cap, configured classes, and max zero persist exact decisions", async () => {
   let now = new Date("2026-01-01T00:00:00.000Z");
   const config = configuration({ initialDelayMs: 1_000, maxDelayMs: 2_500, multiplier: 2, maxAttempts: 4 });

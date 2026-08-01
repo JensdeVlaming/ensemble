@@ -360,6 +360,7 @@ test("a production Scheduler keeps a running worker on revision A while a later 
 
   const firstReload = await scheduler.reloadConfiguration();
   assert.deepEqual(firstReload.operationalPolicy, {
+    startupTimeoutMs: 1,
     pollIntervalMs: 11,
     drainTimeoutMs: 21,
     cancellationTimeoutMs: 31,

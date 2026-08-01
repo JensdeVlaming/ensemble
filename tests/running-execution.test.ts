@@ -35,7 +35,7 @@ function task(id: string): Task {
   };
 }
 
-async function fixture(cancellationMs = 10_000): Promise<string> {
+async function fixture(cancellationMs = 10_000, runtimeStartMs = 30_000): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ensemble-running-"));
   await mkdir(join(root, ".ensemble", "roles"), { recursive: true });
   await writeFile(join(root, "AGENTS.md"), "Test.");
@@ -47,6 +47,7 @@ async function fixture(cancellationMs = 10_000): Promise<string> {
     "initialRole: implementation",
     "timeouts:",
     `  cancellationMs: ${cancellationMs}`,
+    `  runtimeStartMs: ${runtimeStartMs}`,
   ].join("\n"));
   return root;
 }
@@ -185,6 +186,36 @@ test("startup failure before runtime preparation releases transferred workspace 
     /Unknown runtime: controlled/u,
   );
   assert.equal(workspaces.cleaned, 1);
+});
+
+test("runtime startup is bounded and a late session is cancelled without retaining its workspace", async () => {
+  const root = await fixture(10_000, 1);
+  const item = task("late-start");
+  const workspaces = new TrackingWorkspaces(root);
+  const startup = deferred<Awaited<ReturnType<Runtime["start"]>>>();
+  let cancellations = 0;
+  const runtime: Runtime = {
+    name: "controlled",
+    prepare: async (context) => ({ id: "prepared", context, payload: null }),
+    start: () => startup.promise,
+    resume: async (session) => session,
+    cancel: async () => { cancellations += 1; },
+  };
+  const engine = new ExecutionEngine(new RuntimeRegistry([runtime]), workspaces,
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root));
+
+  await assert.rejects(
+    engine.withEnvironment(item, async (environment) => environment.start(request(item))),
+    /Runtime start timed out/u,
+  );
+  assert.equal(workspaces.cleaned, 1);
+  startup.resolve({
+    id: "late-session",
+    events: (async function* (): AsyncIterable<RuntimeEvent> {})(),
+    result: new Promise<RuntimeResult>(() => undefined),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(cancellations, 1);
 });
 
 test("cancellation is first-reason, idempotent, bounded, and observes detached failures", async () => {

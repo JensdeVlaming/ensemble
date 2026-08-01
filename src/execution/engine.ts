@@ -223,7 +223,7 @@ export class ExecutionEngine implements TaskExecutionService {
       this.#emit(request.task, contextEvent(request, "runtime.prepared", "info"));
       const startedAt = this.now();
       this.#emit(request.task, contextEvent(request, "runtime.start_started", "debug"));
-      const session = await runtime.start(prepared);
+      const session = await startRuntimeWithin(runtime, prepared, configuration.timeouts.runtimeStartMs);
       this.#emit(request.task, contextEvent(request, "runtime.started", "info"));
       return new LiveRunningExecution({
         runtime,
@@ -258,6 +258,28 @@ export class ExecutionEngine implements TaskExecutionService {
 
   #emit(task: Task, event: Omit<OperationalEvent, "repositoryId" | "taskId">): void {
     emitOperational(this.operationalEvents, { ...event, repositoryId: task.repository.id, taskId: task.id });
+  }
+}
+
+async function startRuntimeWithin(runtime: Runtime, prepared: Parameters<Runtime["start"]>[0], timeoutMs: number): Promise<RuntimeSession> {
+  const starting = runtime.start(prepared);
+  if (timeoutMs === 0) {
+    void starting.then((late) => runtime.cancel(late)).catch(() => undefined);
+    throw new Error("Runtime start timed out");
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      starting,
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Runtime start timed out")), timeoutMs); }),
+    ]);
+  } catch (error) {
+    if (error instanceof Error && error.message === "Runtime start timed out") {
+      void starting.then((late) => runtime.cancel(late)).catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

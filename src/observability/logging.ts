@@ -2,6 +2,7 @@ import type {
   OperationalDataValue,
   OperationalEvent,
   OperationalEventReporter,
+  OperationalLogLevel,
   OperationalLogRecord,
   OperationalLogSink,
 } from "../domain/observability.ts";
@@ -26,6 +27,7 @@ export interface StructuredLoggerOptions {
   readonly sink: OperationalLogSink;
   readonly now?: () => Date;
   readonly redact?: (value: string) => string;
+  readonly minimumLevel?: OperationalLogLevel;
 }
 
 export const noopOperationalReporter: OperationalEventReporter = Object.freeze({ emit: () => undefined });
@@ -44,6 +46,7 @@ export class StructuredLogger implements OperationalEventReporter {
   readonly #sink: OperationalLogSink;
   readonly #now: () => Date;
   readonly #redact: (value: string) => string;
+  readonly #minimumLevel: OperationalLogLevel;
   #sinkFailures = 0;
 
   constructor(options: StructuredLoggerOptions) {
@@ -51,11 +54,13 @@ export class StructuredLogger implements OperationalEventReporter {
     this.#sink = options.sink;
     this.#now = options.now ?? (() => new Date());
     this.#redact = options.redact ?? ((value) => value);
+    this.#minimumLevel = options.minimumLevel ?? "debug";
   }
 
   get sinkFailureCount(): number { return this.#sinkFailures; }
 
   emit(event: OperationalEvent): void {
+    if (levelRank(event.level) < levelRank(this.#minimumLevel)) return;
     let record: OperationalLogRecord;
     try {
       record = this.#record(event);
@@ -91,6 +96,10 @@ export class StructuredLogger implements OperationalEventReporter {
     if (jsonBytes(record) > MAX_RECORD_BYTES) throw new Error("Record invariant failed");
     return deepFreeze(record);
   }
+}
+
+function levelRank(level: OperationalLogLevel): number {
+  return level === "debug" ? 0 : level === "info" ? 1 : level === "warn" ? 2 : 3;
 }
 
 export interface JsonLinesWritable { write(chunk: string): unknown; }

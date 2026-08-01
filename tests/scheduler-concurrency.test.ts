@@ -36,7 +36,7 @@ function task(id: string, priority?: number): Task {
   };
 }
 
-function configuration(global: number, byStatus: Readonly<Record<string, number>> = {}): RepositoryConfiguration {
+function configuration(global: number, byStatus: Readonly<Record<string, number>> = {}, deadlineMs = 315_360_000_000): RepositoryConfiguration {
   return {
     repository,
     workflow: { instructions: "Run", roles: [{ name: "implementation", instructions: "Implement" }] },
@@ -63,8 +63,8 @@ function configuration(global: number, byStatus: Readonly<Record<string, number>
       startupMs: 1,
       providerMs: 1,
       runtimeStartMs: 1,
-      turnMs: 1,
-      stallMs: 1,
+      turnMs: deadlineMs,
+      stallMs: deadlineMs,
       cancellationMs: 1,
     },
     shutdown: { drainTimeoutMs: 1 },
@@ -447,6 +447,23 @@ test("shutdown drains naturally, closes intake, and cancels live workers after t
     assert.ok(item?.executionId, event);
   }
   assert.deepEqual((await forced.tick()).dispatchedTaskIds, []);
+});
+
+test("ticks cancel workers at the earliest configured turn or stall deadline", async () => {
+  let now = new Date("2026-07-31T00:00:00.000Z");
+  const provider = new InMemoryProvider([task("deadline")]);
+  const executions = new ControlledExecutions(configuration(1, {}, 1));
+  const scheduler = new Scheduler(provider, executions, { now: () => now });
+  assert.deepEqual((await scheduler.tick()).dispatchedTaskIds, ["deadline"]);
+
+  now = new Date("2026-07-31T00:00:00.002Z");
+  await scheduler.tick();
+  await waitFor(async () => (await provider.getExecutionState("deadline")).history.length === 1);
+  assert.deepEqual(executions.cancelled, ["deadline"]);
+  assert.deepEqual((await provider.getExecutionState("deadline")).history[0]?.failure, {
+    kind: "timeout",
+    retryable: false,
+  });
 });
 
 test("shutdown synchronization failures and conflicts retain every available correlation", async () => {
