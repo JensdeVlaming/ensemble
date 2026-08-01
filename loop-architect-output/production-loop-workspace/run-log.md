@@ -247,3 +247,62 @@
   and practical Node.js containment guarantees.
 - Next boundary: commit milestone 4, then begin repository refresh and lifecycle
   hooks milestone 5.
+
+## 2026-08-01 — milestone 5 started
+
+- Committed milestone 4 as `19adf61` (`fix(workspace): harden identity and
+  containment`).
+- Began repository identity/refresh policy and bounded lifecycle hooks.
+
+## 2026-08-01 — milestone 5 delivery revision 1
+
+- Added identity-verified bounded Git refresh preserving local work and complete
+  argv-only lifecycle hook execution with explicit failure precedence.
+- Verification passed: 189 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 5 delivery judge.
+
+## 2026-08-01 — milestone 5 delivery revision 2
+
+- Independent judge found that timeout paths released child ownership before
+  confirmed exit and that terminal failure lifecycle coverage was incomplete.
+- Unified Git and hook execution behind one bounded argv-only process runner
+  that waits for child close or a final bounded fallback after forced
+  termination.
+- Added exact lifecycle coverage for runtime start failure, runtime result
+  failure, blocked work, and cancellation, including primary-error precedence
+  and exactly-once `afterRun`/`beforeRemove` behavior.
+- Verification passed: 193 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 5 re-review.
+
+## 2026-08-01 — milestone 5 delivery revision 3
+
+- Independent judge found that direct-child termination did not cover spawned
+  descendants and requested explicit blocked/cancelled secondary-failure tests.
+- Bounded processes now own a POSIX process group, kill and confirm the whole
+  group, reject successful parents that leave background descendants, and
+  surface a typed unconfirmed-termination condition after the final bound.
+- The engine and workspace manager stop later destructive transitions whenever
+  process-tree termination cannot be confirmed. Focused tests prove descendant
+  removal, deletion suppression, and blocked/cancelled result precedence when
+  both terminal hooks fail.
+- Verification passed: 194 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 5 final review.
+
+## 2026-08-01 — milestone 5 delivery revision 4
+
+- Independent judge found that unconfirmed termination from `afterCreate` or
+  `beforeRun` could still flow into later hooks and deletion.
+- The engine now carries the unsafe-termination state across allocation and
+  runtime-start boundaries, suppressing all subsequent hooks and cleanup for
+  those paths. Focused tests cover all four lifecycle hook positions.
+- Verification passed: 194 tests, typecheck, production build, diff integrity.
+- Next boundary: independent milestone 5 final re-review.
+
+## 2026-08-01 — milestone 5 delivery gate passed
+
+- Independent judge verdict: `pass`, no blocking issues, confidence `0.99`.
+- Judge confirmed bounded process-tree ownership, destructive-transition
+  suppression for every unconfirmed hook stage, lifecycle ordering, and
+  primary-result precedence across all terminal paths.
+- Next boundary: commit milestone 5, then begin Scheduler-owned terminal and
+  startup cleanup milestone 6.

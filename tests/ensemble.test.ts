@@ -303,6 +303,87 @@ test("git repository materialization selects the configured branch", async () =>
   assert.equal((await execute("git", ["-C", destination, "branch", "--show-current"])).stdout.trim(), "feature");
 });
 
+test("git refresh verifies identity, fast-forwards clean work, and preserves dirty or local work", async () => {
+  const source = await mkdtemp(join(tmpdir(), "ensemble-git-refresh-source-"));
+  await execute("git", ["init", "--quiet", "--initial-branch=main", source]);
+  await execute("git", ["-C", source, "config", "user.email", "ensemble@example.test"]);
+  await execute("git", ["-C", source, "config", "user.name", "Ensemble Test"]);
+  await writeFile(join(source, "tracked.txt"), "one\n");
+  await execute("git", ["-C", source, "add", "tracked.txt"]);
+  await execute("git", ["-C", source, "commit", "--quiet", "-m", "one"]);
+  const target = join(await mkdtemp(join(tmpdir(), "ensemble-git-refresh-target-")), "repository");
+  const driver = new GitRepositoryDriver("git", 5_000);
+  const reference = { id: "refresh", url: source, branch: "main" };
+  await driver.materialize(reference, target);
+
+  await writeFile(join(source, "tracked.txt"), "two\n");
+  await execute("git", ["-C", source, "commit", "--quiet", "-am", "two"]);
+  await driver.refresh(reference, target);
+  assert.equal(await readFile(join(target, "tracked.txt"), "utf8"), "two\n");
+
+  const cleanHead = (await execute("git", ["-C", target, "rev-parse", "HEAD"])).stdout.trim();
+  await writeFile(join(target, "local.txt"), "dirty\n");
+  await writeFile(join(source, "upstream.txt"), "upstream\n");
+  await execute("git", ["-C", source, "add", "upstream.txt"]);
+  await execute("git", ["-C", source, "commit", "--quiet", "-m", "upstream"]);
+  await driver.refresh(reference, target);
+  assert.equal((await execute("git", ["-C", target, "rev-parse", "HEAD"])).stdout.trim(), cleanHead);
+  assert.equal(await readFile(join(target, "local.txt"), "utf8"), "dirty\n");
+
+  await execute("git", ["-C", target, "config", "user.email", "ensemble@example.test"]);
+  await execute("git", ["-C", target, "config", "user.name", "Ensemble Test"]);
+  await execute("git", ["-C", target, "add", "local.txt"]);
+  await execute("git", ["-C", target, "commit", "--quiet", "-m", "local"]);
+  const localHead = (await execute("git", ["-C", target, "rev-parse", "HEAD"])).stdout.trim();
+  await driver.refresh(reference, target);
+  assert.equal((await execute("git", ["-C", target, "rev-parse", "HEAD"])).stdout.trim(), localHead);
+
+  await assert.rejects(driver.refresh({ ...reference, url: `${source}-other` }, target), /origin/u);
+  await assert.rejects(driver.refresh({ ...reference, branch: "feature" }, target), /branch/u);
+});
+
+test("repository commands use a minimal environment and bounded output and time", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ensemble-git-boundary-"));
+  const noisy = join(root, "noisy-git");
+  await writeFile(noisy, `#!${process.execPath}\nif(process.env.VIKUNJA_TOKEN)process.stderr.write(process.env.VIKUNJA_TOKEN);process.stdout.write('x'.repeat(70000));\n`);
+  await chmod(noisy, 0o700);
+  const previous = process.env.VIKUNJA_TOKEN;
+  process.env.VIKUNJA_TOKEN = "provider-secret-sentinel";
+  try {
+    await assert.rejects(new GitRepositoryDriver(noisy, 1_000).refresh({ id: "x", url: "local://x" }, root), (error: unknown) => {
+      assert.equal((error as Error).message, "Repository command output exceeded its limit");
+      assert.doesNotMatch(String(error), /provider-secret-sentinel/u);
+      return true;
+    });
+    const hanging = join(root, "hanging-git");
+    await writeFile(hanging, `#!${process.execPath}\nprocess.on('SIGTERM',()=>{});setInterval(()=>{},1000);\n`);
+    await chmod(hanging, 0o700);
+    await assert.rejects(new GitRepositoryDriver(hanging, 10).refresh({ id: "x", url: "local://x" }, root), /timed out/u);
+  } finally {
+    if (previous === undefined) delete process.env.VIKUNJA_TOKEN;
+    else process.env.VIKUNJA_TOKEN = previous;
+  }
+});
+
+test("workspace restoration refreshes the pinned repository before returning it", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-refresh-"));
+  let refreshes = 0;
+  const repositories = {
+    materialize: async (_reference: RepositoryRef, target: string) => { await mkdir(target); },
+    refresh: async (reference: RepositoryRef, target: string) => {
+      refreshes += 1;
+      assert.deepEqual(reference, repository);
+      assert.equal((await lstat(target)).isDirectory(), true);
+    },
+  };
+  const creator = new LocalWorkspaceManager(base, repositories, true, "vikunja:refresh");
+  await creator.create(task("refresh"));
+  assert.equal(refreshes, 0);
+  const restorer = new LocalWorkspaceManager(base, repositories, true, "vikunja:refresh");
+  assert.ok(await restorer.restore(task("refresh")));
+  assert.equal(refreshes, 1);
+});
+
 test("configuration is completely repository-defined", async () => {
   const root = await fixtureRepository();
   const config = await new RepositoryConfigLoader().load(repository, root);

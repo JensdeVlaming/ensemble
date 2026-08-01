@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { RepositoryRef, Task, Workspace } from "../domain/model.ts";
+import { ProcessTerminationUnconfirmedError, runBoundedProcess } from "./process.ts";
 
 const MANIFEST_VERSION = 1;
 const MANIFEST_NAME = "workspace.json";
@@ -12,13 +12,16 @@ const QUARANTINE_PREFIX = ".ensemble-quarantine-";
 
 export interface RepositoryDriver {
   materialize(repository: RepositoryRef, target: string): Promise<void>;
+  refresh?(repository: RepositoryRef, target: string): Promise<void>;
 }
 
 export class GitRepositoryDriver implements RepositoryDriver {
   readonly executable: string;
+  readonly timeoutMs: number;
 
-  constructor(executable = "git") {
+  constructor(executable = "git", timeoutMs = 60_000) {
     this.executable = executable;
+    this.timeoutMs = timeoutMs;
   }
 
   async materialize(repository: RepositoryRef, target: string): Promise<void> {
@@ -26,7 +29,33 @@ export class GitRepositoryDriver implements RepositoryDriver {
     const arguments_ = ["clone", "--no-tags"];
     if (branch) arguments_.push("--branch", branch, "--single-branch");
     arguments_.push("--", repository.url, target);
-    await run(this.executable, arguments_);
+    await runProcess(this.executable, arguments_, { timeoutMs: this.timeoutMs });
+  }
+
+  async refresh(repository: RepositoryRef, target: string): Promise<void> {
+    const origin = (await runProcess(this.executable, ["-C", target, "remote", "get-url", "origin"],
+      { timeoutMs: this.timeoutMs })).stdout.trim();
+    if (origin !== repository.url) throw new Error("Repository origin does not match configured identity");
+    const branch = repository.branch ?? repository.defaultBranch;
+    if (!branch) {
+      await runProcess(this.executable, ["-C", target, "fetch", "--no-tags", "origin"], { timeoutMs: this.timeoutMs });
+      return;
+    }
+    const current = (await runProcess(this.executable, ["-C", target, "branch", "--show-current"],
+      { timeoutMs: this.timeoutMs })).stdout.trim();
+    if (current !== branch) throw new Error("Repository branch does not match configured identity");
+    await runProcess(this.executable, ["-C", target, "fetch", "--no-tags", "origin", branch], { timeoutMs: this.timeoutMs });
+    const [head, fetched, base, status] = await Promise.all([
+      runProcess(this.executable, ["-C", target, "rev-parse", "HEAD"], { timeoutMs: this.timeoutMs }),
+      runProcess(this.executable, ["-C", target, "rev-parse", "FETCH_HEAD"], { timeoutMs: this.timeoutMs }),
+      runProcess(this.executable, ["-C", target, "merge-base", "HEAD", "FETCH_HEAD"], { timeoutMs: this.timeoutMs }),
+      runProcess(this.executable, ["-C", target, "status", "--porcelain=v1", "--untracked-files=normal"], { timeoutMs: this.timeoutMs }),
+    ]);
+    const headId = head.stdout.trim();
+    const fetchedId = fetched.stdout.trim();
+    if (!status.stdout && base.stdout.trim() === headId && headId !== fetchedId) {
+      await runProcess(this.executable, ["-C", target, "merge", "--ff-only", "FETCH_HEAD"], { timeoutMs: this.timeoutMs });
+    }
   }
 }
 
@@ -42,8 +71,12 @@ export type LegacyWorkspaceMatch =
 export interface WorkspaceManager {
   create(task: Task): Promise<Workspace>;
   restore(task: Task): Promise<Workspace | undefined>;
-  cleanup(workspace: Workspace): Promise<void>;
+  cleanup(workspace: Workspace, options?: WorkspaceCleanupOptions): Promise<void>;
   validate?(workspace: Workspace): Promise<void>;
+}
+
+export interface WorkspaceCleanupOptions {
+  readonly beforeRemove?: () => Promise<void>;
 }
 
 interface WorkspaceManifest {
@@ -125,6 +158,8 @@ export class LocalWorkspaceManager implements WorkspaceManager {
     const workspace = this.#workspace(task.id);
     try {
       const registration = await this.#validateWorkspace(workspace, task);
+      await this.#repositories.refresh?.(task.repository, workspace.repositoryPath);
+      await this.#validateRegistration(workspace, registration);
       this.#registrations.set(workspace.root, registration);
       return workspace;
     } catch (error) {
@@ -141,12 +176,16 @@ export class LocalWorkspaceManager implements WorkspaceManager {
     await this.#validateRegistration(workspace, expected);
   }
 
-  async cleanup(workspace: Workspace): Promise<void> {
+  async cleanup(workspace: Workspace, options: WorkspaceCleanupOptions = {}): Promise<void> {
     if (this.#preserve) return;
     await this.#prepareBase();
     await this.#assertWorkspaceShape(workspace);
     const expected = this.#registrations.get(workspace.root);
     if (!expected) throw new Error("Workspace was not allocated by this manager");
+    await this.#validateRegistration(workspace, expected);
+    await options.beforeRemove?.().catch((error: unknown) => {
+      if (error instanceof ProcessTerminationUnconfirmedError) throw error;
+    });
     await this.#validateRegistration(workspace, expected);
     await this.#removeRoot(workspace.root, expected.root);
     this.#registrations.delete(workspace.root);
@@ -466,16 +505,31 @@ function sameEntry(left: EntryIdentity, right: EntryIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function run(executable: string, arguments_: readonly string[]): Promise<void> {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(executable, arguments_, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) resolvePromise();
-      else reject(new Error(`Repository materialization failed (${signal ?? code ?? "unknown"}): ${stderr.trim()}`));
-    });
+interface ProcessResult {
+  readonly stdout: string;
+}
+
+function runProcess(
+  executable: string,
+  arguments_: readonly string[],
+  options: { readonly timeoutMs: number },
+): Promise<ProcessResult> {
+  return runBoundedProcess({
+    executable,
+    args: arguments_,
+    env: gitEnvironment(),
+    timeoutMs: options.timeoutMs,
+    outputLimit: 65_536,
+    label: "Repository command",
   });
+}
+
+function gitEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const name of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "SSH_AUTH_SOCK", "GIT_ASKPASS"] as const) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  environment.GIT_TERMINAL_PROMPT = "0";
+  return environment;
 }

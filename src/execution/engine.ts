@@ -9,6 +9,9 @@ import type {
 import { validatePortableToolResult, validateRuntimeTools } from "../runtimes/runtime.ts";
 import type { Runtime, RuntimeEvent, RuntimeRegistry, RuntimeSession } from "../runtimes/runtime.ts";
 import type { WorkspaceManager } from "./workspace.ts";
+import { LocalWorkspaceHookRunner } from "./hooks.ts";
+import type { WorkspaceHookRunner } from "./hooks.ts";
+import { ProcessTerminationUnconfirmedError } from "./process.ts";
 import type { OperationalEvent, OperationalEventReporter } from "../domain/observability.ts";
 import { emitOperational } from "../observability/logging.ts";
 
@@ -118,6 +121,7 @@ export class ExecutionEngine implements TaskExecutionService {
   readonly failureDrainMs: number;
   readonly now: () => string;
   readonly operationalEvents?: OperationalEventReporter;
+  readonly hooks: WorkspaceHookRunner;
 
   constructor(
     runtimes: RuntimeRegistry,
@@ -127,6 +131,7 @@ export class ExecutionEngine implements TaskExecutionService {
     failureDrainMs = 100,
     now: () => string = () => new Date().toISOString(),
     operationalEvents?: OperationalEventReporter,
+    hooks: WorkspaceHookRunner = new LocalWorkspaceHookRunner(),
   ) {
     this.runtimes = runtimes;
     this.workspaces = workspaces;
@@ -135,6 +140,7 @@ export class ExecutionEngine implements TaskExecutionService {
     this.failureDrainMs = failureDrainMs;
     this.now = now;
     this.operationalEvents = operationalEvents;
+    this.hooks = hooks;
   }
 
   reloadConfiguration(): Promise<ConfigurationReloadResult> {
@@ -186,6 +192,7 @@ export class ExecutionEngine implements TaskExecutionService {
     let open = true;
     let used = false;
     let cleanupTransferred = false;
+    let safeToCleanup = true;
     try {
       this.#emit(task, { level: "debug", event: "workspace.restore_started" });
       workspace = await this.workspaces.restore(task);
@@ -194,6 +201,7 @@ export class ExecutionEngine implements TaskExecutionService {
         this.#emit(task, { level: "debug", event: "workspace.create_started" });
         workspace = await this.workspaces.create(task);
         this.#emit(task, { level: "info", event: "workspace.created", data: { restored: false } });
+        await this.#runHook(task, workspace, configuration, "afterCreate");
       }
       const environment: ExecutionEnvironment = Object.freeze({
         configuration,
@@ -207,21 +215,27 @@ export class ExecutionEngine implements TaskExecutionService {
       });
       return await work(environment);
     } catch (error) {
+      if (error instanceof ProcessTerminationUnconfirmedError) safeToCleanup = false;
       if (!workspace) this.#emit(task, { level: "error", event: "workspace.allocation_failed", data: { errorCategory: "unexpected" } });
       throw error;
     } finally {
       open = false;
-      if (workspace && !cleanupTransferred) {
+      if (workspace && !cleanupTransferred && safeToCleanup) {
         // Workspace disposal is best-effort. Cleanup must never replace a
         // scheduling, provider, event-stream, or runtime outcome.
-        await this.#cleanup(task, workspace).catch(() => undefined);
+        await this.#cleanup(task, workspace, configuration).catch(() => undefined);
       }
     }
   }
 
   async #start(workspace: Workspace, configuration: RepositoryConfiguration, request: RuntimeExecutionRequest): Promise<RunningExecution> {
+    let attemptStarted = false;
+    let afterRun: Promise<void> | undefined;
+    const finishAttempt = () => afterRun ??= this.#runHook(request.task, workspace, configuration, "afterRun");
     try {
       await this.workspaces.validate?.(workspace);
+      attemptStarted = true;
+      await this.#runHook(request.task, workspace, configuration, "beforeRun");
       const runtime = this.runtimes.get(configuration.runtime.name);
       this.#emit(request.task, contextEvent(request, "runtime.prepare_started", "debug"));
       const prepared = await runtime.prepare({
@@ -254,22 +268,50 @@ export class ExecutionEngine implements TaskExecutionService {
         startedAt,
         now: this.now,
         operationalEvents: this.operationalEvents,
-        cleanup: () => this.#cleanup(request.task, workspace),
+        cleanup: () => configuration.workspace?.hooks?.afterRun
+          ? finishAttempt().catch(continueAfterSafeHookFailure).then(() => this.#cleanup(request.task, workspace, configuration))
+          : this.#cleanup(request.task, workspace, configuration),
       });
     } catch (error) {
       this.#emit(request.task, { ...contextEvent(request, "runtime.failed", "error"), data: { errorCategory: "runtime" } });
-      beginBestEffortCleanup(() => this.#cleanup(request.task, workspace));
+      let safeToContinue = !(error instanceof ProcessTerminationUnconfirmedError);
+      if (safeToContinue && attemptStarted && configuration.workspace?.hooks?.afterRun) {
+        await finishAttempt().catch((hookError: unknown) => { safeToContinue = !(hookError instanceof ProcessTerminationUnconfirmedError); });
+      }
+      if (safeToContinue) beginBestEffortCleanup(() => this.#cleanup(request.task, workspace, configuration));
       throw error;
     }
   }
 
-  async #cleanup(task: Task, workspace: Workspace): Promise<void> {
+  async #cleanup(task: Task, workspace: Workspace, configuration: RepositoryConfiguration): Promise<void> {
     this.#emit(task, { level: "debug", event: "workspace.cleanup_started" });
     try {
-      await this.workspaces.cleanup(workspace);
+      await this.workspaces.cleanup(workspace, {
+        beforeRemove: async () => { await this.#runHook(task, workspace, configuration, "beforeRemove").catch(continueAfterSafeHookFailure); },
+      });
       this.#emit(task, { level: "info", event: "workspace.cleanup_completed" });
     } catch (error) {
       this.#emit(task, { level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "cleanup" } });
+      throw error;
+    }
+  }
+
+  async #runHook(
+    task: Task,
+    workspace: Workspace,
+    configuration: RepositoryConfiguration,
+    name: keyof RepositoryConfiguration["workspace"]["hooks"],
+  ): Promise<void> {
+    const policy = configuration.workspace;
+    if (!policy) return;
+    const hook = policy.hooks[name];
+    if (!hook) return;
+    this.#emit(task, { level: "debug", event: "workspace.hook_started", data: { hook: name } });
+    try {
+      await this.hooks.run(hook, workspace.repositoryPath, policy.hookTimeoutMs);
+      this.#emit(task, { level: "info", event: "workspace.hook_completed", data: { hook: name } });
+    } catch (error) {
+      this.#emit(task, { level: "warn", event: "workspace.hook_failed", data: { hook: name, errorCategory: "hook" } });
       throw error;
     }
   }
@@ -700,6 +742,10 @@ function beginBestEffortCleanup(cleanup: () => Promise<void>): void {
   } catch {
     // Cleanup is secondary to the execution result and is always best-effort.
   }
+}
+
+function continueAfterSafeHookFailure(error: unknown): void {
+  if (error instanceof ProcessTerminationUnconfirmedError) throw error;
 }
 
 function report(request: RuntimeExecutionRequest, result: RuntimeResult): ExecutionReport {

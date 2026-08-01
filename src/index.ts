@@ -14,6 +14,7 @@ export * from "./orchestration/service.ts";
 export * from "./execution/engine.ts";
 export * from "./execution/repository.ts";
 export * from "./execution/workspace.ts";
+export * from "./execution/hooks.ts";
 export * from "./runtimes/runtime.ts";
 export * from "./runtimes/scripted/runtime.ts";
 export * from "./runtimes/codex/runtime.ts";
