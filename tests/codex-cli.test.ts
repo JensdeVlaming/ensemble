@@ -22,11 +22,19 @@ class FakeProcess implements CodexProcess {
 }
 
 class FakeLauncher implements CodexProcessLauncher {
-  readonly calls: Array<{ executable: string; arguments_: readonly string[]; cwd: string }> = [];
+  readonly calls: Array<{
+    executable: string;
+    arguments_: readonly string[];
+    cwd: string;
+    environment: Readonly<Record<string, string>>;
+  }> = [];
   readonly processes: FakeProcess[];
   constructor(processes: FakeProcess[]) { this.processes = processes; }
-  launch(executable: string, arguments_: readonly string[], options: { readonly cwd: string }): CodexProcess {
-    this.calls.push({ executable, arguments_, cwd: options.cwd });
+  launch(executable: string, arguments_: readonly string[], options: {
+    readonly cwd: string;
+    readonly environment: Readonly<Record<string, string>>;
+  }): CodexProcess {
+    this.calls.push({ executable, arguments_, cwd: options.cwd, environment: options.environment });
     const process = this.processes.shift();
     if (!process) throw new Error("No fake process");
     return process;
@@ -45,7 +53,8 @@ function successful(id: string, summary = "done"): FakeProcess {
 
 test("Codex CLI transport builds argv, normalizes JSONL, extracts results, and resumes", async () => {
   const launcher = new FakeLauncher([successful("thread-1"), successful("thread-2", "resumed")]);
-  const transport = new CodexCliTransport({ executable: "codex-test", launcher, executionArguments: ["--sandbox", "workspace-write"] });
+  const transport = new CodexCliTransport({ executable: "codex-test", launcher,
+    executionArguments: ["--sandbox", "workspace-write"], environment: { PATH: "/bin", CODEX_HOME: "/codex" } });
   const first = await transport.start({ id: "request", cwd: "/workspace", prompt: "do work", config: { model: "configured-model" } });
   const messages = [];
   for await (const message of first.messages) messages.push(message);
@@ -58,6 +67,7 @@ test("Codex CLI transport builds argv, normalizes JSONL, extracts results, and r
     executable: "codex-test",
     arguments_: ["exec", "--json", "--sandbox", "workspace-write", "--model", "configured-model", "do work"],
     cwd: "/workspace",
+    environment: { PATH: "/bin", CODEX_HOME: "/codex" },
   });
   const resumed = await transport.resume(first, "continue");
   assert.equal((await resumed.result as { summary: string }).summary, "resumed");

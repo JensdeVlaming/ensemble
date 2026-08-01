@@ -8,12 +8,22 @@ export interface CodexProcess {
 }
 
 export interface CodexProcessLauncher {
-  launch(executable: string, arguments_: readonly string[], options: { readonly cwd: string }): CodexProcess;
+  launch(executable: string, arguments_: readonly string[], options: {
+    readonly cwd: string;
+    readonly environment: Readonly<Record<string, string>>;
+  }): CodexProcess;
 }
 
 export class NodeCodexProcessLauncher implements CodexProcessLauncher {
-  launch(executable: string, arguments_: readonly string[], options: { readonly cwd: string }): CodexProcess {
-    const child = spawn(executable, [...arguments_], { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"] });
+  launch(executable: string, arguments_: readonly string[], options: {
+    readonly cwd: string;
+    readonly environment: Readonly<Record<string, string>>;
+  }): CodexProcess {
+    const child = spawn(executable, [...arguments_], {
+      cwd: options.cwd,
+      env: { ...options.environment },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => { stderr += chunk; });
@@ -37,6 +47,8 @@ export interface CodexCliTransportOptions {
   readonly launcher?: CodexProcessLauncher;
   /** Arguments placed after `codex exec` and before the prompt. */
   readonly executionArguments?: readonly string[];
+  /** Explicit environment; the controller environment is never inherited implicitly. */
+  readonly environment?: Readonly<Record<string, string>>;
 }
 
 /** Process-backed transport for the documented `codex exec --json` protocol. */
@@ -44,12 +56,14 @@ export class CodexCliTransport implements CodexTransport {
   readonly executable: string;
   readonly launcher: CodexProcessLauncher;
   readonly executionArguments: readonly string[];
+  readonly environment: Readonly<Record<string, string>>;
   readonly #processes = new WeakMap<CodexTransportSession, CodexProcess>();
 
   constructor(options: CodexCliTransportOptions = {}) {
     this.executable = options.executable ?? "codex";
     this.launcher = options.launcher ?? new NodeCodexProcessLauncher();
     this.executionArguments = options.executionArguments ?? ["--sandbox", "workspace-write", "--skip-git-repo-check"];
+    this.environment = Object.freeze({ ...(options.environment ?? {}) });
   }
 
   start(request: CodexRunRequest): Promise<CodexTransportSession> {
@@ -75,7 +89,7 @@ export class CodexCliTransport implements CodexTransport {
   }
 
   async #launch(arguments_: readonly string[], cwd: string): Promise<CodexTransportSession> {
-    const process = this.launcher.launch(this.executable, arguments_, { cwd });
+    const process = this.launcher.launch(this.executable, arguments_, { cwd, environment: this.environment });
     const messages = new AsyncMessageQueue();
     const thread = deferred<string>();
     const result = deferred<unknown>();

@@ -117,7 +117,7 @@ export class CodexResultBuilder {
 }
 
 export class CodexRuntime implements Runtime {
-  readonly name = "codex";
+  readonly name: string;
   readonly #sessions = new WeakMap<RuntimeSession, CodexTransportSession>();
 
   constructor(
@@ -126,7 +126,10 @@ export class CodexRuntime implements Runtime {
     privatePromptBuilder = new CodexPromptBuilder(),
     privateEventParser = new CodexEventParser(),
     privateResultBuilder = new CodexResultBuilder(),
+    name = "codex",
   ) {
+    if (!name.trim()) throw new Error("Codex runtime name is required");
+    this.name = name;
     this.transport = privateTransport;
     this.contextBuilder = privateContextBuilder;
     this.promptBuilder = privatePromptBuilder;
