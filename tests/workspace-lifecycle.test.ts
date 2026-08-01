@@ -307,6 +307,49 @@ test("unconfirmed hook process termination prevents every later destructive tran
   assert.equal(beforeRemoveWorkspaces.removed, 0);
 });
 
+test("terminal removal waits for attempt cleanup and preserves afterRun-before-beforeRemove order", async () => {
+  let releaseCleanup!: () => void;
+  let cleanupStarted!: () => void;
+  const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+  const started = new Promise<void>((resolve) => { cleanupStarted = resolve; });
+  const order: string[] = [];
+  class OrderedWorkspaces implements WorkspaceManager {
+    async create(): Promise<Workspace> { return workspace; }
+    async restore(): Promise<Workspace | undefined> { return undefined; }
+    async validate(): Promise<void> {}
+    async cleanup(): Promise<void> {
+      cleanupStarted();
+      await cleanupGate;
+      order.push("attempt-cleanup");
+    }
+    async removeTask(_task: Task, options?: { beforeRemove?: (value: Workspace) => Promise<void> }): Promise<void> {
+      await options?.beforeRemove?.(workspace);
+      order.push("terminal-remove");
+    }
+  }
+  class OrderedHooks extends RecordingHooks {
+    override async run(hook: WorkspaceHook, cwd: string, timeoutMs: number): Promise<void> {
+      await super.run(hook, cwd, timeoutMs);
+      if (hook.executable === "afterRun" || hook.executable === "beforeRemove") order.push(hook.executable);
+    }
+  }
+  const workspaces = new OrderedWorkspaces();
+  const hooks = new OrderedHooks();
+  const service = new ExecutionEngine(
+    new RuntimeRegistry([new ScriptedRuntime("scripted", { outcome: "approved", summary: "done", comments: [], artifacts: [] })]),
+    workspaces, { resolve: async () => configuration() }, undefined, 0, () => "2026-08-01T00:00:00.000Z", undefined, hooks,
+  );
+  assert.equal((await execute(service)).kind, "completed");
+  await started;
+  let removed = false;
+  const removal = service.removeTerminalWorkspace(item).then(() => { removed = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(removed, false);
+  releaseCleanup();
+  await removal;
+  assert.deepEqual(order, ["afterRun", "attempt-cleanup", "beforeRemove", "terminal-remove"]);
+});
+
 async function* asyncEventsPending(): AsyncIterable<RuntimeEvent> {
   await new Promise<never>(() => undefined);
 }

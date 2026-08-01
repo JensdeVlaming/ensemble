@@ -13,6 +13,7 @@ import type {
   ExecutionRecord,
   ProviderAdapter,
   ProviderExecutionState,
+  ProviderTaskInventory,
   TaskRefreshResult,
 } from "../providers/provider.ts";
 import type { FailureKind, RepositoryConfiguration, RuntimeResult, Task } from "../domain/model.ts";
@@ -82,6 +83,7 @@ export const processExecutionOwner = Object.freeze({ id: randomUUID() });
 
 interface WorkerReservation {
   readonly taskId: string;
+  readonly task: Task;
   readonly configuration: RepositoryConfiguration;
   readonly completion: Deferred<ScheduleReport | undefined>;
   status: string;
@@ -193,6 +195,7 @@ export class Scheduler {
   async startup(): Promise<SchedulerStartupReport> {
     if (!this.#accepting) throw new Error("Scheduler intake is closed");
     this.#emit({ level: "info", event: "scheduler.startup_started" });
+    await this.#reconcileWorkspaces();
     let discovered: Task[];
     try { discovered = [...await this.#providerCall(() => this.provider.discoverTasks({ scope: "workflow_candidates" }))].sort(compareCandidates); }
     catch (error) {
@@ -265,6 +268,7 @@ export class Scheduler {
       this.#emit({ level: "error", event: "scheduler.tick_failed", data: { errorCategory: "provider" } });
       throw error;
     }
+    await this.#reconcileWorkspaces();
     if (!this.#accepting) return Object.freeze([]);
     let tasks: readonly Task[];
     try { tasks = await this.#providerCall(() => this.provider.discoverTasks({ scope: "workflow_candidates" })); }
@@ -331,6 +335,7 @@ export class Scheduler {
     const completion = deferred<ScheduleReport | undefined>();
     const reservation: WorkerReservation = {
       taskId: task.id,
+      task,
       configuration: execution.configuration,
       completion,
       status: task.status,
@@ -1092,12 +1097,72 @@ export class Scheduler {
       }
       return failureReport(task.id, role, error);
     }
+    if (terminal) await this.executions.removeTerminalWorkspace?.(task).catch(() => undefined);
     return {
       taskId: task.id,
       outcome: terminal ? "completed" : "advanced",
       role,
       nextRole: result.nextRole,
     };
+  }
+
+  async #reconcileWorkspaces(): Promise<void> {
+    if (!this.executions.inspectWorkspaces) return;
+    let inventory: ProviderTaskInventory;
+    try { inventory = await this.#providerCall(() => this.provider.inventoryTasks()); }
+    catch {
+      this.#emit({ level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "provider" } });
+      return;
+    }
+    const entries = [...inventory.entries].sort((left, right) => left.task.id.localeCompare(right.task.id));
+    const byId = new Map<string, ProviderTaskInventory["entries"][number]>();
+    for (const entry of entries) {
+      if (byId.has(entry.task.id)) throw new Error(`Provider workspace inventory contains duplicate task: ${entry.task.id}`);
+      byId.set(entry.task.id, entry);
+    }
+    const inspectionTasks = new Map(entries.map((entry) => [entry.task.id, entry.task]));
+    for (const reservation of this.#workers.values()) inspectionTasks.set(reservation.task.id, reservation.task);
+    for (const quarantine of this.#quarantines.values()) inspectionTasks.set(quarantine.reservation.task.id, quarantine.reservation.task);
+    for (const synchronization of this.#synchronizations.values()) {
+      inspectionTasks.set(synchronization.lease.reservation.task.id, synchronization.lease.reservation.task);
+    }
+    let workspaces: Awaited<ReturnType<NonNullable<TaskExecutionService["inspectWorkspaces"]>>>;
+    try { workspaces = await this.executions.inspectWorkspaces([...inspectionTasks.values()]); }
+    catch {
+      this.#emit({ level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "cleanup" } });
+      return;
+    }
+    for (const match of workspaces.legacy) {
+      try {
+        if (match.kind === "unique") {
+          if (this.#workers.has(match.taskId) || this.#quarantines.has(match.taskId) || this.#synchronizations.has(match.taskId)) continue;
+          const entry = byId.get(match.taskId)!;
+          if (entry.lifecycle === "terminal") await this.executions.removeLegacyWorkspace?.(match.handle, entry.task);
+          else await this.executions.migrateLegacyWorkspace?.(match, entry.task);
+        } else if (match.kind === "ambiguous") {
+          await this.executions.quarantineLegacyWorkspace?.(match.handle);
+        } else if (inventory.completeness === "complete") {
+          await this.executions.removeLegacyWorkspace?.(match.handle);
+        }
+      } catch {
+        this.#emit({ level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "cleanup" } });
+      }
+    }
+    for (const match of workspaces.managed) {
+      try {
+        if (match.kind === "unique") {
+          if (this.#workers.has(match.taskId) || this.#quarantines.has(match.taskId) || this.#synchronizations.has(match.taskId)) continue;
+          const entry = byId.get(match.taskId)!;
+          if (entry.lifecycle === "terminal") await this.executions.removeManagedWorkspace?.(match.handle, entry.task);
+        } else if (match.kind === "invalid") {
+          await this.executions.quarantineManagedWorkspace?.(match.handle);
+        } else if (inventory.completeness === "complete") {
+          await this.executions.removeManagedWorkspace?.(match.handle);
+        }
+      } catch {
+        this.#emit({ level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "cleanup" } });
+      }
+    }
   }
 
   #leaseClaim(active: ActiveExecution | undefined): ExecutionLeaseClaim {

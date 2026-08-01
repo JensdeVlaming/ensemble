@@ -13,6 +13,7 @@ import type {
   ExecutionRecord,
   ProviderAdapter,
   ProviderExecutionState,
+  ProviderTaskInventory,
   TaskQuery,
   TaskRefreshResult,
 } from "../provider.ts";
@@ -215,6 +216,29 @@ export class VikunjaProvider implements ProviderAdapter {
       candidates.set(normalized.id, normalized);
     }
     return Object.freeze([...candidates.values()].sort(compareTasks));
+  }
+
+  async inventoryTasks(): Promise<ProviderTaskInventory> {
+    const projects = [...await this.client.paginate<VikunjaProject>("projects", { is_archived: true }, {
+      maxPages: Math.ceil(this.#inventoryMaxProjects / this.client.perPage), maxItems: this.#inventoryMaxProjects,
+    })].map(validateProject).sort((left, right) => left.id - right.id);
+    if (!projects.some((project) => project.id === this.projectId)) {
+      throw new Error(`Vikunja configured project is not visible: ${this.projectId}`);
+    }
+    const entries: Array<ProviderTaskInventory["entries"][number]> = [];
+    for (const project of projects) {
+      const remaining = this.#inventoryMaxTasks - entries.length;
+      if (remaining <= 0) throw new VikunjaPaginationLimitError("workspace task inventory", "items");
+      const tasks = await this.client.paginate<VikunjaTask>(`projects/${project.id}/tasks`, { expand: "buckets" }, {
+        maxPages: Math.ceil(remaining / this.client.perPage), maxItems: remaining,
+      });
+      for (const raw of tasks) {
+        const task = this.#normalizeTask(raw, project.is_archived);
+        entries.push(Object.freeze({ task, lifecycle: project.is_archived || task.status === "completed" ? "terminal" : "current" }));
+      }
+    }
+    entries.sort((left, right) => left.task.id.localeCompare(right.task.id));
+    return Object.freeze({ completeness: "complete", entries: Object.freeze(entries) });
   }
 
   async refreshTasks(ids: readonly TaskId[]): Promise<ReadonlyMap<TaskId, TaskRefreshResult>> {

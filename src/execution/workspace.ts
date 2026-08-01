@@ -9,6 +9,7 @@ const MANIFEST_VERSION = 1;
 const MANIFEST_NAME = "workspace.json";
 const MANIFEST_MAX_BYTES = 16_384;
 const QUARANTINE_PREFIX = ".ensemble-quarantine-";
+const MANAGED_NAME_PATTERN = /--[a-f0-9]{20}$/u;
 
 export interface RepositoryDriver {
   materialize(repository: RepositoryRef, target: string): Promise<void>;
@@ -63,20 +64,41 @@ export interface LegacyWorkspaceHandle {
   readonly id: string;
 }
 
+export interface ManagedWorkspaceHandle {
+  readonly id: string;
+}
+
 export type LegacyWorkspaceMatch =
   | { readonly kind: "unique"; readonly handle: LegacyWorkspaceHandle; readonly taskId: string }
   | { readonly kind: "ambiguous"; readonly handle: LegacyWorkspaceHandle }
   | { readonly kind: "unmatched"; readonly handle: LegacyWorkspaceHandle };
+
+export type ManagedWorkspaceMatch =
+  | { readonly kind: "unique"; readonly handle: ManagedWorkspaceHandle; readonly taskId: string }
+  | { readonly kind: "unmatched"; readonly handle: ManagedWorkspaceHandle }
+  | { readonly kind: "invalid"; readonly handle: ManagedWorkspaceHandle };
 
 export interface WorkspaceManager {
   create(task: Task): Promise<Workspace>;
   restore(task: Task): Promise<Workspace | undefined>;
   cleanup(workspace: Workspace, options?: WorkspaceCleanupOptions): Promise<void>;
   validate?(workspace: Workspace): Promise<void>;
+  classifyLegacy?(tasks: readonly Task[]): Promise<readonly LegacyWorkspaceMatch[]>;
+  classifyManaged?(tasks: readonly Task[]): Promise<readonly ManagedWorkspaceMatch[]>;
+  migrateLegacy?(match: Extract<LegacyWorkspaceMatch, { kind: "unique" }>, task: Task): Promise<Workspace>;
+  quarantineLegacy?(handle: LegacyWorkspaceHandle): Promise<void>;
+  removeLegacy?(handle: LegacyWorkspaceHandle, options?: WorkspaceRemovalOptions): Promise<void>;
+  quarantineManaged?(handle: ManagedWorkspaceHandle): Promise<void>;
+  removeManaged?(handle: ManagedWorkspaceHandle, options?: WorkspaceRemovalOptions): Promise<void>;
+  removeTask?(task: Task, options?: WorkspaceRemovalOptions): Promise<void>;
 }
 
 export interface WorkspaceCleanupOptions {
   readonly beforeRemove?: () => Promise<void>;
+}
+
+export interface WorkspaceRemovalOptions {
+  readonly beforeRemove?: (workspace: Workspace) => Promise<void>;
 }
 
 interface WorkspaceManifest {
@@ -109,6 +131,11 @@ export class LocalWorkspaceManager implements WorkspaceManager {
   readonly #preserve: boolean;
   readonly #namespace: string;
   readonly #legacy = new Map<string, { readonly path: string; readonly identity: EntryIdentity }>();
+  readonly #managed = new Map<string, {
+    readonly workspace: Workspace;
+    readonly identity: EntryIdentity;
+    readonly registration?: WorkspaceRegistration;
+  }>();
   readonly #registrations = new Map<string, WorkspaceRegistration>();
   #baseIdentity?: BaseIdentity;
 
@@ -210,7 +237,7 @@ export class LocalWorkspaceManager implements WorkspaceManager {
     for (const entry of entries) {
       const root = join(this.#basePath, entry.name);
       await this.#assertContained(root, true);
-      if (await manifestExists(root)) continue;
+      if (await manifestExists(root) || MANAGED_NAME_PATTERN.test(entry.name)) continue;
       const handle = Object.freeze({ id: randomUUID() });
       this.#legacy.set(handle.id, { path: root, identity: await entryIdentity(root) });
       const candidates = byHistoricalName.get(entry.name) ?? [];
@@ -219,6 +246,45 @@ export class LocalWorkspaceManager implements WorkspaceManager {
         : candidates.length > 1
           ? Object.freeze({ kind: "ambiguous", handle })
           : Object.freeze({ kind: "unmatched", handle }));
+    }
+    return Object.freeze(results);
+  }
+
+  async classifyManaged(tasks: readonly Task[]): Promise<readonly ManagedWorkspaceMatch[]> {
+    await this.#prepareBase();
+    this.#managed.clear();
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    const entries = (await readdir(this.#basePath, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(QUARANTINE_PREFIX))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const results: ManagedWorkspaceMatch[] = [];
+    for (const entry of entries) {
+      const root = join(this.#basePath, entry.name);
+      if (!await manifestExists(root) && !MANAGED_NAME_PATTERN.test(entry.name)) continue;
+      const workspace = Object.freeze({ root, repositoryPath: join(root, "repository"), runtimePath: join(root, ".ensemble-runtime") });
+      const handle = Object.freeze({ id: randomUUID() });
+      const identity = await entryIdentity(root);
+      try {
+        await this.#assertContained(root, true);
+        await this.#assertRepositoryDirectories(workspace);
+        const manifest = await this.#readManifest(workspace);
+        const task = byId.get(manifest.taskId);
+        if (manifest.namespace !== this.#namespace || (task && !sameRepository(manifest.repository, task.repository))) {
+          this.#managed.set(handle.id, { workspace, identity });
+          results.push(Object.freeze({ kind: "invalid", handle }));
+          continue;
+        }
+        const [repositoryIdentity, runtimeIdentity] = await Promise.all([
+          entryIdentity(workspace.repositoryPath), entryIdentity(workspace.runtimePath),
+        ]);
+        const registration = Object.freeze({ manifest, root: identity, repository: repositoryIdentity, runtime: runtimeIdentity });
+        this.#managed.set(handle.id, { workspace, identity, registration });
+        results.push(task ? Object.freeze({ kind: "unique", handle, taskId: task.id })
+          : Object.freeze({ kind: "unmatched", handle }));
+      } catch {
+        this.#managed.set(handle.id, { workspace, identity });
+        results.push(Object.freeze({ kind: "invalid", handle }));
+      }
     }
     return Object.freeze(results);
   }
@@ -260,10 +326,60 @@ export class LocalWorkspaceManager implements WorkspaceManager {
     await this.#assertEntryIdentity(target, legacy.identity);
   }
 
-  async removeLegacy(handle: LegacyWorkspaceHandle): Promise<void> {
+  async removeLegacy(handle: LegacyWorkspaceHandle, options: WorkspaceRemovalOptions = {}): Promise<void> {
     await this.#prepareBase();
     const legacy = this.#takeLegacy(handle);
+    const workspace = Object.freeze({ root: legacy.path, repositoryPath: join(legacy.path, "repository"),
+      runtimePath: join(legacy.path, ".ensemble-runtime") });
+    if (options.beforeRemove) {
+      let hookSafe = true;
+      try {
+        await this.#assertEntryIdentity(legacy.path, legacy.identity);
+        await this.#assertRepositoryDirectories(workspace);
+      } catch { hookSafe = false; }
+      if (hookSafe) await options.beforeRemove(workspace).catch((error: unknown) => {
+        if (error instanceof ProcessTerminationUnconfirmedError) throw error;
+      });
+    }
+    await this.#assertEntryIdentity(legacy.path, legacy.identity);
     await this.#removeRoot(legacy.path, legacy.identity);
+  }
+
+  async quarantineManaged(handle: ManagedWorkspaceHandle): Promise<void> {
+    await this.#prepareBase();
+    const managed = this.#takeManaged(handle);
+    await this.#assertContained(managed.workspace.root, true);
+    await this.#assertEntryIdentity(managed.workspace.root, managed.identity);
+    const target = join(this.#basePath, `${QUARANTINE_PREFIX}${handle.id}`);
+    await this.#assertContained(target, false);
+    await rename(managed.workspace.root, target);
+    await this.#assertEntryIdentity(target, managed.identity);
+  }
+
+  async removeManaged(handle: ManagedWorkspaceHandle, options: WorkspaceRemovalOptions = {}): Promise<void> {
+    await this.#prepareBase();
+    const managed = this.#takeManaged(handle);
+    if (managed.registration) await this.#validateRegistration(managed.workspace, managed.registration);
+    else await this.#assertEntryIdentity(managed.workspace.root, managed.identity);
+    await options.beforeRemove?.(managed.workspace).catch((error: unknown) => {
+      if (error instanceof ProcessTerminationUnconfirmedError) throw error;
+    });
+    await this.#removeRoot(managed.workspace.root, managed.identity);
+    this.#registrations.delete(managed.workspace.root);
+  }
+
+  async removeTask(task: Task, options: WorkspaceRemovalOptions = {}): Promise<void> {
+    await this.#prepareBase();
+    const workspace = this.#workspace(task.id);
+    let expected: WorkspaceRegistration;
+    try { expected = await this.#validateWorkspace(workspace, task); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    await options.beforeRemove?.(workspace).catch((error: unknown) => {
+      if (error instanceof ProcessTerminationUnconfirmedError) throw error;
+    });
+    await this.#validateRegistration(workspace, expected);
+    await this.#removeRoot(workspace.root, expected.root);
+    this.#registrations.delete(workspace.root);
   }
 
   async #prepareBase(): Promise<void> {
@@ -399,6 +515,17 @@ export class LocalWorkspaceManager implements WorkspaceManager {
     const entry = this.#legacy.get(handle.id);
     if (!entry) throw new Error("Legacy workspace handle is invalid or already used");
     this.#legacy.delete(handle.id);
+    return entry;
+  }
+
+  #takeManaged(handle: ManagedWorkspaceHandle): {
+    readonly workspace: Workspace;
+    readonly identity: EntryIdentity;
+    readonly registration?: WorkspaceRegistration;
+  } {
+    const entry = this.#managed.get(handle.id);
+    if (!entry) throw new Error("Managed workspace handle is invalid or already used");
+    this.#managed.delete(handle.id);
     return entry;
   }
 

@@ -228,6 +228,21 @@ test("Vikunja inventory is bounded, concurrency-limited, and fail-closed", async
   await discovery;
 });
 
+test("Vikunja workspace inventory includes completed and archived tasks authoritatively", async () => {
+  const api = new FakeVikunjaApi([
+    task(1, "Current", [1], 1),
+    { ...task(2, "Completed", [5], 1), done: true },
+    { ...task(3, "Archived", [1], 1), project_id: 4 },
+  ]);
+  api.projects.set(4, { id: 4, title: "Archived", is_archived: true });
+  const result = await providerFor(api, "unused").inventoryTasks();
+  assert.equal(result.completeness, "complete");
+  assert.deepEqual(result.entries.map((entry) => [entry.task.id, entry.lifecycle]), [
+    ["1", "current"], ["2", "terminal"], ["3", "terminal"],
+  ]);
+  await assert.rejects(providerFor(api, "unused", { inventoryMaxTasks: 2 }).inventoryTasks(), VikunjaPaginationLimitError);
+});
+
 test("Vikunja execution journal claims once and synchronizes idempotently", async () => {
   const api = new FakeVikunjaApi([task(1, "Work", [1], 1)]);
   const provider = providerFor(api, "execution-1");

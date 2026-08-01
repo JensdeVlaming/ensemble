@@ -8,7 +8,7 @@ import type {
 } from "./repository.ts";
 import { validatePortableToolResult, validateRuntimeTools } from "../runtimes/runtime.ts";
 import type { Runtime, RuntimeEvent, RuntimeRegistry, RuntimeSession } from "../runtimes/runtime.ts";
-import type { WorkspaceManager } from "./workspace.ts";
+import type { LegacyWorkspaceHandle, LegacyWorkspaceMatch, ManagedWorkspaceHandle, ManagedWorkspaceMatch, WorkspaceManager } from "./workspace.ts";
 import { LocalWorkspaceHookRunner } from "./hooks.ts";
 import type { WorkspaceHookRunner } from "./hooks.ts";
 import { ProcessTerminationUnconfirmedError } from "./process.ts";
@@ -93,6 +93,18 @@ export interface ConfiguredExecution {
 export interface TaskExecutionService {
   reloadConfiguration(): Promise<ConfigurationReloadResult>;
   withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T>;
+  inspectWorkspaces?(tasks: readonly Task[]): Promise<ExecutionWorkspaceInventory>;
+  migrateLegacyWorkspace?(match: Extract<LegacyWorkspaceMatch, { kind: "unique" }>, task: Task): Promise<void>;
+  quarantineLegacyWorkspace?(handle: LegacyWorkspaceHandle): Promise<void>;
+  removeLegacyWorkspace?(handle: LegacyWorkspaceHandle, task?: Task): Promise<void>;
+  quarantineManagedWorkspace?(handle: ManagedWorkspaceHandle): Promise<void>;
+  removeManagedWorkspace?(handle: ManagedWorkspaceHandle, task?: Task): Promise<void>;
+  removeTerminalWorkspace?(task: Task): Promise<void>;
+}
+
+export interface ExecutionWorkspaceInventory {
+  readonly legacy: readonly LegacyWorkspaceMatch[];
+  readonly managed: readonly ManagedWorkspaceMatch[];
 }
 
 export type EventSink = (event: RuntimeEvent, task: Task) => void | Promise<void>;
@@ -122,6 +134,7 @@ export class ExecutionEngine implements TaskExecutionService {
   readonly now: () => string;
   readonly operationalEvents?: OperationalEventReporter;
   readonly hooks: WorkspaceHookRunner;
+  readonly #attemptCleanup = new Map<string, Promise<void>>();
 
   constructor(
     runtimes: RuntimeRegistry,
@@ -148,6 +161,47 @@ export class ExecutionEngine implements TaskExecutionService {
       return Promise.reject(new ConfigurationReloadError("Execution configuration source does not support reload"));
     }
     return this.configurations.reload((configuration) => this.#validateConfiguration(configuration));
+  }
+
+  async inspectWorkspaces(tasks: readonly Task[]): Promise<ExecutionWorkspaceInventory> {
+    const [legacy, managed] = await Promise.all([
+      this.workspaces.classifyLegacy?.(tasks) ?? Promise.resolve(Object.freeze([])),
+      this.workspaces.classifyManaged?.(tasks) ?? Promise.resolve(Object.freeze([])),
+    ]);
+    return Object.freeze({ legacy: Object.freeze([...legacy]), managed: Object.freeze([...managed]) });
+  }
+
+  async migrateLegacyWorkspace(match: Extract<LegacyWorkspaceMatch, { kind: "unique" }>, task: Task): Promise<void> {
+    if (!this.workspaces.migrateLegacy) throw new Error("Workspace manager does not support legacy migration");
+    await this.workspaces.migrateLegacy(match, task);
+  }
+
+  async quarantineLegacyWorkspace(handle: LegacyWorkspaceHandle): Promise<void> {
+    if (!this.workspaces.quarantineLegacy) throw new Error("Workspace manager does not support legacy quarantine");
+    await this.workspaces.quarantineLegacy(handle);
+  }
+
+  async removeLegacyWorkspace(handle: LegacyWorkspaceHandle, task?: Task): Promise<void> {
+    if (!this.workspaces.removeLegacy) throw new Error("Workspace manager does not support legacy removal");
+    if (task) await this.#attemptCleanup.get(task.id);
+    await this.workspaces.removeLegacy(handle, task ? await this.#terminalRemovalOptions(task) : undefined);
+  }
+
+  async quarantineManagedWorkspace(handle: ManagedWorkspaceHandle): Promise<void> {
+    if (!this.workspaces.quarantineManaged) throw new Error("Workspace manager does not support managed quarantine");
+    await this.workspaces.quarantineManaged(handle);
+  }
+
+  async removeManagedWorkspace(handle: ManagedWorkspaceHandle, task?: Task): Promise<void> {
+    if (!this.workspaces.removeManaged) throw new Error("Workspace manager does not support managed removal");
+    if (task) await this.#attemptCleanup.get(task.id);
+    await this.workspaces.removeManaged(handle, task ? await this.#terminalRemovalOptions(task) : undefined);
+  }
+
+  async removeTerminalWorkspace(task: Task): Promise<void> {
+    if (!this.workspaces.removeTask) return;
+    await this.#attemptCleanup.get(task.id);
+    await this.workspaces.removeTask(task, await this.#terminalRemovalOptions(task));
   }
 
   async withConfiguration<T>(task: Task, work: (execution: ConfiguredExecution) => Promise<T>): Promise<T> {
@@ -268,9 +322,9 @@ export class ExecutionEngine implements TaskExecutionService {
         startedAt,
         now: this.now,
         operationalEvents: this.operationalEvents,
-        cleanup: () => configuration.workspace?.hooks?.afterRun
+        cleanup: () => this.#trackAttemptCleanup(request.task.id, () => configuration.workspace?.hooks?.afterRun
           ? finishAttempt().catch(continueAfterSafeHookFailure).then(() => this.#cleanup(request.task, workspace, configuration))
-          : this.#cleanup(request.task, workspace, configuration),
+          : this.#cleanup(request.task, workspace, configuration)),
       });
     } catch (error) {
       this.#emit(request.task, { ...contextEvent(request, "runtime.failed", "error"), data: { errorCategory: "runtime" } });
@@ -294,6 +348,21 @@ export class ExecutionEngine implements TaskExecutionService {
       this.#emit(task, { level: "warn", event: "workspace.cleanup_failed", data: { errorCategory: "cleanup" } });
       throw error;
     }
+  }
+
+  async #terminalRemovalOptions(task: Task) {
+    const configuration = await this.configurations.resolve(task);
+    return { beforeRemove: (workspace: Workspace) => this.#runHook(task, workspace, configuration, "beforeRemove") };
+  }
+
+  #trackAttemptCleanup(taskId: string, cleanup: () => Promise<void>): Promise<void> {
+    const existing = this.#attemptCleanup.get(taskId);
+    if (existing) return existing;
+    const attempt = cleanup().finally(() => {
+      if (this.#attemptCleanup.get(taskId) === attempt) this.#attemptCleanup.delete(taskId);
+    });
+    this.#attemptCleanup.set(taskId, attempt);
+    return attempt;
   }
 
   async #runHook(
@@ -772,6 +841,19 @@ export class EngineExecutionService implements TaskExecutionService {
   withEnvironment<T>(task: Task, work: (environment: ExecutionEnvironment) => Promise<T>): Promise<T> {
     return this.engine.withEnvironment(task, work);
   }
+  inspectWorkspaces(tasks: readonly Task[]): Promise<ExecutionWorkspaceInventory> { return this.engine.inspectWorkspaces(tasks); }
+  migrateLegacyWorkspace(match: Extract<LegacyWorkspaceMatch, { kind: "unique" }>, task: Task): Promise<void> {
+    return this.engine.migrateLegacyWorkspace(match, task);
+  }
+  quarantineLegacyWorkspace(handle: LegacyWorkspaceHandle): Promise<void> { return this.engine.quarantineLegacyWorkspace(handle); }
+  removeLegacyWorkspace(handle: LegacyWorkspaceHandle, task?: Task): Promise<void> {
+    return this.engine.removeLegacyWorkspace(handle, task);
+  }
+  quarantineManagedWorkspace(handle: ManagedWorkspaceHandle): Promise<void> { return this.engine.quarantineManagedWorkspace(handle); }
+  removeManagedWorkspace(handle: ManagedWorkspaceHandle, task?: Task): Promise<void> {
+    return this.engine.removeManagedWorkspace(handle, task);
+  }
+  removeTerminalWorkspace(task: Task): Promise<void> { return this.engine.removeTerminalWorkspace(task); }
 }
 
 function isReloadableConfigurationResolver(value: ConfigurationResolver): value is ReloadableConfigurationResolver {

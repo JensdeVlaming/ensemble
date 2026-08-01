@@ -9,6 +9,7 @@ import type {
   ExecutionCancellation,
   ProviderAdapter,
   ProviderExecutionState,
+  ProviderTaskInventory,
   TaskQuery,
   TaskRefreshResult,
 } from "../provider.ts";
@@ -42,6 +43,14 @@ export class InMemoryProvider implements ProviderAdapter {
   async discoverTasks(query: TaskQuery): Promise<readonly Task[]> {
     if (query.scope !== "workflow_candidates") throw new Error(`Unsupported task query scope: ${String(query.scope)}`);
     return [...this.#tasks.values()].filter(this.#isWorkflowCandidate);
+  }
+
+  async inventoryTasks(): Promise<ProviderTaskInventory> {
+    return Object.freeze({
+      completeness: "complete",
+      entries: Object.freeze([...this.#tasks.values()].sort((left, right) => left.id.localeCompare(right.id)).map((task) =>
+        Object.freeze({ task: Object.freeze({ ...task }), lifecycle: task.status === "completed" ? "terminal" as const : "current" as const }))),
+    });
   }
 
   async refreshTasks(ids: readonly TaskId[]): Promise<ReadonlyMap<TaskId, TaskRefreshResult>> {

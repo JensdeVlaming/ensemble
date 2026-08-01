@@ -7,6 +7,18 @@ export interface TaskQuery {
   readonly scope: "workflow_candidates";
 }
 
+export interface ProviderTaskInventoryEntry {
+  readonly task: Task;
+  /** Provider-normalized authoritative lifecycle, including native archive state. */
+  readonly lifecycle: "current" | "terminal";
+}
+
+export interface ProviderTaskInventory {
+  /** Partial inventories must never authorize deletion of absent task IDs. */
+  readonly completeness: "complete" | "partial";
+  readonly entries: readonly ProviderTaskInventoryEntry[];
+}
+
 export interface ExecutionRecord {
   readonly id: string;
   readonly role: string;
@@ -100,6 +112,7 @@ export class ProviderClaimConflict extends Error {
 
 export interface ProviderAdapter {
   readonly name: string;
+  inventoryTasks(): Promise<ProviderTaskInventory>;
   discoverTasks(query: TaskQuery): Promise<readonly Task[]>;
   refreshTasks(ids: readonly TaskId[]): Promise<ReadonlyMap<TaskId, TaskRefreshResult>>;
   getTask(id: TaskId): Promise<Task>;

@@ -306,3 +306,38 @@
   primary-result precedence across all terminal paths.
 - Next boundary: commit milestone 5, then begin Scheduler-owned terminal and
   startup cleanup milestone 6.
+
+## 2026-08-01 — milestone 6 delivery revision 1
+
+- Committed milestone 5 as `3cfd773` (`feat(workspace): add refresh and
+  lifecycle hooks`).
+- Added complete/partial portable provider inventory, Vikunja terminal/archive
+  inventory, opaque legacy/managed workspace classification, Scheduler-owned
+  startup/tick decisions, forced terminal cleanup, and restart-safe quarantine.
+- Added active-execution retention and attempt-cleanup ordering so terminal
+  deletion cannot overlap a live runtime or `afterRun`.
+- Verification passed: 201 tests and typecheck.
+- Next boundary: build/diff verification and independent milestone 6 judge.
+
+## 2026-08-01 — milestone 6 delivery revision 2
+
+- Independent judge required exact retention for unmatched workspaces under a
+  partial inventory and containment validation before legacy hooks.
+- Partial inventory now leaves unmatched legacy and managed workspaces wholly
+  untouched; only independently ambiguous or invalid entries are quarantined.
+- Legacy removal validates the repository/runtime shape immediately before a
+  repository-scoped hook and skips the hook when that shape is unsafe while
+  retaining identity-pinned root deletion.
+- Added a symlink escape regression test.
+- Next boundary: full verification and final milestone 6 re-review.
+
+## 2026-08-01 — milestone 6 delivery gate passed
+
+- Independent judge verdict: `pass`, no blocking issues, confidence `0.99`.
+- Judge confirmed exact partial-inventory retention, independent quarantine of
+  ambiguous/invalid workspaces, legacy hook containment, and the symlink escape
+  regression.
+- Final verification passed: 202 tests, typecheck, production build, and diff
+  integrity.
+- Work stops after the milestone 6 commit by operator request. Milestones 7 and
+  8 are documented in `handoff-after-milestone-6.md`.
