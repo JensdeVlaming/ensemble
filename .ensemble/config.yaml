@@ -5,7 +5,8 @@ runtime:
 initialRole: planner
 terminalOutcomes: [approved, completed]
 statuses:
-  runnable: [todo, in_progress]
-  running: in_progress
-  completed: done
+  runnable: [ready, running]
+  running: running
+  completed: completed
   failed: failed
+  blocked: blocked
