@@ -112,6 +112,19 @@ test("local workspace creation removes partial materialization failures", async 
   await assert.rejects(stat(join(base, "partial-1")), { code: "ENOENT" });
 });
 
+test("local workspace cleanup rejects paths outside its absolute root", async () => {
+  const base = await mkdtemp(join(tmpdir(), "ensemble-workspace-root-"));
+  const outside = await mkdtemp(join(tmpdir(), "ensemble-workspace-outside-"));
+  const manager = new LocalWorkspaceManager(base, { materialize: async () => undefined }, false);
+  await assert.rejects(manager.cleanup({
+    root: outside,
+    repositoryPath: join(outside, "repository"),
+    runtimePath: join(outside, ".ensemble-runtime"),
+  }), /direct child/u);
+  assert.equal((await stat(outside)).isDirectory(), true);
+  assert.throws(() => new LocalWorkspaceManager("relative", { materialize: async () => undefined }), /absolute/u);
+});
+
 test("git repository materialization selects the configured branch", async () => {
   const source = await mkdtemp(join(tmpdir(), "ensemble-git-source-"));
   await execute("git", ["init", "--quiet", "--initial-branch=main", source]);

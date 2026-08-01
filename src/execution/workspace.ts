@@ -1,6 +1,6 @@
-import { mkdir, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { RepositoryRef, Task, Workspace } from "../domain/model.ts";
 
 export interface RepositoryDriver {
@@ -39,41 +39,48 @@ export class LocalWorkspaceManager implements WorkspaceManager {
     repositories: RepositoryDriver,
     preserve = true,
   ) {
-    this.#basePath = basePath;
+    if (!isAbsolute(basePath)) throw new Error(`Workspace root must be absolute: ${basePath}`);
+    this.#basePath = resolve(basePath);
     this.#repositories = repositories;
     this.#preserve = preserve;
   }
 
   async create(task: Task): Promise<Workspace> {
-    const root = join(this.#basePath, safeSegment(task.id));
-    const workspace = {
+    const root = this.#taskRoot(task.id);
+    const workspace = Object.freeze({
       root,
       repositoryPath: join(root, "repository"),
       runtimePath: join(root, ".ensemble-runtime"),
-    };
+    });
+    let ownsRoot = false;
     try {
-      await mkdir(workspace.runtimePath, { recursive: true });
+      await mkdir(root, { mode: 0o700 });
+      ownsRoot = true;
+      await mkdir(workspace.runtimePath, { mode: 0o700 });
       await this.#repositories.materialize(task.repository, workspace.repositoryPath);
       return workspace;
     } catch (error) {
-      await rm(root, { recursive: true, force: true });
+      if (ownsRoot) await rm(root, { recursive: true, force: true });
       throw error;
     }
   }
 
   async restore(task: Task): Promise<Workspace | undefined> {
-    const root = join(this.#basePath, safeSegment(task.id));
-    const workspace = {
+    const root = this.#taskRoot(task.id);
+    const workspace = Object.freeze({
       root,
       repositoryPath: join(root, "repository"),
       runtimePath: join(root, ".ensemble-runtime"),
-    };
+    });
     try {
-      const [repository, runtime] = await Promise.all([
-        stat(workspace.repositoryPath),
-        stat(workspace.runtimePath),
+      const [workspaceRoot, repository, runtime] = await Promise.all([
+        lstat(workspace.root),
+        lstat(workspace.repositoryPath),
+        lstat(workspace.runtimePath),
       ]);
-      return repository.isDirectory() && runtime.isDirectory() ? workspace : undefined;
+      return workspaceRoot.isDirectory() && !workspaceRoot.isSymbolicLink()
+        && repository.isDirectory() && !repository.isSymbolicLink()
+        && runtime.isDirectory() && !runtime.isSymbolicLink() ? workspace : undefined;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
@@ -81,7 +88,23 @@ export class LocalWorkspaceManager implements WorkspaceManager {
   }
 
   async cleanup(workspace: Workspace): Promise<void> {
-    if (!this.#preserve) await rm(workspace.root, { recursive: true, force: true });
+    if (this.#preserve) return;
+    const root = resolve(workspace.root);
+    this.#assertDirectChild(root);
+    await rm(root, { recursive: true, force: true });
+  }
+
+  #taskRoot(taskId: string): string {
+    const root = resolve(this.#basePath, safeSegment(taskId));
+    this.#assertDirectChild(root);
+    return root;
+  }
+
+  #assertDirectChild(path: string): void {
+    const child = relative(this.#basePath, path);
+    if (!child || child.startsWith(`..${sep}`) || child === ".." || isAbsolute(child) || child.includes(sep)) {
+      throw new Error(`Workspace path must be a direct child of the configured root: ${path}`);
+    }
   }
 }
 
