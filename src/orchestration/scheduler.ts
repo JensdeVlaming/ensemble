@@ -1213,8 +1213,20 @@ export class Scheduler {
       ));
       if (!renewed.ownerId || !renewed.leaseExpiresAt) throw new Error("Provider returned an invalid renewed lease");
       lease.active = { ...renewed, ownerId: renewed.ownerId, leaseExpiresAt: renewed.leaseExpiresAt };
+      this.#emit({ level: "debug", event: "lease.renewed", taskId: lease.reservation.taskId,
+        ...(lease.reservation.role ? { role: lease.reservation.role } : {}),
+        ...(lease.reservation.executionId ? { executionId: lease.reservation.executionId } : {}),
+        data: { leaseExpiresAt: renewed.leaseExpiresAt } });
     } catch (error) {
-      if (error instanceof ProviderClaimConflict || this.#nowEpoch() >= Date.parse(lease.active.leaseExpiresAt)) {
+      const now = this.#nowEpoch();
+      const expiresAt = Date.parse(lease.active.leaseExpiresAt);
+      const lost = error instanceof ProviderClaimConflict || now >= expiresAt;
+      this.#emit({ level: "warn", event: "lease.renewal_failed", taskId: lease.reservation.taskId,
+        ...(lease.reservation.role ? { role: lease.reservation.role } : {}),
+        ...(lease.reservation.executionId ? { executionId: lease.reservation.executionId } : {}),
+        data: { errorCategory: error instanceof ProviderClaimConflict ? "claim_conflict" : "provider",
+          remainingMs: Number.isFinite(expiresAt) ? Math.max(0, expiresAt - now) : 0, willRetry: !lost } });
+      if (lost) {
         this.#loseLease(lease, error);
       }
     }

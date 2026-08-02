@@ -11,6 +11,7 @@ import type {
   ActiveExecution,
   ConfiguredExecution,
   ExecutionEnvironment,
+  OperationalEvent,
   ProviderAdapter,
   RepositoryConfiguration,
   RunningExecution,
@@ -138,6 +139,7 @@ test("a renewal ownership conflict cancels the running execution and suppresses 
   const delegate = new InMemoryProvider([task("loss")]);
   const timers = new ManualTimers();
   const executions = new PendingExecutions();
+  const operationalEvents: OperationalEvent[] = [];
   const provider = new Proxy(delegate, {
     get(target, property, receiver) {
       if (property === "renewExecutionLease") return async (_id: string, _executionId: string, claim: Parameters<ProviderAdapter["renewExecutionLease"]>[2]) => {
@@ -153,6 +155,7 @@ test("a renewal ownership conflict cancels the running execution and suppresses 
   const scheduler = new Scheduler(provider, executions, {
     now: () => new Date("2026-01-01T00:00:00.000Z"),
     lease: { ownerId: "loser", durationMs: 60_000, renewIntervalMs: 20_000 }, timers,
+    events: { emit: (event) => { operationalEvents.push(event); } },
   });
   const poll = scheduler.poll();
   await waitFor(() => executions.starts === 1);
@@ -164,6 +167,9 @@ test("a renewal ownership conflict cancels the running execution and suppresses 
   assert.equal(state.history.length, 0);
   assert.ok(state.active);
   assert.equal(timers.callbacks.length, 0);
+  const failed = operationalEvents.find((event) => event.event === "lease.renewal_failed");
+  assert.deepEqual(failed?.data, { errorCategory: "claim_conflict", remainingMs: 60_000, willRetry: false });
+  assert.equal(operationalEvents.filter((event) => event.event === "lease.lost").length, 1);
 });
 
 test("expired and legacy ineligible work is acquired and owner-guard cancelled without starting a runtime", async () => {
@@ -194,6 +200,7 @@ test("renewal is non-overlapping and retries a transient failure while the durab
   const executions = new PendingExecutions();
   let now = new Date("2026-01-01T00:00:00.000Z");
   let calls = 0;
+  const operationalEvents: OperationalEvent[] = [];
   let rejectFirst!: (error: unknown) => void;
   const first = new Promise<ActiveExecution>((_resolve, reject) => { rejectFirst = reject; });
   const provider = new Proxy(delegate, {
@@ -209,6 +216,7 @@ test("renewal is non-overlapping and retries a transient failure while the durab
   }) as ProviderAdapter;
   const scheduler = new Scheduler(provider, executions, {
     now: () => now, lease: { ownerId: "worker", durationMs: 60_000, renewIntervalMs: 20_000 }, timers,
+    events: { emit: (event) => { operationalEvents.push(event); } },
   });
   const poll = scheduler.poll();
   await waitFor(() => executions.starts === 1);
@@ -217,14 +225,54 @@ test("renewal is non-overlapping and retries a transient failure while the durab
   await waitFor(() => calls === 1);
   timers.fire();
   assert.equal(calls, 1);
-  rejectFirst(new Error("temporary provider outage"));
+  rejectFirst(new Error("temporary provider outage with private response"));
   await waitFor(() => timers.callbacks.length === 1);
   now = new Date("2026-01-01T00:00:40.000Z");
   timers.fire();
   await waitFor(() => calls === 2);
   assert.equal((await delegate.getExecutionState("transient")).active?.leaseExpiresAt, "2026-01-01T00:01:40.000Z");
+  assert.deepEqual(operationalEvents.find((event) => event.event === "lease.renewal_failed")?.data,
+    { errorCategory: "provider", remainingMs: 40_000, willRetry: true });
+  assert.equal(operationalEvents.filter((event) => event.event === "lease.renewed").length, 1);
+  assert.doesNotMatch(JSON.stringify(operationalEvents), /private response/u);
   await scheduler.shutdown({ drainTimeoutMs: 0, cancellationTimeoutMs: 10 });
   await poll;
+});
+
+test("repeated renewal failures report retries and lose the lease exactly once at expiry", async () => {
+  const delegate = new InMemoryProvider([task("expiry")]);
+  const timers = new ManualTimers();
+  const executions = new PendingExecutions();
+  const operationalEvents: OperationalEvent[] = [];
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  const provider = new Proxy(delegate, {
+    get(target, property, receiver) {
+      if (property === "renewExecutionLease") return async () => { throw new Error("private provider body"); };
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as ProviderAdapter;
+  const scheduler = new Scheduler(provider, executions, {
+    now: () => now, lease: { ownerId: "worker", durationMs: 60_000, renewIntervalMs: 20_000 }, timers,
+    events: { emit: (event) => { operationalEvents.push(event); } },
+  });
+  const poll = scheduler.poll();
+  await waitFor(() => executions.starts === 1);
+  const renewalTimes = ["2026-01-01T00:00:20.000Z", "2026-01-01T00:00:40.000Z", "2026-01-01T00:01:00.000Z"];
+  for (const [index, timestamp] of renewalTimes.entries()) {
+    now = new Date(timestamp);
+    timers.fire();
+    await waitFor(() => operationalEvents.filter((event) => event.event === "lease.renewal_failed").length === index + 1);
+  }
+  await poll;
+  assert.deepEqual(operationalEvents.filter((event) => event.event === "lease.renewal_failed").map((event) => event.data), [
+    { errorCategory: "provider", remainingMs: 40_000, willRetry: true },
+    { errorCategory: "provider", remainingMs: 20_000, willRetry: true },
+    { errorCategory: "provider", remainingMs: 0, willRetry: false },
+  ]);
+  assert.equal(operationalEvents.filter((event) => event.event === "lease.lost").length, 1);
+  assert.deepEqual(executions.cancellations, ["lease_lost"]);
+  assert.doesNotMatch(JSON.stringify(operationalEvents), /private provider body/u);
 });
 
 test("default schedulers share the one process execution owner", async () => {

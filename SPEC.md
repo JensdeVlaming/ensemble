@@ -395,6 +395,11 @@ interface BlockingRequest {
 }
 ```
 
+Provider adapters MUST return execution timestamps as canonical UTC ISO strings
+equivalent to `Date.prototype.toISOString()`. Provider timestamps with lower
+precision are normalized at the adapter boundary before they become execution
+identity or lease-basis fields.
+
 Returned state MUST be validated, immutable to consumers, and ordered by
 `finishedAt`, using execution ID as the deterministic tie-breaker.
 

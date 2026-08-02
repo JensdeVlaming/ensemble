@@ -668,7 +668,8 @@ function parseEvents(comments: readonly VikunjaComment[]): readonly ParsedEvent[
     try { value = JSON.parse(body.slice(STATE_PREFIX.length, -STATE_SUFFIX.length)); }
     catch { throw new Error(`Malformed Ensemble provider state comment ${String(comment.id)}`); }
     const event = validateEvent(value);
-    return [{ event, commentId: requiredNumber(comment.id, "comment id"), createdAt: requiredDate(comment.created, "comment created") }];
+    return [{ event, commentId: requiredNumber(comment.id, "comment id"),
+      createdAt: canonicalProviderTimestamp(comment.created, "comment created") }];
   }).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.commentId - right.commentId);
 }
 
@@ -807,6 +808,13 @@ function requiredDate(value: unknown, name: string): string {
   const date = requiredString(value, name);
   if (Number.isNaN(Date.parse(date))) throw new Error(`Invalid Vikunja ${name}`);
   return date;
+}
+
+function canonicalProviderTimestamp(value: unknown, name: string): string {
+  const date = requiredString(value, name);
+  const epoch = Date.parse(date);
+  if (!Number.isFinite(epoch)) throw new Error(`Invalid Vikunja ${name}`);
+  return new Date(epoch).toISOString();
 }
 
 function requiredCanonicalTimestamp(value: unknown, name: string): string {

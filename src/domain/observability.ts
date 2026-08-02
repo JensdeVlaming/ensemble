@@ -15,7 +15,7 @@ export const OPERATIONAL_EVENT_NAMES = Object.freeze([
   "candidate.discovered", "candidate.skipped", "candidate.capacity_rejected", "candidate.eligible",
   "claim.started", "claim.succeeded", "claim.conflict", "claim.failed",
   "dispatch.started", "dispatch.runtime_started", "dispatch.completed", "dispatch.failed",
-  "retry.deferred", "retry.suppressed", "retry.scheduled", "lease.lost",
+  "retry.deferred", "retry.suppressed", "retry.scheduled", "lease.renewed", "lease.renewal_failed", "lease.lost",
   "synchronization.started", "synchronization.completed", "synchronization.quarantined",
   "synchronization.retry_started", "synchronization.retry_completed", "synchronization.conflict",
   "synchronization.failed", "scheduler.shutdown_started", "scheduler.shutdown_draining",

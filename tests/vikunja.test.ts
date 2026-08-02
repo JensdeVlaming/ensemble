@@ -512,6 +512,56 @@ test("Vikunja reconstructs retry, cancellation, blocking, and renewed lease stat
   assert.equal((await restored.getExecutionState("4")).active?.leaseExpiresAt, "2026-07-31T10:02:00.000Z");
 });
 
+test("Vikunja canonicalizes provider comment timestamps across renewal, restart, and takeover", async () => {
+  const api = new FakeVikunjaApi([
+    task(1, "Whole-second lease", [1], 1),
+    task(2, "Expired takeover", [1], 1),
+    task(3, "Millisecond lease", [1], 1),
+    task(4, "Invalid timestamp", [1], 1),
+  ]);
+  api.commentCreatedAt = () => "2026-08-02T10:43:35Z";
+  const provider = providerFor(api, "whole-second");
+  const active = await provider.beginExecution("1", "implementation", "running", {
+    ownerId: "worker-1", observedAt: "2026-08-02T10:43:34.000Z",
+    expiresAt: "2026-08-02T10:44:34.000Z", expected: { kind: "none" },
+  });
+  assert.equal(active.startedAt, "2026-08-02T10:43:35.000Z");
+  const renewed = await provider.renewExecutionLease("1", active.id, {
+    ownerId: "worker-1", observedAt: "2026-08-02T10:43:55.000Z",
+    expiresAt: "2026-08-02T10:44:55.000Z", expected: leaseClaim(active, "worker-1").expected,
+  });
+  assert.equal(rawEvents(api, 1, "lease").length, 1);
+  assert.equal(renewed.leaseExpiresAt, "2026-08-02T10:44:55.000Z");
+
+  const restored = providerFor(api, "unused-after-restart");
+  const restoredActive = (await restored.getExecutionState("1")).active!;
+  assert.equal(restoredActive.startedAt, "2026-08-02T10:43:35.000Z");
+  const renewedAgain = await restored.renewExecutionLease("1", restoredActive.id, {
+    ownerId: "worker-1", observedAt: "2026-08-02T10:44:15.000Z",
+    expiresAt: "2026-08-02T10:45:15.000Z", expected: leaseClaim(restoredActive, "worker-1").expected,
+  });
+  assert.equal(renewedAgain.leaseExpiresAt, "2026-08-02T10:45:15.000Z");
+  assert.equal(rawEvents(api, 1, "lease").length, 2);
+
+  const expired = await provider.beginExecution("2", "implementation", "running", {
+    ownerId: "expired-owner", observedAt: "2026-08-02T10:40:00.000Z",
+    expiresAt: "2026-08-02T10:41:00.000Z", expected: { kind: "none" },
+  });
+  const taken = await restored.beginExecution("2", "ignored", "running", {
+    ownerId: "new-owner", observedAt: "2026-08-02T10:41:00.000Z",
+    expiresAt: "2026-08-02T10:42:00.000Z", expected: leaseClaim(expired, "new-owner").expected,
+  });
+  assert.deepEqual({ id: taken.id, role: taken.role, startedAt: taken.startedAt },
+    { id: expired.id, role: expired.role, startedAt: "2026-08-02T10:43:35.000Z" });
+
+  api.commentCreatedAt = () => "2026-08-02T10:43:35.123Z";
+  const millisecond = await provider.beginExecution("3", "implementation", "running", leaseClaim(undefined, "worker-3"));
+  assert.equal(millisecond.startedAt, "2026-08-02T10:43:35.123Z");
+
+  api.comments.set(4, [{ ...stateComment(999, activeClaimEvent("invalid", "worker-4")), created: "not-a-date" }]);
+  await assert.rejects(provider.getExecutionState("4"), /Invalid Vikunja comment created/u);
+});
+
 test("Vikunja append-only claims deterministically reject a competing claimant", async () => {
   const api = new FakeVikunjaApi([task(1, "Race", [1], 1)]);
   const left = providerFor(api, "claim-left");
@@ -693,6 +743,7 @@ class FakeVikunjaApi {
   maxConcurrentCommentReads = 0;
   failNextLabelUpdates = 0;
   commentWriteCount = 0;
+  commentCreatedAt = (id: number): string => new Date(Date.UTC(2026, 6, 31, 10, 0, id)).toISOString();
   #concurrentCommentReads = 0;
   #commentId = 0;
 
@@ -777,7 +828,7 @@ class FakeVikunjaApi {
         const comment = {
           id: this.#commentId,
           comment: body.comment,
-          created: new Date(Date.UTC(2026, 6, 31, 10, 0, this.#commentId)).toISOString(),
+          created: this.commentCreatedAt(this.#commentId),
           author: { id: 7, username: "ensemble-bot" },
         };
         comments.push(comment);
