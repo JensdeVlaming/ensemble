@@ -52,6 +52,13 @@ class FakeServer implements CodexAppServerProcess {
     if (request.method === "thread/start") this.send({ id, result: { thread: { id: "thread-1" } } });
     if (request.method === "turn/start") {
       const turnId = `turn-${++this.#turn}`;
+      this.send({ method: "thread/started", params: { thread: { id: "thread-1" } } });
+      this.send({ method: "thread/status/changed", params: {
+        threadId: "thread-1", status: { type: "active", activeFlags: [] },
+      } });
+      this.send({ method: "mcpServer/startupStatus/updated", params: {
+        name: "openaiDeveloperDocs", status: "ready",
+      } });
       this.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: turnId, status: "inProgress" } } });
       this.send({ id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
       this.options.onTurn?.(this, request, turnId);
@@ -138,6 +145,18 @@ test("Codex App Server initializes, correlates fragmented thread/turn messages, 
   const methods = launcher.servers[0]!.writes.map((value) => value.method);
   assert.deepEqual(methods.slice(0, 4), ["initialize", "initialized", "thread/start", "turn/start"]);
   assert.equal(methods.filter((method) => method === "turn/start").length, 2);
+  const threadStart = launcher.servers[0]!.writes.find((value) => value.method === "thread/start");
+  assert.equal((threadStart?.params as { sandbox?: unknown }).sandbox, "workspace-write");
+  assert.equal((threadStart?.params as { approvalPolicy?: unknown }).approvalPolicy, "untrusted");
+  const turnStart = launcher.servers[0]!.writes.find((value) => value.method === "turn/start");
+  assert.deepEqual((turnStart?.params as { sandboxPolicy?: unknown }).sandboxPolicy, {
+    type: "workspaceWrite", writableRoots: ["/workspace"], networkAccess: false,
+  });
+  const outputSchema = (turnStart?.params as { outputSchema?: Record<string, unknown> }).outputSchema;
+  assert.deepEqual((outputSchema?.properties as Record<string, { type?: unknown }>).nextRole?.type, ["string", "null"]);
+  const artifactItems = ((outputSchema?.properties as Record<string, { items?: Record<string, unknown> }>).artifacts?.items);
+  assert.equal(artifactItems?.additionalProperties, false);
+  assert.deepEqual(artifactItems?.required, ["type", "url", "name"]);
 });
 
 test("Codex App Server invokes only captured dynamic tools and returns bounded portable output", async () => {
@@ -160,6 +179,32 @@ test("Codex App Server invokes only captured dynamic tools and returns bounded p
   assert.match(JSON.stringify(response), /include/u);
   const threadStart = launcher.servers[0]!.writes.find((value) => value.method === "thread/start");
   assert.equal(((threadStart?.params as { dynamicTools?: Array<{ type?: unknown }> }).dynamicTools?.[0]?.type), "function");
+});
+
+test("Codex App Server keeps a turn alive while Codex retries a reported error", async () => {
+  const launcher = new Launcher({ onTurn: (server, _request, turnId) => {
+    server.send({ method: "error", params: { threadId: "thread-1", turnId, willRetry: true,
+      error: { message: "transient detail", codexErrorInfo: "serverOverloaded" } } });
+    server.send({ method: "item/completed", params: { threadId: "thread-1", turnId,
+      item: { id: "message-1", type: "agentMessage", text: JSON.stringify(result) } } });
+    server.send({ method: "turn/completed", params: { threadId: "thread-1",
+      turn: { id: turnId, status: "completed", items: [] } } });
+  } });
+  const session = await new CodexAppServerTransport({ launcher }).start(request);
+  assert.deepEqual(await session.result, result);
+  assert.deepEqual(await collect(session.messages), [{ type: "heartbeat" }]);
+});
+
+test("Codex App Server validates current approval and sandbox wire values", () => {
+  const transport = new CodexAppServerTransport();
+  assert.doesNotThrow(() => transport.validateConfiguration({
+    operatorRequests: "reject", approvalPolicy: "on-request", sandbox: "read-only",
+  }));
+  assert.doesNotThrow(() => transport.validateConfiguration({
+    operatorRequests: "reject", approvalPolicy: "never", sandbox: "danger-full-access",
+  }));
+  assert.throws(() => transport.validateConfiguration({ sandbox: "workspaceWrite" }), /sandbox policy/u);
+  assert.throws(() => transport.validateConfiguration({ approvalPolicy: "unlessTrusted" }), /approval policy/u);
 });
 
 test("Codex App Server surfaces blocking approvals and rejects malformed or unknown protocol data", async () => {
@@ -204,7 +249,8 @@ test("Codex Runtime keeps one App Server thread across corrective turns and clas
   let turns = 0;
   const launcher = new Launcher({ onTurn: (server, _request, turnId) => {
     turns += 1;
-    const output = turns === 1 ? {} : result;
+    const output = turns === 1 ? {} : { ...result, nextRole: null,
+      artifacts: [{ type: "report", url: "https://example.test/report", name: null }] };
     server.send({ method: "item/completed", params: { threadId: "thread-1", turnId,
       item: { id: `message-${turns}`, type: "agentMessage", text: JSON.stringify(output) } } });
     server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
@@ -213,7 +259,8 @@ test("Codex Runtime keeps one App Server thread across corrective turns and clas
   const prepared = await runtime.prepare(context({ operatorRequests: "reject", maxTurns: 2 }));
   const session = await runtime.start(prepared);
   const eventsPromise = collect(session.events);
-  assert.deepEqual(await session.result, { ...result, nextRole: undefined });
+  assert.deepEqual(await session.result, { ...result, nextRole: undefined,
+    artifacts: [{ type: "report", url: "https://example.test/report" }] });
   const events = await eventsPromise;
   assert.equal(turns, 2);
   await runtime.cancel(session);

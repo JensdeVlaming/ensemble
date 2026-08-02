@@ -184,6 +184,19 @@ export class CodexAppServerTransport implements CodexTransport {
     const active = thread.active;
     if (!active || typeof message.method !== "string") return {};
     const params = requireRecord(message.params ?? {});
+    if (message.method === "thread/started") {
+      const startedThreadId = nestedString(params, "thread", "id");
+      if (startedThreadId !== thread.threadId) throw new Error("Codex App Server thread correlation mismatch");
+      return {};
+    }
+    if (message.method === "thread/status/changed" || message.method === "thread/name/updated") {
+      assertCorrelation(params, thread.threadId, undefined, true, false);
+      return {};
+    }
+    if (message.method === "mcpServer/startupStatus/updated") {
+      assertCorrelation(params, thread.threadId, undefined, false, false);
+      return {};
+    }
     if (message.method === "turn/started") {
       assertCorrelation(params, thread.threadId, undefined, true, false);
       const turnId = nestedString(params, "turn", "id");
@@ -196,7 +209,7 @@ export class CodexAppServerTransport implements CodexTransport {
       return {};
     }
     const requiresTurn = message.method !== "turn/completed";
-    assertCorrelation(params, thread.threadId, active.turnId, true, requiresTurn);
+    assertCorrelation(params, thread.threadId, active.turnId, true, requiresTurn, false, message.method);
     if (message.method === "item/started" || message.method === "item/completed") {
       const item = requireRecord(params.item);
       if (item.type === "agentMessage" && message.method === "item/completed" && typeof item.text === "string") {
@@ -225,8 +238,17 @@ export class CodexAppServerTransport implements CodexTransport {
       thread.active = undefined;
       this.#scheduleIdleClose(thread);
     } else if (message.method === "error") {
-      active.result.reject(new Error("Codex App Server reported a turn error"));
-      active.messages.fail(new Error("Codex App Server reported a turn error"));
+      const error = requireRecord(params.error);
+      if (typeof error.message !== "string" || typeof params.willRetry !== "boolean") {
+        throw new Error("Codex App Server turn error notification is invalid");
+      }
+      if (params.willRetry) {
+        active.messages.push({ type: "heartbeat" });
+        return {};
+      }
+      const failure = new Error(`Codex App Server reported a turn error (${codexErrorCategory(error.codexErrorInfo)})`);
+      active.result.reject(failure);
+      active.messages.fail(failure);
       thread.active = undefined;
     }
     return {};
@@ -284,8 +306,8 @@ interface AppServerConfig {
   readonly automaticApprovals: readonly ("command" | "file_change")[];
   readonly model?: string;
   readonly effort?: string;
-  readonly approvalPolicy: "unlessTrusted" | "never";
-  readonly sandbox: "readOnly" | "workspaceWrite" | "dangerFullAccess";
+  readonly approvalPolicy: "untrusted" | "on-request" | "never";
+  readonly sandbox: "read-only" | "workspace-write" | "danger-full-access";
   readonly networkAccess: boolean;
 }
 
@@ -301,10 +323,10 @@ function appServerConfig(value: Readonly<Record<string, unknown>>): AppServerCon
   if (operatorRequests !== "auto" && automaticApprovals.length) throw new Error("Codex automaticApprovals requires operatorRequests: auto");
   const model = optionalText(value.model, "Codex model");
   const effort = optionalText(value.effort, "Codex reasoning effort");
-  const approvalPolicy = value.approvalPolicy ?? "unlessTrusted";
-  if (approvalPolicy !== "unlessTrusted" && approvalPolicy !== "never") throw new Error("Invalid Codex approval policy");
-  const sandbox = value.sandbox ?? "workspaceWrite";
-  if (!["readOnly", "workspaceWrite", "dangerFullAccess"].includes(sandbox as string)) throw new Error("Invalid Codex sandbox policy");
+  const approvalPolicy = value.approvalPolicy ?? "untrusted";
+  if (!["untrusted", "on-request", "never"].includes(approvalPolicy as string)) throw new Error("Invalid Codex approval policy");
+  const sandbox = value.sandbox ?? "workspace-write";
+  if (!["read-only", "workspace-write", "danger-full-access"].includes(sandbox as string)) throw new Error("Invalid Codex sandbox policy");
   if (value.networkAccess !== undefined && typeof value.networkAccess !== "boolean") throw new Error("Invalid Codex network access policy");
   if (value.maxTurns !== undefined) positiveInteger(value.maxTurns, "Codex maxTurns");
   return Object.freeze({ operatorRequests, automaticApprovals: Object.freeze([...new Set(automaticApprovals)]),
@@ -322,18 +344,22 @@ function threadStartParams(request: CodexRunRequest, config: AppServerConfig): R
 function turnStartParams(thread: AppServerThread, prompt: string): Record<string, unknown> {
   return { threadId: thread.threadId, input: [{ type: "text", text: prompt }], cwd: thread.cwd,
     approvalPolicy: thread.config.approvalPolicy,
-    sandboxPolicy: thread.config.sandbox === "workspaceWrite"
+    sandboxPolicy: thread.config.sandbox === "workspace-write"
       ? { type: "workspaceWrite", writableRoots: [thread.cwd], networkAccess: thread.config.networkAccess }
-      : { type: thread.config.sandbox },
+      : { type: thread.config.sandbox === "read-only" ? "readOnly" : "dangerFullAccess" },
     ...(thread.config.model ? { model: thread.config.model } : {}),
     ...(thread.config.effort ? { effort: thread.config.effort } : {}),
     outputSchema: runtimeResultSchema };
 }
 
 const runtimeResultSchema = Object.freeze({ type: "object", properties: {
-  outcome: { type: "string" }, summary: { type: "string" }, nextRole: { type: "string" },
-  comments: { type: "array", items: { type: "string" } }, artifacts: { type: "array", items: { type: "object" } },
-}, required: ["outcome", "summary", "comments", "artifacts"], additionalProperties: false });
+  outcome: { type: "string" }, summary: { type: "string" }, nextRole: { type: ["string", "null"] },
+  comments: { type: "array", items: { type: "string" } }, artifacts: { type: "array", items: {
+    type: "object", properties: {
+      type: { type: "string" }, url: { type: "string" }, name: { type: ["string", "null"] },
+    }, required: ["type", "url", "name"], additionalProperties: false,
+  } },
+}, required: ["outcome", "summary", "nextRole", "comments", "artifacts"], additionalProperties: false });
 
 interface JsonRpcInbound { readonly id?: string | number; readonly method?: string; readonly params?: unknown; readonly result?: unknown; readonly error?: unknown }
 type ServerRequestHandler = (message: JsonRpcInbound) => Promise<unknown>;
@@ -513,16 +539,26 @@ function rateLimitEvents(params: Record<string, unknown>): readonly unknown[] {
   });
 }
 
+function codexErrorCategory(value: unknown): string {
+  if (typeof value === "string" && /^[a-zA-Z][a-zA-Z0-9]{0,63}$/u.test(value)) return value;
+  if (isRecord(value)) {
+    const keys = Object.keys(value);
+    if (keys.length === 1 && /^[a-zA-Z][a-zA-Z0-9]{0,63}$/u.test(keys[0]!)) return keys[0]!;
+  }
+  return "other";
+}
+
 function assertCorrelation(
   params: Record<string, unknown>, threadId: string, turnId: string | undefined,
-  requireThread: boolean, requireTurn: boolean, allowNullTurn = false,
+  requireThread: boolean, requireTurn: boolean, allowNullTurn = false, source?: string,
 ): void {
+  const context = source ? ` (${boundedUtf8(source, 128)})` : "";
   if ((requireThread && params.threadId === undefined) || (params.threadId !== undefined && params.threadId !== threadId)) {
-    throw new Error("Codex App Server thread correlation mismatch");
+    throw new Error(`Codex App Server thread correlation mismatch${context}`);
   }
   const suppliedTurn = allowNullTurn && params.turnId === null ? undefined : params.turnId;
   if ((requireTurn && suppliedTurn === undefined) || (turnId !== undefined && suppliedTurn !== undefined && suppliedTurn !== turnId)) {
-    throw new Error("Codex App Server turn correlation mismatch");
+    throw new Error(`Codex App Server turn correlation mismatch${context}`);
   }
 }
 

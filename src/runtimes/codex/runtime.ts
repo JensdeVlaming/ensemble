@@ -116,7 +116,7 @@ export class CodexResultBuilder {
     if (typeof value.outcome !== "string" || typeof value.summary !== "string") {
       throw new Error("Codex result requires string outcome and summary");
     }
-    if (value.nextRole !== undefined && typeof value.nextRole !== "string") {
+    if (value.nextRole !== undefined && value.nextRole !== null && typeof value.nextRole !== "string") {
       throw new Error("Codex result nextRole must be a string");
     }
     if (!isStringArray(value.comments)) throw new Error("Codex result comments must be a string array");
@@ -126,9 +126,14 @@ export class CodexResultBuilder {
     return {
       outcome: value.outcome,
       summary: value.summary,
-      nextRole: value.nextRole,
+      nextRole: typeof value.nextRole === "string" ? value.nextRole : undefined,
       comments: value.comments,
-      artifacts: value.artifacts,
+      artifacts: value.artifacts.map((artifact) => ({
+        type: artifact.type,
+        url: artifact.url,
+        ...(typeof artifact.name === "string" ? { name: artifact.name } : {}),
+        ...(isObject(artifact.metadata) ? { metadata: artifact.metadata } : {}),
+      })),
     };
   }
 }
@@ -302,7 +307,9 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 function isArtifact(value: unknown): value is RuntimeResult["artifacts"][number] {
-  return isObject(value) && typeof value.type === "string" && typeof value.url === "string";
+  return isObject(value) && typeof value.type === "string" && typeof value.url === "string"
+    && (value.name === undefined || value.name === null || typeof value.name === "string")
+    && (value.metadata === undefined || value.metadata === null || isObject(value.metadata));
 }
 
 function numberOrUndefined(value: unknown): number | undefined {
