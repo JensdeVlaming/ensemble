@@ -95,7 +95,7 @@ The package also includes a Vikunja-and-Codex-based example at
 `examples/host-config.yaml` plus a non-secret
 `examples/ensemble.env.example` template. Follow the dedicated
 [Vikunja guide](docs/providers/VIKUNJA.md) and
-[Codex CLI guide](docs/runtimes/CODEX_CLI.md) for those adapter fields.
+[Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md) for those adapter fields.
 
 Polling, worker, retry, turn, stall, cancellation, and drain bounds remain in
 the repository-owned workflow configuration so they hot-reload atomically with
@@ -137,7 +137,7 @@ src/
 └── runtimes/
     ├── runtime.ts          common runtime contract
     ├── scripted/           test/reference runtime
-    └── codex/              Codex runtime and CLI transport
+    └── codex/              Codex runtime and App Server transport
 ```
 
 - `Scheduler` polls semantic workflow candidates, deterministically orders them,
@@ -209,7 +209,7 @@ ID, regardless of status or retry exhaustion.
 
 Runtime adapters have separate installation, authentication, environment and
 protocol instructions. See the [runtime guides](docs/runtimes/README.md),
-including the detailed [Codex CLI guide](docs/runtimes/CODEX_CLI.md). The main
+including the detailed [Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md). The main
 Starter Guide describes only the shared Runtime contract and portable role
 lifecycle; adapter-specific setup stays in its runtime guide.
 

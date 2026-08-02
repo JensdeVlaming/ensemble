@@ -10,9 +10,10 @@ workspace:
   gitExecutable: /usr/bin/git
 runtimes:
   - name: codex
-    type: codex-cli
+    type: codex-app-server
     executable: /usr/local/bin/codex
-    executionArguments: [--sandbox, workspace-write, --skip-git-repo-check]
+    serverArguments: [app-server, --listen, stdio://]
+    requestTimeoutMs: 30000
     environment:
       inherit: [PATH, HOME, CODEX_HOME, TMPDIR, LANG, LC_ALL]
 repositories:

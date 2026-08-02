@@ -755,9 +755,9 @@ Result Builder
 
 Nothing outside the runtime should understand how Codex works.
 
-The App Server transport is the production Codex transport. A one-shot
-`codex exec --json` transport MAY remain as a development or compatibility
-fallback, but it is not sufficient for production-runtime conformance.
+The App Server transport is the Codex transport. One-shot `codex exec --json`
+invocation is not supported because it cannot provide the required dynamic
+tools, blocking requests, continuation turns, usage, and rate-limit events.
 
 Continuation turns MUST reuse the live App Server thread and MUST be bounded by
 `runtime.maxTurns`. A process restart MAY create a fresh thread while reusing

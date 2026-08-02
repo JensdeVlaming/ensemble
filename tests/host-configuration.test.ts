@@ -24,9 +24,10 @@ function host(overrides: readonly string[] = []): string {
     "  gitExecutable: /usr/bin/git",
     "runtimes:",
     "  - name: codex",
-    "    type: codex-cli",
+    "    type: codex-app-server",
     "    executable: /usr/local/bin/codex",
-    "    executionArguments: [--sandbox, workspace-write]",
+    "    serverArguments: [app-server, --listen, stdio://]",
+    "    requestTimeoutMs: 45000",
     "    environment:",
     "      inherit: [PATH, HOME, CODEX_HOME, SSH_AUTH_SOCK]",
     "repositories:",
@@ -50,6 +51,9 @@ test("host configuration is strict, immutable, and keeps runtime selection opera
   assert.equal(configuration.version, 1);
   assert.equal(configuration.repositories[0]?.provider.projectId, 3);
   assert.equal(configuration.runtimes[0]?.name, "codex");
+  assert.equal(configuration.runtimes[0]?.type, "codex-app-server");
+  assert.deepEqual(configuration.runtimes[0]?.serverArguments, ["app-server", "--listen", "stdio://"]);
+  assert.equal(configuration.runtimes[0]?.requestTimeoutMs, 45_000);
   assert.equal(configuration.logging.level, "info");
   assert.equal(configuration.service.stopTimeoutSeconds, 60);
   assert.equal(Object.isFrozen(configuration), true);
@@ -64,16 +68,9 @@ test("host configuration is strict, immutable, and keeps runtime selection opera
   assert.throws(() => parseHostConfiguration(host().replace("level: info", "level: trace")), /logging\.level/u);
 });
 
-test("host configuration registers Codex App Server independently from the CLI fallback", () => {
-  const source = host().replace("type: codex-cli", "type: codex-app-server")
-    .replace("executionArguments: [--sandbox, workspace-write]", "serverArguments: [app-server, --listen, stdio://]\n    requestTimeoutMs: 45000");
-  const configuration = parseHostConfiguration(source);
-  const runtime = configuration.runtimes[0];
-  assert.equal(runtime?.type, "codex-app-server");
-  if (runtime?.type === "codex-app-server") {
-    assert.deepEqual(runtime.serverArguments, ["app-server", "--listen", "stdio://"]);
-    assert.equal(runtime.requestTimeoutMs, 45_000);
-  }
+test("host configuration rejects the removed Codex CLI runtime", () => {
+  const source = host().replace("type: codex-app-server", "type: codex-cli");
+  assert.throws(() => parseHostConfiguration(source), /Unsupported runtime type/u);
 });
 
 test("environment files are non-shell, bounded, duplicate-free, and permission checked", async () => {

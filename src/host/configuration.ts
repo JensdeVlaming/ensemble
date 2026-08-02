@@ -33,14 +33,6 @@ export interface HostRuntimeEnvironment {
   readonly inherit: readonly string[];
 }
 
-export interface HostCodexRuntimeConfiguration {
-  readonly name: string;
-  readonly type: "codex-cli";
-  readonly executable: string;
-  readonly executionArguments: readonly string[];
-  readonly environment: HostRuntimeEnvironment;
-}
-
 export interface HostCodexAppServerRuntimeConfiguration {
   readonly name: string;
   readonly type: "codex-app-server";
@@ -50,7 +42,7 @@ export interface HostCodexAppServerRuntimeConfiguration {
   readonly environment: HostRuntimeEnvironment;
 }
 
-export type HostRuntimeConfiguration = HostCodexRuntimeConfiguration | HostCodexAppServerRuntimeConfiguration;
+export type HostRuntimeConfiguration = HostCodexAppServerRuntimeConfiguration;
 
 export interface HostVikunjaConfiguration {
   readonly type: "vikunja";
@@ -206,10 +198,8 @@ export function runtimeEnvironment(
 function runtimeAt(value: unknown, path: string): HostRuntimeConfiguration {
   const runtime = mapping(value, path, true);
   const type = text(runtime.type, `${path}.type`);
-  if (type !== "codex-cli" && type !== "codex-app-server") throw new Error(`Unsupported runtime type at ${path}.type: ${type}`);
-  exactKeys(runtime, type === "codex-cli"
-    ? ["name", "type", "executable", "executionArguments", "environment"]
-    : ["name", "type", "executable", "serverArguments", "requestTimeoutMs", "environment"], path);
+  if (type !== "codex-app-server") throw new Error(`Unsupported runtime type at ${path}.type: ${type}`);
+  exactKeys(runtime, ["name", "type", "executable", "serverArguments", "requestTimeoutMs", "environment"], path);
   const environment = mapping(runtime.environment, `${path}.environment`, false);
   exactKeys(environment, ["inherit"], `${path}.environment`);
   const inherit = stringList(environment.inherit, `${path}.environment.inherit`, [
@@ -223,10 +213,7 @@ function runtimeAt(value: unknown, path: string): HostRuntimeConfiguration {
     executable: absolutePath(runtime.executable, `${path}.executable`),
     environment: { inherit },
   };
-  return type === "codex-cli" ? { ...shared, type,
-    executionArguments: stringList(runtime.executionArguments, `${path}.executionArguments`, [
-      "--sandbox", "workspace-write", "--skip-git-repo-check",
-    ]) } : { ...shared, type,
+  return { ...shared, type,
     serverArguments: stringList(runtime.serverArguments, `${path}.serverArguments`, ["app-server", "--listen", "stdio://"]),
     requestTimeoutMs: positiveInteger(runtime.requestTimeoutMs ?? 30_000, `${path}.requestTimeoutMs`),
   };

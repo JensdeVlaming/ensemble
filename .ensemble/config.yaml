@@ -1,7 +1,11 @@
 runtime:
   name: codex
   config:
+    operatorRequests: reject
+    approvalPolicy: never
     sandbox: workspace-write
+    networkAccess: false
+    maxTurns: 3
 initialRole: planner
 terminalOutcomes: [approved, completed]
 statuses:

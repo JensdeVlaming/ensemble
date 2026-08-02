@@ -212,9 +212,10 @@ workspace:
   gitExecutable: ${yaml(git)}
 runtimes:
   - name: codex
-    type: codex-cli
+    type: codex-app-server
     executable: ${yaml(codex)}
-    executionArguments: [--sandbox, workspace-write, --skip-git-repo-check]
+    serverArguments: [app-server, --listen, stdio://]
+    requestTimeoutMs: 30000
     environment:
       inherit: [PATH, HOME, CODEX_HOME, TMPDIR, LANG, LC_ALL]
 repositories:

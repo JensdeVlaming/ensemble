@@ -15,7 +15,6 @@ import type { OrchestratorRegistration } from "../orchestration/service.ts";
 import { Scheduler } from "../orchestration/scheduler.ts";
 import { VikunjaProvider } from "../providers/vikunja/adapter.ts";
 import { RuntimeRegistry } from "../runtimes/runtime.ts";
-import { CodexCliTransport } from "../runtimes/codex/cli-transport.ts";
 import { CodexAppServerTransport } from "../runtimes/codex/app-server-transport.ts";
 import { CodexRuntime } from "../runtimes/codex/runtime.ts";
 
@@ -162,11 +161,8 @@ function createRuntime(
   environment: Readonly<Record<string, string | undefined>>,
 ): CodexRuntime {
   const selectedEnvironment = runtimeEnvironment(runtime.environment.inherit, environment);
-  const transport = runtime.type === "codex-cli"
-    ? new CodexCliTransport({ executable: runtime.executable, executionArguments: runtime.executionArguments,
-      environment: selectedEnvironment })
-    : new CodexAppServerTransport({ executable: runtime.executable, arguments: runtime.serverArguments,
-      requestTimeoutMs: runtime.requestTimeoutMs, environment: selectedEnvironment });
+  const transport = new CodexAppServerTransport({ executable: runtime.executable, arguments: runtime.serverArguments,
+    requestTimeoutMs: runtime.requestTimeoutMs, environment: selectedEnvironment });
   return new CodexRuntime(transport, undefined, undefined, undefined, undefined, runtime.name);
 }
 
