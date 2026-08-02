@@ -44,7 +44,7 @@ export class NodeCodexAppServerLauncher implements CodexAppServerLauncher {
       child.once("error", reject);
       child.once("close", (code, signal) => {
         if (code === 0 || signal === "SIGTERM") resolve({ code, signal });
-        else reject(new Error(`Codex App Server failed (${signal ?? code ?? "unknown"}): ${bounded(stderr.trim(), 2_048)}`));
+        else reject(new Error(`Codex App Server failed (${signal ?? code ?? "unknown"}): ${boundedUtf8(stderr.trim(), 2_048)}`));
       });
     });
     return { stdin: child.stdin, stdout: child.stdout, exit, kill: (signal = "SIGTERM") => { child.kill(signal); } };
@@ -446,14 +446,14 @@ function blockingRequest(method: string, params: Record<string, unknown>, rpcId:
   }
   if (method === "mcpServer/elicitation/request") {
     return { type: "tool_elicitation_requested", at, request: { kind: "tool_elicitation",
-      summary: typeof params.message === "string" ? bounded(params.message, 2_048) : "An MCP server requires operator input",
+      summary: typeof params.message === "string" ? boundedUtf8(params.message, 2_048) : "An MCP server requires operator input",
       ...(typeof requestId === "string" ? { requestId } : {}), createdAt: at } };
   }
   return undefined;
 }
 
 function approvalSummary(method: string, params: Record<string, unknown>): string {
-  const reason = typeof params.reason === "string" ? bounded(params.reason, 1_900) : undefined;
+  const reason = typeof params.reason === "string" ? boundedUtf8(params.reason, 1_900) : undefined;
   const subject = method.includes("commandExecution") ? "command execution" : method.includes("fileChange") ? "file changes" : "additional permissions";
   return reason ? `Codex requests approval for ${subject}: ${reason}` : `Codex requests approval for ${subject}`;
 }
@@ -477,14 +477,14 @@ function automaticDecision(config: AppServerConfig, method: string): boolean {
 function itemEvent(method: string, item: Record<string, unknown>): unknown {
   const started = method === "item/started";
   if (item.type === "commandExecution") {
-    const tool = typeof item.command === "string" ? bounded(item.command, 256) : "command";
+    const tool = typeof item.command === "string" ? boundedUtf8(item.command, 256) : "command";
     return started ? { type: "tool_started", tool } : { type: "tool_finished", tool, success: item.status === "completed" };
   }
   if (item.type === "fileChange") return started ? { type: "tool_started", tool: "file_change" }
     : { type: "tool_finished", tool: "file_change", success: item.status === "completed" };
   if (item.type === "dynamicToolCall" && typeof item.tool === "string") return started
-    ? { type: "tool_started", tool: bounded(item.tool, 256) }
-    : { type: "tool_finished", tool: bounded(item.tool, 256), success: item.success === true };
+    ? { type: "tool_started", tool: boundedUtf8(item.tool, 256) }
+    : { type: "tool_finished", tool: boundedUtf8(item.tool, 256), success: item.success === true };
   return undefined;
 }
 
@@ -533,13 +533,13 @@ function isActivityDelta(method: string): boolean {
 }
 
 function turnFailure(turn: Record<string, unknown>): string {
-  if (isRecord(turn.error) && typeof turn.error.message === "string") return `Codex turn failed: ${bounded(turn.error.message, 2_048)}`;
+  if (isRecord(turn.error) && typeof turn.error.message === "string") return `Codex turn failed: ${boundedUtf8(turn.error.message, 2_048)}`;
   return `Codex turn ended with status ${String(turn.status)}`;
 }
 
 function protocolError(value: unknown): Error {
   if (isRecord(value) && typeof value.code === "number" && typeof value.message === "string") {
-    return new Error(`Codex App Server error ${value.code}: ${bounded(value.message, 2_048)}`);
+    return new Error(`Codex App Server error ${value.code}: ${boundedUtf8(value.message, 2_048)}`);
   }
   return new Error("Codex App Server returned an invalid protocol error");
 }
@@ -588,5 +588,21 @@ function nestedString(value: Record<string, unknown>, key: string, child: string
 function requiredString(value: unknown, label: string): string { if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > 256) throw new Error(`${label} is invalid`); return value; }
 function optionalText(value: unknown, label: string): string | undefined { if (value === undefined) return undefined; return requiredString(value, label); }
 function positiveInteger(value: unknown, label: string): number { if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new Error(`${label} must be a positive safe integer`); return value as number; }
-function bounded(value: string, bytes: number): string { return Buffer.byteLength(value, "utf8") <= bytes ? value : `${value.slice(0, Math.max(0, bytes - 1))}…`; }
+export function boundedUtf8(value: string, maximumBytes: number): string {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw new Error("UTF-8 byte limit must be a nonnegative safe integer");
+  if (Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  const marker = "…";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const appendMarker = maximumBytes >= markerBytes;
+  const contentBytes = maximumBytes - (appendMarker ? markerBytes : 0);
+  let output = "";
+  let usedBytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > contentBytes) break;
+    output += character;
+    usedBytes += characterBytes;
+  }
+  return appendMarker ? `${output}${marker}` : output;
+}
 function numberFrom(value: Record<string, unknown>, keys: readonly string[]): number | undefined { for (const key of keys) if (Number.isSafeInteger(value[key]) && (value[key] as number) >= 0) return value[key] as number; return undefined; }

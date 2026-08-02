@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CodexAppServerTransport, CodexRuntime } from "../src/index.ts";
 import type { CodexAppServerLauncher, CodexAppServerProcess, RuntimeContext, RuntimeTool } from "../src/index.ts";
+import { boundedUtf8 } from "../src/runtimes/codex/app-server-transport.ts";
 
 class Stream implements AsyncIterable<string> {
   readonly values: string[] = [];
@@ -70,6 +71,47 @@ class Launcher implements CodexAppServerLauncher {
 
 const result = { outcome: "approved", summary: "done", comments: [], artifacts: [] };
 const request = { id: "run-1", cwd: "/workspace", prompt: "work", config: { operatorRequests: "reject" }, tools: [] };
+
+test("Codex App Server bounds text by UTF-8 bytes without splitting code points", () => {
+  assert.equal(boundedUtf8("a".repeat(256), 256), "a".repeat(256));
+  assert.equal(boundedUtf8("a".repeat(257), 256), `${"a".repeat(253)}…`);
+  assert.equal(Buffer.byteLength(boundedUtf8("a".repeat(1_000), 256), "utf8"), 256);
+
+  const unicode = boundedUtf8(`${"é".repeat(127)}abc`, 256);
+  assert.ok(Buffer.byteLength(unicode, "utf8") <= 256);
+  assert.doesNotMatch(unicode, /�/u);
+  const emoji = boundedUtf8(`${"a".repeat(250)}😀😀`, 256);
+  assert.ok(Buffer.byteLength(emoji, "utf8") <= 256);
+  assert.doesNotMatch(emoji, /�/u);
+
+  assert.equal(boundedUtf8("abc", 2), "ab");
+  assert.equal(boundedUtf8("😀", 2), "");
+  assert.throws(() => boundedUtf8("value", -1), /nonnegative safe integer/u);
+});
+
+test("Codex App Server emits engine-valid bounded names for long commands", async () => {
+  const command = `${"a".repeat(260)}😀`;
+  const launcher = new Launcher({ onTurn: (server, _request, turnId) => {
+    server.send({ method: "item/started", params: { threadId: "thread-1", turnId,
+      item: { id: "command-long", type: "commandExecution", command, status: "inProgress" } } });
+    server.send({ method: "item/completed", params: { threadId: "thread-1", turnId,
+      item: { id: "command-long", type: "commandExecution", command, status: "completed" } } });
+    server.send({ method: "item/completed", params: { threadId: "thread-1", turnId,
+      item: { id: "message-long", type: "agentMessage", text: JSON.stringify(result) } } });
+    server.send({ method: "turn/completed", params: { threadId: "thread-1",
+      turn: { id: turnId, status: "completed", items: [] } } });
+  } });
+  const session = await new CodexAppServerTransport({ launcher }).start(request);
+  const messages = await collect(session.messages) as Array<{ tool?: string }>;
+  assert.deepEqual(await session.result, result);
+  assert.equal(messages.length, 2);
+  for (const message of messages) {
+    assert.equal(typeof message.tool, "string");
+    assert.ok(message.tool!.trim());
+    assert.ok(Buffer.byteLength(message.tool!, "utf8") <= 256);
+    assert.doesNotMatch(message.tool!, /�/u);
+  }
+});
 
 test("Codex App Server initializes, correlates fragmented thread/turn messages, resumes, and cancels", async () => {
   const launcher = new Launcher({ onTurn: (server, _request, turnId) => {
