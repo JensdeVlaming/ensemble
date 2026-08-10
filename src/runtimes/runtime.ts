@@ -83,6 +83,8 @@ export interface RuntimeSession {
 export interface Runtime {
   readonly name: string;
   validateConfiguration?(config: Readonly<Record<string, unknown>>): void;
+  /** Performs a non-dispatching installation/protocol check. */
+  diagnose?(context: { readonly cwd: string }): Promise<void>;
   prepare(context: RuntimeContext): Promise<PreparedRun>;
   start(prepared: PreparedRun): Promise<RuntimeSession>;
   resume(session: RuntimeSession, context: ResumeContext): Promise<RuntimeSession>;

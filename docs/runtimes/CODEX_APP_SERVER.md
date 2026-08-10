@@ -72,8 +72,15 @@ the provider execution journal and must not be edited manually.
 
 ```sh
 ensemble validate
+ensemble doctor
 ensemble run
 ```
+
+`ensemble doctor` starts App Server only long enough to perform `initialize`,
+send `initialized`, and read the configured account state. It does not create a
+thread or turn. A successful account check confirms that the selected Codex
+home has an account when the active provider requires OpenAI authentication;
+it does not consume a model request.
 
 A healthy execution progresses through `runtime.prepared`, `runtime.started`,
 `runtime.completed`, and `synchronization.completed`. Failures before

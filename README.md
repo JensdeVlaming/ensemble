@@ -36,6 +36,9 @@ environment file, validate it without dispatching work, then install the service
 ```sh
 ensemble init
 ensemble validate
+ensemble doctor
+ensemble status
+ensemble inspect task <id>
 ensemble service install
 ensemble service start
 ensemble service status
@@ -49,6 +52,13 @@ and install a user LaunchAgent. `ensemble run` runs the identical service in the
 foreground on either platform. `SIGINT` and `SIGTERM` stop intake, drain live
 workers within repository bounds, persist cancellations, and release the
 single-instance guard.
+
+`ensemble doctor` performs non-dispatching filesystem, provider,
+repository-configuration, Codex App Server initialization, and Codex account
+checks. `ensemble status` reads the local instance guard without contacting the
+provider. `ensemble inspect task <id>` reconstructs durable provider state;
+add `--journal` for safe ordered event metadata or `--json` for automation.
+Raw hidden provider comments are never emitted.
 
 The protected environment file is deliberately not shell syntax:
 

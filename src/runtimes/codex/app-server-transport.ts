@@ -97,6 +97,31 @@ export class CodexAppServerTransport implements CodexTransport {
 
   validateConfiguration(value: Readonly<Record<string, unknown>>): void { appServerConfig(value); }
 
+  async diagnose(cwd: string): Promise<void> {
+    const process = this.launcher.launch(this.executable, this.arguments, { cwd, environment: this.environment });
+    const connection = new JsonRpcConnection(process, this.requestTimeoutMs, async () => ({}), () => undefined);
+    try {
+      await connection.request("initialize", {
+        clientInfo: { name: "ensemble", title: "Ensemble", version: "0.1.0" },
+        capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true },
+      });
+      connection.notify("initialized", {});
+      const account = requireRecord(await connection.request("account/read", { refreshToken: false }));
+      if (typeof account.requiresOpenaiAuth !== "boolean") {
+        throw new Error("Codex App Server returned an invalid account state");
+      }
+      if (account.account === undefined) throw new Error("Codex App Server returned an invalid account state");
+      if (account.requiresOpenaiAuth && account.account === null) {
+        throw new Error("Codex App Server is not authenticated");
+      }
+      if (account.account !== null) requireRecord(account.account);
+    } finally {
+      connection.close(new Error("Codex App Server diagnostic completed"));
+      process.kill("SIGTERM");
+      void process.exit.catch(() => undefined);
+    }
+  }
+
   async start(request: CodexRunRequest): Promise<CodexTransportSession> {
     const config = appServerConfig(request.config);
     const process = this.launcher.launch(this.executable, this.arguments, {

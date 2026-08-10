@@ -18,6 +18,7 @@ class Stream implements AsyncIterable<string> {
 interface FakeOptions {
   readonly onTurn?: (server: FakeServer, request: Record<string, unknown>, turnId: string) => void;
   readonly ignoreMethods?: readonly string[];
+  readonly accountResult?: Readonly<Record<string, unknown>>;
 }
 
 class FakeServer implements CodexAppServerProcess {
@@ -49,6 +50,8 @@ class FakeServer implements CodexAppServerProcess {
     if (typeof request.method === "string" && this.options.ignoreMethods?.includes(request.method)) return;
     const id = request.id;
     if (request.method === "initialize") this.send({ id, result: { platformFamily: "unix", platformOs: "macos" } });
+    if (request.method === "account/read") this.send({ id, result: this.options.accountResult
+      ?? { account: { type: "chatgpt" }, requiresOpenaiAuth: true } });
     if (request.method === "thread/start") this.send({ id, result: { thread: { id: "thread-1" } } });
     if (request.method === "turn/start") {
       const turnId = `turn-${++this.#turn}`;
@@ -78,6 +81,24 @@ class Launcher implements CodexAppServerLauncher {
 
 const result = { outcome: "approved", summary: "done", comments: [], artifacts: [] };
 const request = { id: "run-1", cwd: "/workspace", prompt: "work", config: { operatorRequests: "reject" }, tools: [] };
+
+test("Codex App Server diagnostic performs only the initialize handshake and terminates", async () => {
+  const launcher = new Launcher();
+  const transport = new CodexAppServerTransport({ launcher });
+  await transport.diagnose("/configuration");
+  assert.deepEqual(launcher.servers[0]?.writes.map((entry) => entry.method), ["initialize", "initialized", "account/read"]);
+  assert.equal(launcher.servers[0]?.killed, true);
+
+  const failing = new CodexAppServerTransport({
+    launcher: new Launcher({ ignoreMethods: ["initialize"] }),
+    requestTimeoutMs: 1,
+  });
+  await assert.rejects(failing.diagnose("/configuration"), /request timed out: initialize/u);
+  const unauthenticated = new CodexAppServerTransport({
+    launcher: new Launcher({ accountResult: { account: null, requiresOpenaiAuth: true } }),
+  });
+  await assert.rejects(unauthenticated.diagnose("/configuration"), /not authenticated/u);
+});
 
 test("Codex App Server bounds text by UTF-8 bytes without splitting code points", () => {
   assert.equal(boundedUtf8("a".repeat(256), 256), "a".repeat(256));

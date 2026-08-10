@@ -1144,6 +1144,12 @@ last error. Snapshots MUST be defensively copied, bounded in history, and MUST
 not expose provider credentials, prompts containing secrets, raw tool arguments,
 or mutable internal handles.
 
+Provider adapters MAY expose a read-only task diagnostic projection for
+operator inspection. The portable projection MUST be reconstructed from the
+same durable state used by scheduling, MUST be bounded and defensively copied,
+and MUST NOT expose raw provider journal bodies, provider response payloads, or
+credentials. Provider-specific event parsing remains inside the adapter.
+
 A read-only JSON API and dashboard MAY present snapshots, health, and readiness.
 If present, they MUST NOT become a second control plane or durable state store.
 Readiness is false until initial validation and startup reconciliation complete.
@@ -1159,6 +1165,10 @@ Ensemble MUST provide an executable entry point that can:
 
 * select host configuration and registered providers and runtimes
 * validate configuration without dispatching work
+* run non-dispatching installation, provider-read, runtime-protocol, and account
+  diagnostics
+* inspect local controller state and provider-owned task execution state without
+  mutating either
 * start the long-running service
 * handle platform termination signals
 * emit structured logs to standard output

@@ -13,6 +13,8 @@ import type {
   ExecutionRecord,
   ProviderAdapter,
   ProviderExecutionState,
+  ProviderJournalDiagnostic,
+  ProviderTaskDiagnostic,
   ProviderTaskInventory,
   TaskQuery,
   TaskRefreshResult,
@@ -358,6 +360,23 @@ export class VikunjaProvider implements ProviderAdapter {
     return stateFromEvents(parseEvents(await this.#comments(id)));
   }
 
+  async inspectTask(id: TaskId, options: { readonly includeJournal?: boolean } = {}): Promise<ProviderTaskDiagnostic> {
+    const [task, comments] = await Promise.all([this.getTask(id), this.#comments(id)]);
+    const events = parseEvents(comments);
+    const execution = stateFromEvents(events);
+    const ordinaryCommentCount = comments.filter((comment) => !requiredString(comment.comment, "comment").startsWith(STATE_PREFIX)).length;
+    const terminalCommentCount = [...foldEvents(events).terminals.values()]
+      .reduce((count, event) => count + (event.comments?.length ?? 0), 0);
+    const artifacts = events.reduce((count, parsed) => count + (parsed.event.artifacts?.length ?? 0), 0);
+    return Object.freeze({
+      task: diagnosticTask(task),
+      execution: diagnosticExecution(execution),
+      commentCount: ordinaryCommentCount + terminalCommentCount,
+      artifactCount: artifacts,
+      ...(options.includeJournal ? { journal: diagnosticJournal(events) } : {}),
+    });
+  }
+
   async updateStatus(id: TaskId, status: string): Promise<void> {
     const task = await this.client.request<VikunjaTask>("GET", `tasks/${taskNumber(id)}`);
     const labels = task.labels ?? [];
@@ -671,6 +690,59 @@ function parseEvents(comments: readonly VikunjaComment[]): readonly ParsedEvent[
     return [{ event, commentId: requiredNumber(comment.id, "comment id"),
       createdAt: canonicalProviderTimestamp(comment.created, "comment created") }];
   }).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.commentId - right.commentId);
+}
+
+function diagnosticJournal(events: readonly ParsedEvent[]): readonly ProviderJournalDiagnostic[] {
+  const selected = events.slice(-1_000);
+  const offset = events.length - selected.length;
+  return Object.freeze(selected.map((parsed, sequence) => Object.freeze({
+    sequence: offset + sequence + 1,
+    kind: parsed.event.kind,
+    executionId: boundedText(parsed.event.executionId, 256),
+    createdAt: parsed.createdAt,
+    ...(parsed.event.role ? { role: boundedText(parsed.event.role, 256) } : {}),
+    ...(parsed.event.ownerId ? { ownerId: boundedText(parsed.event.ownerId, 256) } : {}),
+    ...(parsed.event.leaseExpiresAt ? { leaseExpiresAt: parsed.event.leaseExpiresAt } : {}),
+    ...(parsed.event.record?.outcome ? { outcome: parsed.event.record.outcome } : {}),
+  })));
+}
+
+function diagnosticTask(task: Task): ProviderTaskDiagnostic["task"] {
+  return Object.freeze({
+    id: boundedText(task.id, 256),
+    title: boundedText(task.title, 1_024),
+    status: boundedText(task.status, 256),
+    ...(task.dispatchable === undefined ? {} : { dispatchable: task.dispatchable }),
+    labels: Object.freeze(task.labels.slice(0, 100).map((value) => boundedText(value, 256))),
+    assignees: Object.freeze(task.assignees.slice(0, 100).map((value) => boundedText(value, 256))),
+    ...(task.blockers ? { blockers: Object.freeze(task.blockers.slice(0, 100).map((blocker) => Object.freeze({
+      id: boundedText(blocker.id, 256), resolved: blocker.resolved,
+      ...(blocker.status === undefined ? {} : { status: boundedText(blocker.status, 256) }),
+    }))) } : {}),
+  });
+}
+
+function diagnosticExecution(state: ProviderExecutionState): ProviderTaskDiagnostic["execution"] {
+  const active = state.active ? Object.freeze({
+    id: boundedText(state.active.id, 256),
+    role: boundedText(state.active.role, 256),
+    startedAt: state.active.startedAt,
+    ...(state.active.ownerId ? { ownerId: boundedText(state.active.ownerId, 256) } : {}),
+    ...(state.active.leaseExpiresAt ? { leaseExpiresAt: state.active.leaseExpiresAt } : {}),
+  }) : undefined;
+  const history = state.history.slice(-100).map((record) => Object.freeze({
+    id: boundedText(record.id, 256),
+    role: boundedText(record.role, 256),
+    outcome: boundedText(record.outcome, 256),
+    finishedAt: new Date(Date.parse(record.finishedAt)).toISOString(),
+    ...(record.nextRole ? { nextRole: boundedText(record.nextRole, 256) } : {}),
+    ...(record.failure ? { failure: record.failure } : {}),
+  }));
+  return Object.freeze({
+    ...(active ? { active } : {}),
+    history: Object.freeze(history),
+    ...(state.nextRole ? { nextRole: boundedText(state.nextRole, 256) } : {}),
+  });
 }
 
 function validateEvent(value: unknown): ProviderEvent {

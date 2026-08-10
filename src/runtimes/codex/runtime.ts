@@ -21,6 +21,7 @@ export interface CodexTransportSession {
 export interface CodexTransport {
   readonly defaultMaxTurns?: number;
   validateConfiguration?(config: Readonly<Record<string, unknown>>): void;
+  diagnose?(cwd: string): Promise<void>;
   start(request: CodexRunRequest): Promise<CodexTransportSession>;
   resume(session: CodexTransportSession, prompt: string): Promise<CodexTransportSession>;
   cancel(session: CodexTransportSession): Promise<void>;
@@ -169,6 +170,11 @@ export class CodexRuntime implements Runtime {
     codexOperatorRequestPolicy(config);
     codexMaxTurns(config, this.transport.defaultMaxTurns ?? 1);
     this.transport.validateConfiguration?.(config);
+  }
+
+  async diagnose(context: { readonly cwd: string }): Promise<void> {
+    if (!this.transport.diagnose) throw new Error("Codex transport does not support diagnostics");
+    await this.transport.diagnose(context.cwd);
   }
 
   async prepare(context: RuntimeContext): Promise<PreparedRun> {

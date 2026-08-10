@@ -70,6 +70,9 @@ The CLI provides:
 ```text
 ensemble init
 ensemble validate
+ensemble doctor
+ensemble status
+ensemble inspect task <id>
 ensemble run
 ensemble service install|uninstall|start|stop|restart|status|logs
 ```
@@ -487,6 +490,32 @@ Success prints:
 ```text
 Ensemble configuration is valid
 ```
+
+For a deeper non-dispatching check, run:
+
+```sh
+ensemble doctor
+```
+
+`doctor` checks the configured filesystem, state directory, instance guard,
+provider read access, repository configuration, runtime settings, and an actual
+Codex App Server initialize plus account-state handshake. It does not start a
+thread, create a turn, claim a task, or test provider write permissions.
+
+Use the read-only operational commands when diagnosing a running or stopped
+controller:
+
+```sh
+ensemble status
+ensemble inspect task 32
+ensemble inspect task 32 --journal
+```
+
+`status` reports the local controller PID/lock state and configured paths.
+`inspect task` reconstructs the provider-owned execution state and reports the
+active lease and terminal history. `--journal` adds ordered event metadata, but
+never prints raw hidden comment bodies. Use `--repository <id>` when more than
+one repository is registered. All three commands accept `--json`.
 
 Common validation failures include:
 

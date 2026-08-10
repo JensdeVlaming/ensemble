@@ -1,4 +1,4 @@
-import type { Artifact, BlockingRequest, FailureKind, RuntimeTool, Task, TaskComment, TaskId } from "../domain/model.ts";
+import type { Artifact, BlockingRequest, FailureKind, RuntimeTool, Task, TaskBlocker, TaskComment, TaskId } from "../domain/model.ts";
 
 export type { BlockingRequest } from "../domain/model.ts";
 
@@ -80,6 +80,37 @@ export interface ProviderExecutionState {
   readonly nextRole?: string;
 }
 
+export interface ProviderJournalDiagnostic {
+  readonly sequence: number;
+  readonly kind: "claim" | "lease" | "complete" | "fail" | "cancel" | "block" | "artifact";
+  readonly executionId: string;
+  readonly createdAt: string;
+  readonly role?: string;
+  readonly ownerId?: string;
+  readonly leaseExpiresAt?: string;
+  readonly outcome?: string;
+}
+
+export interface ProviderTaskDiagnostic {
+  readonly task: {
+    readonly id: string;
+    readonly title: string;
+    readonly status: string;
+    readonly dispatchable?: boolean;
+    readonly labels: readonly string[];
+    readonly assignees: readonly string[];
+    readonly blockers?: readonly TaskBlocker[];
+  };
+  readonly execution: {
+    readonly active?: ActiveExecution;
+    readonly history: readonly Omit<ExecutionRecord, "summary" | "blockingRequest">[];
+    readonly nextRole?: string;
+  };
+  readonly commentCount: number;
+  readonly artifactCount: number;
+  readonly journal?: readonly ProviderJournalDiagnostic[];
+}
+
 export interface ExecutionCompletion {
   readonly record: ExecutionRecord;
   readonly comments: readonly string[];
@@ -121,6 +152,8 @@ export interface ProviderAdapter {
   /** Returns task-scoped host capabilities; credentials stay captured inside the adapter. */
   getRuntimeTools(id: TaskId, executionId: string, ownerId: string): Promise<readonly RuntimeTool[]>;
   getExecutionState(id: TaskId): Promise<ProviderExecutionState>;
+  /** Returns a bounded, read-only diagnostic projection without raw provider state bodies. */
+  inspectTask?(id: TaskId, options?: { readonly includeJournal?: boolean }): Promise<ProviderTaskDiagnostic>;
   updateStatus(id: TaskId, status: string): Promise<void>;
   createComment(id: TaskId, body: string): Promise<TaskComment>;
   uploadArtifact(id: TaskId, artifact: Artifact): Promise<Artifact>;

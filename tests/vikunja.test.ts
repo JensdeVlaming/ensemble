@@ -159,6 +159,30 @@ test("Vikunja adapter filters and normalizes workflow candidates", async () => {
   assert.deepEqual(blocked.blockers, [{ id: "99", status: "open", resolved: false }]);
 });
 
+test("Vikunja task inspection exposes reconstructed state and safe journal metadata only", async () => {
+  const api = new FakeVikunjaApi([task(1, "Inspectable", [2], 1)]);
+  api.comments.set(1, [
+    { id: 10, comment: "operator context", created: "2026-07-31T09:59:00Z", author: { username: "operator" } },
+    stateComment(11, activeClaimEvent("execution-1", "owner-secret-value")),
+  ]);
+  const report = await providerFor(api, "unused").inspectTask("1", { includeJournal: true });
+  assert.equal(report.task.id, "1");
+  assert.equal(report.execution.active?.id, "execution-1");
+  assert.equal(report.execution.active?.startedAt, "2026-07-31T10:00:00.000Z");
+  assert.equal(report.commentCount, 1);
+  assert.equal(report.artifactCount, 0);
+  assert.deepEqual(report.journal, [{
+    sequence: 1,
+    kind: "claim",
+    executionId: "execution-1",
+    createdAt: "2026-07-31T10:00:00.000Z",
+    role: "implementation",
+    ownerId: "owner-secret-value",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+  }]);
+  assert.doesNotMatch(JSON.stringify(report.journal), /operator context|ensemble-provider-state/u);
+});
+
 test("Vikunja discovery recovers active work through status and project routing drift", async () => {
   const api = new FakeVikunjaApi([
     task(1, "Status drift", [], 3),

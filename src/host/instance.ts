@@ -7,6 +7,37 @@ export interface InstanceGuard {
   release(): Promise<void>;
 }
 
+export interface InstanceGuardStatus {
+  readonly state: "stopped" | "running" | "stale" | "invalid";
+  readonly path: string;
+  readonly pid?: number;
+}
+
+export interface InstanceGuardInspectionOptions {
+  readonly processAlive?: (pid: number) => boolean;
+}
+
+export async function inspectInstanceGuard(
+  statePath: string,
+  options: InstanceGuardInspectionOptions = {},
+): Promise<InstanceGuardStatus> {
+  if (!isAbsolute(statePath)) throw new Error(`State path must be absolute: ${statePath}`);
+  const path = join(statePath, "service.lock");
+  const details = await lstat(path).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (!details) return Object.freeze({ state: "stopped", path });
+  if (!details.isFile() || details.isSymbolicLink()) return Object.freeze({ state: "invalid", path });
+  const source = await readFile(path, "utf8").catch(() => "");
+  const match = /^(\d+):[0-9a-f-]+$/iu.exec(source.trim());
+  if (!match) return Object.freeze({ state: "invalid", path });
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return Object.freeze({ state: "invalid", path });
+  const alive = options.processAlive ? options.processAlive(pid) : processIsAlive(pid);
+  return Object.freeze({ state: alive ? "running" : "stale", path, pid });
+}
+
 export async function acquireInstanceGuard(statePath: string): Promise<InstanceGuard> {
   if (!isAbsolute(statePath)) throw new Error(`State path must be absolute: ${statePath}`);
   const path = join(statePath, "service.lock");
@@ -42,6 +73,10 @@ async function liveOwner(path: string): Promise<boolean> {
   if (!match) return false;
   const pid = Number(match[1]);
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  return processIsAlive(pid);
+}
+
+function processIsAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }

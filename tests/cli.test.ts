@@ -27,6 +27,7 @@ test("CLI help and init create protected non-secret local configuration without 
 
   assert.equal(await runCli(["--help"], context), 0);
   assert.match(stdout.value, /service install/u);
+  assert.match(stdout.value, /inspect task/u);
   stdout.value = "";
   assert.equal(await runCli(["init", "--config", config, "--env-file", environment], context), 0);
   assert.match(await readFile(config, "utf8"), /type: vikunja/u);
@@ -42,6 +43,29 @@ test("CLI help and init create protected non-secret local configuration without 
   assert.equal(await runCli(["init", "--config", config, "--env-file", environment], context), 0);
   assert.equal(await readFile(environment, "utf8"), "VIKUNJA_API_TOKEN=preserve-me\n");
   assert.equal(stderr.value, "");
+});
+
+test("CLI status remains machine-readable without configuration and diagnostic flags are scoped", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ensemble-cli-status-"));
+  const stdout = new Output();
+  const stderr = new Output();
+  const context = { platform: "darwin" as const, home, io: { stdout, stderr } };
+  assert.equal(await runCli(["status", "--json"], context), 1);
+  const report = JSON.parse(stdout.value) as { controller: { state: string }; configurationError?: string };
+  assert.equal(report.controller.state, "stopped");
+  assert.equal(typeof report.configurationError, "string");
+  assert.equal(stderr.value, "");
+
+  stdout.value = "";
+  assert.equal(await runCli(["doctor", "--json"], context), 1);
+  const doctor = JSON.parse(stdout.value) as { healthy: boolean; checks: Array<{ id: string; status: string }> };
+  assert.equal(doctor.healthy, false);
+  assert.deepEqual(doctor.checks.map((check) => check.id), ["host.environment", "host.configuration"]);
+  assert.equal(doctor.checks.every((check) => check.status === "fail"), true);
+
+  stdout.value = "";
+  assert.equal(await runCli(["validate", "--journal"], context), 1);
+  assert.match(stderr.value, /only valid with inspect task/u);
 });
 
 test("CLI rejects relative paths and unsupported service management without leaking input", async () => {

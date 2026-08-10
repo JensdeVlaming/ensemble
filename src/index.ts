@@ -3,6 +3,7 @@ export * from "./domain/observability.ts";
 export * from "./observability/logging.ts";
 export * from "./host/configuration.ts";
 export * from "./host/instance.ts";
+export * from "./host/diagnostics.ts";
 export * from "./host/service.ts";
 export * from "./host/service-manager.ts";
 export * from "./providers/provider.ts";

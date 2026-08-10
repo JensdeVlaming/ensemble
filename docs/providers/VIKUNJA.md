@@ -191,6 +191,17 @@ Validation checks:
 Typical failures identify an invalid project/view, a missing label, an invalid
 token, or an inaccessible API endpoint.
 
+For read-only task diagnostics, use:
+
+```sh
+ensemble inspect task 32
+ensemble inspect task 32 --journal
+```
+
+The journal view exposes only ordered event kind, correlation, owner, lease,
+and outcome metadata. It does not expose the hidden HTML comment body or raw
+provider responses. Inspection never changes labels, comments, or task state.
+
 ## 8. Prepare a task
 
 For the simplest first run:
