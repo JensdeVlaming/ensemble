@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   generateLaunchdPlist,
+  generateLaunchdLogRotationPlist,
+  generateNewsyslogConfiguration,
   generateSystemdUnit,
   LaunchdServiceManager,
   serviceManagerFor,
@@ -60,6 +62,13 @@ test("launchd plist uses argv, restarts failures, and keeps credentials out", ()
   assert.doesNotMatch(plist, /VIKUNJA_API_TOKEN|secret-value/u);
 });
 
+test("macOS log rotation is bounded and scheduled", () => {
+  const plist = generateLaunchdLogRotationPlist(options.logPath!);
+  assert.match(plist, /newsyslog/u);
+  assert.match(plist, /3600/u);
+  assert.match(generateNewsyslogConfiguration(options.logPath!), /ensemble-error\.log 600 7 10240/u);
+});
+
 test("systemd installation is idempotent and testable through injected boundaries", async () => {
   const runner = new FakeRunner();
   const files = new FakeFiles();
@@ -80,6 +89,7 @@ test("launchd installation and platform selection stay behind one adapter", asyn
   await manager.install(options);
   assert.ok(runner.calls.some((call) => call.arguments_.includes("bootstrap")));
   assert.match(files.writes[0]?.path ?? "", /Library\/LaunchAgents\/dev\.ensemble\.service\.plist$/u);
+  assert.ok(files.writes.some((write) => write.path.endsWith("newsyslog.conf")));
   assert.ok(serviceManagerFor("linux", { runner, files }) instanceof SystemdServiceManager);
   assert.ok(serviceManagerFor("darwin", { userId: 501, home: "/Users/test", runner, files }) instanceof LaunchdServiceManager);
   assert.throws(() => serviceManagerFor("win32"), /unsupported/u);

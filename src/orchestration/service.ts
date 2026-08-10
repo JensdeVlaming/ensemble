@@ -39,6 +39,19 @@ export interface OrchestratorTickReport {
   readonly repositories: readonly RepositoryTickReport[];
 }
 
+export interface ServiceSnapshot {
+  readonly generatedAt: string;
+  readonly service: "starting" | "running" | "draining" | "stopped";
+  readonly readiness: boolean;
+  readonly repositories: readonly {
+    readonly id: string;
+    readonly initialized: boolean;
+    readonly lastError?: string;
+    readonly lastTick?: RepositoryTickReport;
+  }[];
+  readonly metrics: Readonly<Record<string, number>>;
+}
+
 export interface RepositoryShutdownReport {
   readonly repositoryId: string;
   readonly outcome: "completed" | "failed";
@@ -70,6 +83,7 @@ interface RegistrationState {
   tick?: Promise<RepositoryTickReport>;
   timer?: unknown;
   lastError?: string;
+  lastTick?: RepositoryTickReport;
 }
 
 const nodeSignals: ServiceSignalSource = {
@@ -94,6 +108,7 @@ export class OrchestratorService {
   #start?: Promise<void>;
   #shutdown?: Promise<OrchestratorShutdownReport>;
   #signalsInstalled = false;
+  readonly #metrics = new Map<string, number>();
 
   constructor(
     registrations: readonly OrchestratorRegistration[],
@@ -128,6 +143,22 @@ export class OrchestratorService {
 
   get state(): OrchestratorServiceState {
     return this.#state;
+  }
+
+  snapshot(now: () => Date = () => new Date()): ServiceSnapshot {
+    const service = this.#state === "idle" ? "starting" : this.#state;
+    return Object.freeze({
+      generatedAt: now().toISOString(),
+      service,
+      readiness: this.#state === "running" && this.#registrations.every((entry) => entry.initialized),
+      repositories: Object.freeze(this.#registrations.map((entry) => Object.freeze({
+        id: entry.registration.id,
+        initialized: entry.initialized,
+        ...(entry.lastError === undefined ? {} : { lastError: entry.lastError }),
+        ...(entry.lastTick === undefined ? {} : { lastTick: entry.lastTick }),
+      }))),
+      metrics: Object.freeze(Object.fromEntries(this.#metrics.entries())),
+    });
   }
 
   start(): Promise<void> {
@@ -209,6 +240,9 @@ export class OrchestratorService {
         }
         const report = await state.registration.scheduler.tick();
         state.lastError = undefined;
+        state.lastTick = Object.freeze({ repositoryId: state.registration.id, outcome: "completed",
+          dispatchedTaskIds: Object.freeze([...report.dispatchedTaskIds]) });
+        this.#increment("tick_success_total");
         this.#emit({ level: "info", event: "tick.completed", repositoryId: state.registration.id,
           data: { dispatchedCount: report.dispatchedTaskIds.length } });
         return Object.freeze({
@@ -221,6 +255,9 @@ export class OrchestratorService {
         });
       } catch (error) {
         state.lastError = errorMessage(error);
+        state.lastTick = Object.freeze({ repositoryId: state.registration.id, outcome: "failed",
+          dispatchedTaskIds: Object.freeze([]), error: state.lastError });
+        this.#increment("tick_failure_total");
         this.#emit({ level: "error", event: "tick.failed", repositoryId: state.registration.id,
           data: { errorCategory: "unexpected" } });
         return Object.freeze({
@@ -253,9 +290,11 @@ export class OrchestratorService {
         }
         state.initialized = true;
         state.lastError = undefined;
+        this.#increment("repository_startup_success_total");
         this.#emit({ level: "info", event: "repository.startup_succeeded", repositoryId: state.registration.id });
       } catch (error) {
         state.lastError = errorMessage(error);
+        this.#increment("repository_startup_failure_total");
         this.#emit({ level: "error", event: "repository.startup_failed", repositoryId: state.registration.id,
           data: { errorCategory: "configuration" } });
         throw error;
@@ -372,6 +411,8 @@ export class OrchestratorService {
   }
 
   #emit(event: Parameters<typeof emitOperational>[1]): void { emitOperational(this.#events, event); }
+
+  #increment(name: string): void { this.#metrics.set(name, (this.#metrics.get(name) ?? 0) + 1); }
 }
 
 interface Deferred<T> {

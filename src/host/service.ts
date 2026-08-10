@@ -11,6 +11,7 @@ import { GitRepositoryDriver, LocalWorkspaceManager } from "../execution/workspa
 import { JsonLinesOperationalLogSink, StructuredLogger } from "../observability/logging.ts";
 import type { JsonLinesWritable } from "../observability/logging.ts";
 import { OrchestratorService } from "../orchestration/service.ts";
+import type { ServiceSnapshot } from "../orchestration/service.ts";
 import type { OrchestratorRegistration } from "../orchestration/service.ts";
 import { Scheduler } from "../orchestration/scheduler.ts";
 import { VikunjaProvider } from "../providers/vikunja/adapter.ts";
@@ -63,6 +64,9 @@ export class HostController {
 
   run(): Promise<void> { return this.service.start(); }
   shutdown() { return this.service.shutdown(); }
+  snapshot(now?: () => Date): ServiceSnapshot { return this.service.snapshot(now); }
+  health(): boolean { return this.service.state !== "stopped"; }
+  readiness(): boolean { return this.service.snapshot().readiness; }
 }
 
 export async function buildHostController(

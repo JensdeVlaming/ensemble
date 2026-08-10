@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  integration:
+    if: ${{ secrets.ENSEMBLE_VIKUNJA_BASE_URL != '' && secrets.ENSEMBLE_VIKUNJA_TOKEN != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run integration
+        env:
+          ENSEMBLE_INTEGRATION: "1"
+          ENSEMBLE_VIKUNJA_BASE_URL: ${{ secrets.ENSEMBLE_VIKUNJA_BASE_URL }}
+          ENSEMBLE_VIKUNJA_TOKEN: ${{ secrets.ENSEMBLE_VIKUNJA_TOKEN }}
+          ENSEMBLE_VIKUNJA_PROJECT_ID: ${{ vars.ENSEMBLE_VIKUNJA_PROJECT_ID }}
+          ENSEMBLE_VIKUNJA_VIEW_ID: ${{ vars.ENSEMBLE_VIKUNJA_VIEW_ID }}
+          ENSEMBLE_CODEX_EXECUTABLE: ${{ vars.ENSEMBLE_CODEX_EXECUTABLE }}

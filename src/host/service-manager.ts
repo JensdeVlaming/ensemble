@@ -36,6 +36,7 @@ export interface PlatformServiceManager {
   stop(): Promise<void>;
   restart(): Promise<void>;
   status(): Promise<ServiceCommandResult>;
+  verify(): Promise<ServiceCommandResult>;
   logs(): Promise<void>;
 }
 
@@ -116,12 +117,14 @@ export class SystemdServiceManager implements PlatformServiceManager {
   async stop(): Promise<void> { await requireSuccess(this.#runner, "/usr/bin/systemctl", ["stop", "ensemble.service"], "stop Ensemble"); }
   async restart(): Promise<void> { await requireSuccess(this.#runner, "/usr/bin/systemctl", ["restart", "ensemble.service"], "restart Ensemble"); }
   status(): Promise<ServiceCommandResult> { return this.#runner.run("/usr/bin/systemctl", ["status", "--no-pager", "ensemble.service"]); }
+  verify(): Promise<ServiceCommandResult> { return this.#runner.run("/usr/bin/systemctl", ["is-enabled", "ensemble.service"]); }
   async logs(): Promise<void> { await requireSuccess(this.#runner, "/usr/bin/journalctl", ["-u", "ensemble.service", "-n", "200", "-f"],
     "read Ensemble logs", true); }
 }
 
 export class LaunchdServiceManager implements PlatformServiceManager {
   static readonly label = "dev.ensemble.service";
+  static readonly logRotationLabel = "dev.ensemble.log-rotation";
   readonly #userId: number;
   readonly #home: string;
   readonly #runner: ServiceProcessRunner;
@@ -139,6 +142,7 @@ export class LaunchdServiceManager implements PlatformServiceManager {
   get plistPath(): string { return resolve(this.#home, "Library", "LaunchAgents", `${LaunchdServiceManager.label}.plist`); }
   get domain(): string { return `gui/${this.#userId}`; }
   get target(): string { return `${this.domain}/${LaunchdServiceManager.label}`; }
+  get logRotationPlistPath(): string { return resolve(this.#home, "Library", "LaunchAgents", `${LaunchdServiceManager.logRotationLabel}.plist`); }
 
   async install(options: ServiceInstallOptions): Promise<void> {
     validateInstallOptions(options);
@@ -146,18 +150,26 @@ export class LaunchdServiceManager implements PlatformServiceManager {
     this.#logPath = options.logPath;
     await this.#files.mkdir(options.logPath, { recursive: true, mode: 0o700 });
     await this.#files.write(this.plistPath, generateLaunchdPlist(options), 0o600);
+    await this.#files.write(this.logRotationPlistPath, generateLaunchdLogRotationPlist(options.logPath), 0o600);
+    await this.#files.write(resolve(options.logPath, "newsyslog.conf"), generateNewsyslogConfiguration(options.logPath), 0o600);
     await this.#runner.run("/bin/launchctl", ["bootout", this.domain, this.plistPath]);
     await requireSuccess(this.#runner, "/bin/launchctl", ["bootstrap", this.domain, this.plistPath], "install Ensemble LaunchAgent");
     await requireSuccess(this.#runner, "/bin/launchctl", ["enable", this.target], "enable Ensemble LaunchAgent");
+    await this.#runner.run("/bin/launchctl", ["bootout", this.domain, this.logRotationPlistPath]);
+    await requireSuccess(this.#runner, "/bin/launchctl", ["bootstrap", this.domain, this.logRotationPlistPath], "install Ensemble log rotation");
+    await requireSuccess(this.#runner, "/bin/launchctl", ["enable", `${this.domain}/${LaunchdServiceManager.logRotationLabel}`], "enable Ensemble log rotation");
   }
   async uninstall(): Promise<void> {
     await this.#runner.run("/bin/launchctl", ["bootout", this.domain, this.plistPath]);
+    await this.#runner.run("/bin/launchctl", ["bootout", this.domain, this.logRotationPlistPath]);
     await this.#files.remove(this.plistPath);
+    await this.#files.remove(this.logRotationPlistPath);
   }
   async start(): Promise<void> { await requireSuccess(this.#runner, "/bin/launchctl", ["kickstart", "-k", this.target], "start Ensemble"); }
   async stop(): Promise<void> { await requireSuccess(this.#runner, "/bin/launchctl", ["kill", "SIGTERM", this.target], "stop Ensemble"); }
   async restart(): Promise<void> { await this.start(); }
   status(): Promise<ServiceCommandResult> { return this.#runner.run("/bin/launchctl", ["print", this.target]); }
+  verify(): Promise<ServiceCommandResult> { return this.#runner.run("/bin/launchctl", ["print", this.target]); }
   async logs(): Promise<void> {
     const directory = this.#logPath ?? resolve(this.#home, "Library", "Logs", "Ensemble");
     await requireSuccess(this.#runner, "/usr/bin/tail", ["-n", "200", "-f",
@@ -237,6 +249,24 @@ export function generateLaunchdPlist(options: ServiceInstallOptions): string {
   ].join("\n");
 }
 
+export function generateLaunchdLogRotationPlist(logPath: string): string {
+  validateAbsolutePath(logPath, "logPath");
+  const configuration = resolve(logPath, "newsyslog.conf");
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    "<plist version=\"1.0\"><dict>",
+    "<key>Label</key>", `  <string>${xml(LaunchdServiceManager.logRotationLabel)}</string>`,
+    "<key>ProgramArguments</key><array>", "  <string>/usr/bin/newsyslog</string>", `  <string>-f</string><string>${xml(configuration)}</string>`, "</array>",
+    "<key>StartInterval</key><integer>3600</integer>",
+    "</dict></plist>", "",
+  ].join("\n");
+}
+
+export function generateNewsyslogConfiguration(logPath: string): string {
+  validateAbsolutePath(logPath, "logPath");
+  return `${resolve(logPath, "ensemble.log")} 600 7 10240 * Z\n${resolve(logPath, "ensemble-error.log")} 600 7 10240 * Z\n`;
+}
+
 function validateInstallOptions(options: ServiceInstallOptions): void {
   for (const [name, value] of Object.entries(options)) {
     if (name === "stopTimeoutSeconds" || name === "logPath" && value === undefined) continue;
@@ -244,6 +274,10 @@ function validateInstallOptions(options: ServiceInstallOptions): void {
       throw new Error(`Service installation requires a safe absolute ${name}`);
     }
   }
+}
+
+function validateAbsolutePath(value: string, name: string): void {
+  if (!value.startsWith("/") || /[\0\r\n]/u.test(value)) throw new Error(`${name} must be a safe absolute path`);
 }
 
 function systemdArgument(value: string): string {
