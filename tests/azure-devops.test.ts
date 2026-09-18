@@ -206,6 +206,41 @@ test("Azure DevOps refresh is deterministic and distinguishes missing from unrea
   assert.deepEqual(unreadable.get("1"), { kind: "unreadable", error: "Azure DevOps read failed (500)" });
 });
 
+test("Azure DevOps refresh recovers a readable work item omitted by the batch API", async () => {
+  const api = new FakeAzureDevOpsApi([
+    workItem(1, "One", "New", "", undefined, 1),
+    workItem(2, "Two", "New", "", undefined, 2),
+  ], [1, 2]);
+  api.omitBatchIds.add(2);
+
+  const refreshed = await providerFor(api, "unused").refreshTasks(["2", "1"]);
+
+  assert.deepEqual([...refreshed.keys()], ["1", "2"]);
+  assert.equal(refreshed.get("1")?.kind, "current");
+  assert.equal(refreshed.get("2")?.kind, "current");
+  assert.deepEqual(api.itemReads, [2]);
+});
+
+test("Azure DevOps refresh classifies an omitted work item as missing only after an individual 404", async () => {
+  const api = new FakeAzureDevOpsApi([], []);
+
+  const refreshed = await providerFor(api, "unused").refreshTasks(["42"]);
+
+  assert.deepEqual(refreshed.get("42"), { kind: "missing" });
+  assert.deepEqual(api.itemReads, [42]);
+});
+
+test("Azure DevOps refresh keeps an omitted work item unreadable after an individual transient error", async () => {
+  const api = new FakeAzureDevOpsApi([workItem(7, "Seven", "New", "", undefined, 7)], [7]);
+  api.omitBatchIds.add(7);
+  api.itemReadFailures.set(7, 503);
+
+  const refreshed = await providerFor(api, "unused").refreshTasks(["7"]);
+
+  assert.deepEqual(refreshed.get("7"), { kind: "unreadable", error: "Azure DevOps read failed (503)" });
+  assert.deepEqual(api.itemReads, [7]);
+});
+
 test("Azure DevOps revision-guarded claims have one winner and preserve takeover identity", async () => {
   const api = new FakeAzureDevOpsApi([workItem(1, "Race", "New", "", undefined, 1)], [1]);
   api.patchGate = deferred();
@@ -254,6 +289,66 @@ test("Azure DevOps terminal synchronization is durable, restart-safe, and idempo
   assert.deepEqual((await restarted.getComments("1")).map((comment) => comment.body), ["Validation passed"]);
   assert.deepEqual(await restarted.getArtifacts("1"), completion.artifacts);
   assert.equal(api.comments.get(1)?.length, 1);
+});
+
+test("Azure DevOps lease renewal state stays bounded and reconstructs active and terminal state", async () => {
+  const api = new FakeAzureDevOpsApi([workItem(1, "Work", "New", "", undefined, 1)], [1]);
+  const executionIds = ["execution-history", "execution-active"];
+  const provider = providerFor(api, "unused", { executionId: () => executionIds.shift()! });
+  const historical = await provider.beginExecution("1", "implementation", "running", {
+    ownerId: "worker-history", observedAt: "2026-09-18T10:00:00.000Z", expiresAt: "2026-09-18T10:05:00.000Z",
+    expected: { kind: "none" },
+  });
+  const completion: ExecutionCompletion = {
+    record: { id: historical.id, role: historical.role, outcome: "approved", summary: "Done", finishedAt: "2026-09-18T10:01:00.000Z" },
+    comments: [], artifacts: [], status: "completed",
+  };
+  await provider.completeExecution("1", historical.id, {
+    ownerId: historical.ownerId!, leaseExpiresAt: historical.leaseExpiresAt!, observedAt: "2026-09-18T10:01:00.000Z",
+  }, completion);
+  let active = await provider.beginExecution("1", "verification", "running", {
+    ownerId: "worker-active", observedAt: "2026-09-18T10:02:00.000Z", expiresAt: "2026-09-18T10:03:00.000Z",
+    expected: { kind: "none" },
+  });
+  let firstRenewalSize = 0;
+  let expectedExpiry = active.leaseExpiresAt!;
+  for (let index = 0; index < 500; index += 1) {
+    const previousExpiry = Date.parse(active.leaseExpiresAt!);
+    expectedExpiry = new Date(previousExpiry + 60_000).toISOString();
+    active = await provider.renewExecutionLease("1", active.id, {
+      ownerId: active.ownerId!,
+      observedAt: new Date(previousExpiry - 30_000).toISOString(),
+      expiresAt: expectedExpiry,
+      expected: { kind: "leased", executionId: active.id, role: active.role, startedAt: active.startedAt,
+        ownerId: active.ownerId!, leaseExpiresAt: active.leaseExpiresAt! },
+    });
+    if (index === 0) firstRenewalSize = String(api.items.get(1)?.fields["Custom.EnsembleState"]).length;
+  }
+
+  const serialized = String(api.items.get(1)?.fields["Custom.EnsembleState"]);
+  assert.equal(serialized.length, firstRenewalSize);
+  assert.equal((JSON.parse(serialized) as { events: unknown[] }).events.length, 4);
+  assert.equal(active.leaseExpiresAt, expectedExpiry);
+  assert.equal(active.leaseExpiresAt, "2026-09-18T18:23:00.000Z");
+  const restarted = providerFor(api, "unused");
+  const reconstructed = await restarted.getExecutionState("1");
+  assert.deepEqual(reconstructed.history.map((record) => record.id), ["execution-history"]);
+  assert.deepEqual(reconstructed.active, active);
+  await restarted.completeExecution("1", historical.id, {
+    ownerId: historical.ownerId!, leaseExpiresAt: historical.leaseExpiresAt!, observedAt: "2026-09-18T10:01:00.000Z",
+  }, completion);
+  assert.deepEqual((await restarted.getExecutionState("1")).active, active);
+  const takeoverObservedAt = active.leaseExpiresAt!;
+  const takeover = await restarted.beginExecution("1", "ignored", "running", {
+    ownerId: "worker-takeover", observedAt: takeoverObservedAt,
+    expiresAt: new Date(Date.parse(takeoverObservedAt) + 60_000).toISOString(),
+    expected: { kind: "leased", executionId: active.id, role: active.role, startedAt: active.startedAt,
+      ownerId: active.ownerId!, leaseExpiresAt: active.leaseExpiresAt! },
+  });
+  assert.equal(takeover.id, active.id);
+  assert.equal(takeover.startedAt, active.startedAt);
+  assert.equal(takeover.ownerId, "worker-takeover");
+  assert.deepEqual((await restarted.getExecutionState("1")).history.map((record) => record.id), ["execution-history"]);
 });
 
 test("Azure DevOps rejects malformed durable state and redacts runtime tool failures", async () => {
@@ -312,6 +407,8 @@ class FakeAzureDevOpsApi {
   readonly stateQueries: string[] = [];
   readonly queryTops: string[] = [];
   readonly omitBatchIds = new Set<number>();
+  readonly itemReads: number[] = [];
+  readonly itemReadFailures = new Map<number, number>();
   savedQueryPayload?: unknown;
   stateQueryPayload?: unknown;
   failBatch = false;
@@ -355,6 +452,11 @@ class FakeAzureDevOpsApi {
     const itemMatch = /^_apis\/wit\/workitems\/(\d+)$/u.exec(path);
     if (itemMatch) {
       const id = Number(itemMatch[1]);
+      if (method === "GET") {
+        this.itemReads.push(id);
+        const failure = this.itemReadFailures.get(id);
+        if (failure !== undefined) return response({ message: "temporary failure" }, failure);
+      }
       const item = this.items.get(id);
       if (!item) return response({ message: "not found" }, 404);
       if (method === "GET") return response(structuredClone(item));

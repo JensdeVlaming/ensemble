@@ -39,6 +39,7 @@ test("host provider factory constructs the configured Azure DevOps Services prov
 
   const provider = controller.repositories[0]?.provider;
   assert.ok(provider instanceof AzureDevOpsProvider);
+  assert.equal(typeof controller.service.tick, "function");
   assert.equal(provider.client.baseUrl.toString(), "https://dev.azure.com/example-org/Example%20Project/");
   assert.deepEqual(provider.requiredTags, ["ensemble"]);
   assert.equal(provider.priorityField, "Microsoft.VSTS.Common.Priority");

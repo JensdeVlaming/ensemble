@@ -42,7 +42,7 @@ type HostedProvider = ProviderAdapter & {
   validateConfiguration(): Promise<void>;
 };
 
-interface HostServiceLifecycle {
+export interface HostServiceLifecycle {
   readonly state: OrchestratorService["state"];
   start(): Promise<void>;
   shutdown(): ReturnType<OrchestratorService["shutdown"]>;
@@ -69,9 +69,9 @@ const ignoredServiceSignals = Object.freeze({
   removeListener: () => undefined,
 });
 
-export class HostController {
+export class HostController<TService extends HostServiceLifecycle = OrchestratorService> {
   readonly configuration: HostConfiguration;
-  readonly service: HostServiceLifecycle;
+  readonly service: TService;
   readonly repositories: readonly HostRepositoryRuntime[];
   readonly runtimes: RuntimeRegistry;
   readonly secrets: HostSecretResolver;
@@ -88,7 +88,7 @@ export class HostController {
 
   constructor(
     configuration: HostConfiguration,
-    service: HostServiceLifecycle,
+    service: TService,
     repositories: readonly HostRepositoryRuntime[],
     runtimes: RuntimeRegistry,
     secrets: HostSecretResolver,

@@ -193,9 +193,21 @@ export class AzureDevOpsProvider implements ProviderAdapter {
       for (const id of ordered) result.set(id, { kind: "unreadable", error: safeError(error) });
       return result;
     }
-    const normalized = await this.#normalizeItems(raw);
+    const returnedIds = new Set(raw.map((item) => String(requiredNumber(validateWorkItem(item).id, "work item id"))));
+    const recovered: AzureWorkItem[] = [];
+    const omitted = new Map<TaskId, TaskRefreshResult>();
+    for (const id of ordered) {
+      if (returnedIds.has(id)) continue;
+      try { recovered.push(await this.#getRawItem(id)); }
+      catch (error) {
+        omitted.set(id, error instanceof AzureDevOpsApiError && error.status === 404
+          ? { kind: "missing" }
+          : { kind: "unreadable", error: safeError(error) });
+      }
+    }
+    const normalized = await this.#normalizeItems([...raw, ...recovered]);
     const byId = new Map(normalized.map((task) => [task.id, task]));
-    for (const id of ordered) result.set(id, byId.has(id) ? { kind: "current", task: byId.get(id)! } : { kind: "missing" });
+    for (const id of ordered) result.set(id, byId.has(id) ? { kind: "current", task: byId.get(id)! } : omitted.get(id)!);
     return result;
   }
 
@@ -333,9 +345,10 @@ export class AzureDevOpsProvider implements ProviderAdapter {
     }
     const event: ProviderEvent = Object.freeze({ kind: "lease", executionId, role: before.active.role, expected: lease.expected,
       ownerId: lease.ownerId, leaseExpiresAt: lease.expiresAt, observedAt: lease.observedAt, createdAt: this.#now().toISOString() });
-    try { await this.#patchState(item, [...persisted.events, event], undefined, `Ensemble renewed ${executionId}`); }
+    const events = compactLeaseRenewal(persisted.events, event);
+    try { await this.#patchState(item, events, undefined, `Ensemble renewed ${executionId}`); }
     catch (error) { throw await this.#claimError(id, error); }
-    return foldState([...persisted.events, event]).state.active!;
+    return foldState(events).state.active!;
   }
 
   async completeExecution(id: TaskId, executionId: string, lease: ExecutionLeaseGuard, completion: ExecutionCompletion): Promise<void> {
@@ -625,6 +638,24 @@ function foldState(events: readonly ProviderEvent[]): FoldedState {
   const history = [...records.values()].sort(compareRecords).map(freezeRecord);
   return Object.freeze({ state: Object.freeze({ ...(active ? { active } : {}), history: Object.freeze(history),
     ...(history.at(-1)?.nextRole ? { nextRole: history.at(-1)!.nextRole } : {}) }), terminals });
+}
+
+function compactLeaseRenewal(events: readonly ProviderEvent[], renewal: ProviderEvent): readonly ProviderEvent[] {
+  let claimIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.kind === "claim" && event.executionId === renewal.executionId) {
+      claimIndex = index;
+      break;
+    }
+  }
+  const priorLease = events.slice(claimIndex + 1)
+    .find((event) => event.kind === "lease" && event.executionId === renewal.executionId);
+  const compacted = events.filter((event, index) => index <= claimIndex
+    || event.kind !== "lease" || event.executionId !== renewal.executionId);
+  return Object.freeze([...compacted, Object.freeze(priorLease
+    ? { ...renewal, expected: priorLease.expected, observedAt: priorLease.observedAt, createdAt: priorLease.createdAt }
+    : renewal)]);
 }
 
 function validateEvent(value: unknown): ProviderEvent {
