@@ -68,7 +68,7 @@ export async function diagnoseHost(
       checks.push(result(`runtime.${configured.name}.protocol`, "fail", "Runtime does not support a non-dispatching diagnostic"));
       continue;
     }
-    await check(checks, `runtime.${configured.name}.protocol`, "Codex App Server initialize and account checks succeeded",
+    await check(checks, `runtime.${configured.name}.protocol`, `${configured.type} protocol checks succeeded`,
       () => runtime.diagnose!({ cwd: diagnosticCwd }), redact);
   }
 

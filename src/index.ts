@@ -20,3 +20,6 @@ export * from "./runtimes/runtime.ts";
 export * from "./runtimes/scripted/runtime.ts";
 export * from "./runtimes/codex/runtime.ts";
 export * from "./runtimes/codex/app-server-transport.ts";
+export * from "./runtimes/opencode/runtime.ts";
+export * from "./runtimes/opencode/server-transport.ts";
+export * from "./runtimes/opencode/tool-bridge.ts";

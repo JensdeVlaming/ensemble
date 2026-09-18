@@ -86,7 +86,11 @@ ensemble init
 ```
 
 This creates a configuration template, protected environment file, state
-directory, and workspace directory. Existing files are not overwritten.
+directory, and workspace directory. In an interactive terminal it asks whether
+to configure Codex or OpenCode. For automation use `ensemble init --runtime
+codex` or `ensemble init --runtime opencode`; non-interactive invocation without
+the option retains Codex as its compatibility default. Existing files are not
+overwritten.
 
 ### macOS defaults
 
@@ -498,9 +502,11 @@ ensemble doctor
 ```
 
 `doctor` checks the configured filesystem, state directory, instance guard,
-provider read access, repository configuration, runtime settings, and an actual
-Codex App Server initialize plus account-state handshake. It does not start a
-thread, create a turn, claim a task, or test provider write permissions.
+provider read access, repository configuration, runtime settings, and the
+selected runtime's non-dispatching protocol check. Codex checks initialization
+and account state; OpenCode checks server health without creating a session. It
+does not claim a task, dispatch a model request, or test provider write
+permissions.
 
 Use the read-only operational commands when diagnosing a running or stopped
 controller:

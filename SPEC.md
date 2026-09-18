@@ -91,6 +91,7 @@ Ensemble MUST NOT depend on a specific AI system.
 Supported runtimes may include:
 
 * Codex
+* OpenCode
 * Claude Code
 * OpenHands
 * future runtimes

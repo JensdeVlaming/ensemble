@@ -54,8 +54,7 @@ workers within repository bounds, persist cancellations, and release the
 single-instance guard.
 
 `ensemble doctor` performs non-dispatching filesystem, provider,
-repository-configuration, Codex App Server initialization, and Codex account
-checks. `ensemble status` reads the local instance guard without contacting the
+repository-configuration, and runtime-specific protocol checks. `ensemble status` reads the local instance guard without contacting the
 provider. `ensemble inspect task <id>` reconstructs durable provider state;
 add `--journal` for safe ordered event metadata or `--json` for automation.
 Raw hidden provider comments are never emitted.
@@ -101,11 +100,11 @@ repositories:
       type: provider-specific
 ```
 
-The package also includes a Vikunja-and-Codex-based example at
-`examples/host-config.yaml` plus a non-secret
+The package also includes Vikunja examples for Codex at
+`examples/host-config.yaml` and OpenCode at `examples/host-config-opencode.yaml`, plus a non-secret
 `examples/ensemble.env.example` template. Follow the dedicated
 [Vikunja guide](docs/providers/VIKUNJA.md) and
-[Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md) for those adapter fields.
+[runtime guide](docs/runtimes/README.md) for those adapter fields.
 
 Polling, worker, retry, turn, stall, cancellation, and drain bounds remain in
 the repository-owned workflow configuration so they hot-reload atomically with
@@ -147,7 +146,8 @@ src/
 └── runtimes/
     ├── runtime.ts          common runtime contract
     ├── scripted/           test/reference runtime
-    └── codex/              Codex runtime and App Server transport
+    ├── codex/              Codex runtime and App Server transport
+    └── opencode/           OpenCode runtime, server transport and MCP bridge
 ```
 
 - `Scheduler` polls semantic workflow candidates, deterministically orders them,
@@ -219,7 +219,8 @@ ID, regardless of status or retry exhaustion.
 
 Runtime adapters have separate installation, authentication, environment and
 protocol instructions. See the [runtime guides](docs/runtimes/README.md),
-including the detailed [Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md). The main
+including the [Codex App Server](docs/runtimes/CODEX_APP_SERVER.md) and
+[OpenCode Server](docs/runtimes/OPENCODE_SERVER.md) guides. The main
 Starter Guide describes only the shared Runtime contract and portable role
 lifecycle; adapter-specific setup stays in its runtime guide.
 

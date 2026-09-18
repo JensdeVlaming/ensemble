@@ -42,7 +42,16 @@ export interface HostCodexAppServerRuntimeConfiguration {
   readonly environment: HostRuntimeEnvironment;
 }
 
-export type HostRuntimeConfiguration = HostCodexAppServerRuntimeConfiguration;
+export interface HostOpenCodeServerRuntimeConfiguration {
+  readonly name: string;
+  readonly type: "opencode-server";
+  readonly executable: string;
+  readonly serverArguments: readonly string[];
+  readonly requestTimeoutMs: number;
+  readonly environment: HostRuntimeEnvironment;
+}
+
+export type HostRuntimeConfiguration = HostCodexAppServerRuntimeConfiguration | HostOpenCodeServerRuntimeConfiguration;
 
 export interface HostVikunjaConfiguration {
   readonly type: "vikunja";
@@ -198,12 +207,15 @@ export function runtimeEnvironment(
 function runtimeAt(value: unknown, path: string): HostRuntimeConfiguration {
   const runtime = mapping(value, path, true);
   const type = text(runtime.type, `${path}.type`);
-  if (type !== "codex-app-server") throw new Error(`Unsupported runtime type at ${path}.type: ${type}`);
+  if (type !== "codex-app-server" && type !== "opencode-server") {
+    throw new Error(`Unsupported runtime type at ${path}.type: ${type}`);
+  }
   exactKeys(runtime, ["name", "type", "executable", "serverArguments", "requestTimeoutMs", "environment"], path);
   const environment = mapping(runtime.environment, `${path}.environment`, false);
   exactKeys(environment, ["inherit"], `${path}.environment`);
   const inherit = stringList(environment.inherit, `${path}.environment.inherit`, [
-    "PATH", "HOME", "CODEX_HOME", "TMPDIR", "LANG", "LC_ALL",
+    "PATH", "HOME", ...(type === "codex-app-server" ? ["CODEX_HOME"] : ["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]),
+    "TMPDIR", "LANG", "LC_ALL",
   ]);
   for (const name of inherit) {
     if (forbiddenRuntimeEnvironment.test(name)) throw new Error(`Forbidden runtime environment variable: ${name}`);
@@ -214,7 +226,8 @@ function runtimeAt(value: unknown, path: string): HostRuntimeConfiguration {
     environment: { inherit },
   };
   return { ...shared, type,
-    serverArguments: stringList(runtime.serverArguments, `${path}.serverArguments`, ["app-server", "--listen", "stdio://"]),
+    serverArguments: stringList(runtime.serverArguments, `${path}.serverArguments`,
+      type === "codex-app-server" ? ["app-server", "--listen", "stdio://"] : ["serve", "--pure"]),
     requestTimeoutMs: positiveInteger(runtime.requestTimeoutMs ?? 30_000, `${path}.requestTimeoutMs`),
   };
 }

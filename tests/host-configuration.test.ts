@@ -5,7 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   defaultHostPaths,
+  buildHostController,
   loadEnvironmentFile,
+  OpenCodeRuntime,
   parseHostConfiguration,
   runtimeEnvironment,
 } from "../src/index.ts";
@@ -71,6 +73,30 @@ test("host configuration is strict, immutable, and keeps runtime selection opera
 test("host configuration rejects the removed Codex CLI runtime", () => {
   const source = host().replace("type: codex-app-server", "type: codex-cli");
   assert.throws(() => parseHostConfiguration(source), /Unsupported runtime type/u);
+});
+
+test("host configuration accepts OpenCode server runtimes with secure XDG defaults", () => {
+  const source = host().replace("name: codex", "name: opencode")
+    .replace("type: codex-app-server", "type: opencode-server")
+    .replace("/usr/local/bin/codex", "/usr/local/bin/opencode")
+    .replace("serverArguments: [app-server, --listen, stdio://]", "serverArguments: [serve, --pure]")
+    .replace("[PATH, HOME, CODEX_HOME, SSH_AUTH_SOCK]", "[PATH, HOME, XDG_DATA_HOME, XDG_CONFIG_HOME]");
+  const configuration = parseHostConfiguration(source);
+  assert.equal(configuration.runtimes[0]?.type, "opencode-server");
+  assert.deepEqual(configuration.runtimes[0]?.serverArguments, ["serve", "--pure"]);
+  assert.throws(() => parseHostConfiguration(source.replace("XDG_DATA_HOME", "OPENAI_API_KEY")), /Forbidden runtime environment/u);
+});
+
+test("host controller registers the configured OpenCode runtime", async () => {
+  const source = host().replace("name: codex", "name: opencode")
+    .replace("type: codex-app-server", "type: opencode-server")
+    .replace("/usr/local/bin/codex", "/usr/local/bin/opencode")
+    .replace("serverArguments: [app-server, --listen, stdio://]", "serverArguments: [serve, --pure]");
+  const controller = await buildHostController(parseHostConfiguration(source), {
+    environment: { VIKUNJA_API_TOKEN: "test-token", PATH: "/bin", HOME: "/home" },
+    writable: { write: () => true },
+  });
+  assert.equal(controller.runtimes.get("opencode") instanceof OpenCodeRuntime, true);
 });
 
 test("environment files are non-shell, bounded, duplicate-free, and permission checked", async () => {

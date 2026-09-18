@@ -1,0 +1,30 @@
+version: 1
+service:
+  startupTimeoutMs: 30000
+  stopTimeoutSeconds: 60
+logging:
+  level: info
+workspace:
+  root: /var/lib/ensemble/workspaces
+  preserve: true
+  gitExecutable: /usr/bin/git
+runtimes:
+  - name: opencode
+    type: opencode-server
+    executable: /usr/local/bin/opencode
+    serverArguments: [serve, --pure]
+    requestTimeoutMs: 30000
+    environment:
+      inherit: [PATH, HOME, XDG_DATA_HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, TMPDIR, LANG, LC_ALL]
+repositories:
+  - id: ensemble
+    url: https://github.com/example/ensemble.git
+    branch: main
+    configurationPath: /srv/ensemble
+    provider:
+      type: vikunja
+      baseUrl: https://vikunja.example.test
+      token: $VIKUNJA_API_TOKEN
+      projectId: 1
+      viewId: 1
+      requiredLabels: []

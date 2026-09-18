@@ -4,6 +4,7 @@ import { constants, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
 import {
   defaultHostPaths,
   loadEnvironmentFile,
@@ -36,6 +37,7 @@ export interface CliContext {
   readonly nodeExecutable?: string;
   readonly cliEntrypoint?: string;
   readonly io?: CliIo;
+  readonly selectRuntime?: () => Promise<"codex" | "opencode">;
 }
 
 interface ParsedArguments {
@@ -45,6 +47,7 @@ interface ParsedArguments {
   readonly repositoryId?: string;
   readonly json: boolean;
   readonly journal: boolean;
+  readonly runtime?: "codex" | "opencode";
   readonly configPath: string;
   readonly environmentPath: string;
   readonly paths: HostPaths;
@@ -59,7 +62,8 @@ export async function runCli(arguments_: readonly string[], context: CliContext 
     validateCommandArguments(parsed);
     if (parsed.command === "help") { io.stdout.write(help()); return 0; }
     if (parsed.command === "init") {
-      await initializeFiles(parsed, platform, context.environment ?? process.env);
+      const runtime = parsed.runtime ?? await selectRuntime(context);
+      await initializeFiles(parsed, platform, context.environment ?? process.env, runtime);
       io.stdout.write(`Initialized Ensemble configuration at ${parsed.configPath}\n`);
       return 0;
     }
@@ -208,12 +212,17 @@ function parseArguments(arguments_: readonly string[], defaults: HostPaths): Par
   let repositoryId: string | undefined;
   let json = false;
   let journal = false;
+  let runtime: "codex" | "opencode" | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index]!;
-    if (argument === "--config" || argument === "--env-file" || argument === "--repository") {
+    if (argument === "--config" || argument === "--env-file" || argument === "--repository" || argument === "--runtime") {
       const value = arguments_[index + 1];
       if (!value) throw new Error(`Missing value for ${argument}`);
       if (argument === "--repository") repositoryId = value;
+      else if (argument === "--runtime") {
+        if (value !== "codex" && value !== "opencode") throw new Error("--runtime must be codex or opencode");
+        runtime = value;
+      }
       else {
         if (!value.startsWith("/")) throw new Error(`${argument} requires an absolute path`);
         if (argument === "--config") configPath = resolve(value);
@@ -224,7 +233,8 @@ function parseArguments(arguments_: readonly string[], defaults: HostPaths): Par
     }
     if (argument === "--json") { json = true; continue; }
     if (argument === "--journal") { journal = true; continue; }
-    if (argument === "--help" || argument === "-h") return { command: "help", configPath, environmentPath, paths: defaults, json, journal };
+    if (argument === "--help" || argument === "-h") return { command: "help", configPath, environmentPath, paths: defaults, json, journal,
+      ...(runtime ? { runtime } : {}) };
     if (argument.startsWith("-")) throw new Error(`Unknown option: ${argument}`);
     positionals.push(argument);
   }
@@ -236,6 +246,7 @@ function parseArguments(arguments_: readonly string[], defaults: HostPaths): Par
     ...(repositoryId ? { repositoryId } : {}),
     json,
     journal,
+    ...(runtime ? { runtime } : {}),
     configPath,
     environmentPath,
     paths: defaults,
@@ -254,6 +265,7 @@ function validateCommandArguments(parsed: ParsedArguments): void {
   }
   if (parsed.journal && parsed.command !== "inspect") throw new Error("--journal is only valid with inspect task");
   if (parsed.repositoryId && parsed.command !== "inspect") throw new Error("--repository is only valid with inspect task");
+  if (parsed.runtime && parsed.command !== "init") throw new Error("--runtime is only valid with init");
   if (parsed.json && !["doctor", "status", "inspect"].includes(parsed.command)) {
     throw new Error("--json is only valid with doctor, status, or inspect task");
   }
@@ -263,6 +275,7 @@ async function initializeFiles(
   parsed: ParsedArguments,
   platform: NodeJS.Platform,
   environment: Readonly<Record<string, string | undefined>>,
+  runtime: "codex" | "opencode",
 ): Promise<void> {
   await Promise.all([
     mkdir(dirname(parsed.configPath), { recursive: true, mode: 0o750 }),
@@ -271,12 +284,12 @@ async function initializeFiles(
     ...(parsed.paths.logs ? [mkdir(parsed.paths.logs, { recursive: true, mode: 0o700 })] : []),
   ]);
   const git = await findExecutable("git", environment.PATH) ?? "/usr/bin/git";
-  const codex = await findExecutable("codex", environment.PATH) ?? "/usr/local/bin/codex";
-  await createExclusive(parsed.configPath, hostTemplate(parsed.paths, git, codex), platform === "linux" ? 0o640 : 0o600);
+  const runtimeExecutable = await findExecutable(runtime, environment.PATH) ?? `/usr/local/bin/${runtime}`;
+  await createExclusive(parsed.configPath, hostTemplate(parsed.paths, git, runtime, runtimeExecutable), platform === "linux" ? 0o640 : 0o600);
   await createExclusive(parsed.environmentPath, [
     "# Ensemble controller values; this file is not shell syntax.",
     "VIKUNJA_API_TOKEN=",
-    `CODEX_HOME=${resolve(parsed.paths.state, "codex")}`,
+    ...(runtime === "codex" ? [`CODEX_HOME=${resolve(parsed.paths.state, "codex")}`] : []),
     "",
   ].join("\n"), 0o600);
 }
@@ -301,7 +314,20 @@ async function findExecutable(name: string, path: string | undefined): Promise<s
   return undefined;
 }
 
-function hostTemplate(paths: HostPaths, git: string, codex: string): string {
+function hostTemplate(paths: HostPaths, git: string, runtime: "codex" | "opencode", executable: string): string {
+  const runtimeBlock = runtime === "codex" ? `  - name: codex
+    type: codex-app-server
+    executable: ${yaml(executable)}
+    serverArguments: [app-server, --listen, stdio://]
+    requestTimeoutMs: 30000
+    environment:
+      inherit: [PATH, HOME, CODEX_HOME, TMPDIR, LANG, LC_ALL]` : `  - name: opencode
+    type: opencode-server
+    executable: ${yaml(executable)}
+    serverArguments: [serve, --pure]
+    requestTimeoutMs: 30000
+    environment:
+      inherit: [PATH, HOME, XDG_DATA_HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, TMPDIR, LANG, LC_ALL]`;
   return `version: 1
 service:
   startupTimeoutMs: 30000
@@ -313,13 +339,7 @@ workspace:
   preserve: true
   gitExecutable: ${yaml(git)}
 runtimes:
-  - name: codex
-    type: codex-app-server
-    executable: ${yaml(codex)}
-    serverArguments: [app-server, --listen, stdio://]
-    requestTimeoutMs: 30000
-    environment:
-      inherit: [PATH, HOME, CODEX_HOME, TMPDIR, LANG, LC_ALL]
+${runtimeBlock}
 repositories:
   - id: ensemble
     url: https://example.invalid/replace-with-repository.git
@@ -362,9 +382,24 @@ Options:
   --config <absolute path>
   --env-file <absolute path>
   --repository <id>    Select a repository when more than one is configured
+  --runtime <name>     Runtime for init: codex or opencode
   --journal            Include safe provider journal metadata during task inspection
   --json               Emit machine-readable JSON
 `;
+}
+
+async function selectRuntime(context: CliContext): Promise<"codex" | "opencode"> {
+  if (context.selectRuntime) return context.selectRuntime();
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return "codex";
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    for (;;) {
+      const answer = (await prompt.question("Runtime [codex/opencode] (codex): ")).trim().toLowerCase();
+      if (!answer || answer === "codex") return "codex";
+      if (answer === "opencode") return "opencode";
+      process.stdout.write("Choose codex or opencode.\n");
+    }
+  } finally { prompt.close(); }
 }
 
 function selectRepository(controller: Awaited<ReturnType<typeof buildHostController>>, repositoryId?: string) {

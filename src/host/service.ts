@@ -16,8 +16,11 @@ import type { OrchestratorRegistration } from "../orchestration/service.ts";
 import { Scheduler } from "../orchestration/scheduler.ts";
 import { VikunjaProvider } from "../providers/vikunja/adapter.ts";
 import { RuntimeRegistry } from "../runtimes/runtime.ts";
+import type { Runtime } from "../runtimes/runtime.ts";
 import { CodexAppServerTransport } from "../runtimes/codex/app-server-transport.ts";
 import { CodexRuntime } from "../runtimes/codex/runtime.ts";
+import { OpenCodeServerTransport } from "../runtimes/opencode/server-transport.ts";
+import { OpenCodeRuntime } from "../runtimes/opencode/runtime.ts";
 
 export interface HostControllerOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
@@ -163,11 +166,16 @@ export async function initializeHostDirectories(configuration: HostConfiguration
 function createRuntime(
   runtime: HostRuntimeConfiguration,
   environment: Readonly<Record<string, string | undefined>>,
-): CodexRuntime {
+): Runtime {
   const selectedEnvironment = runtimeEnvironment(runtime.environment.inherit, environment);
-  const transport = new CodexAppServerTransport({ executable: runtime.executable, arguments: runtime.serverArguments,
+  if (runtime.type === "codex-app-server") {
+    const transport = new CodexAppServerTransport({ executable: runtime.executable, arguments: runtime.serverArguments,
+      requestTimeoutMs: runtime.requestTimeoutMs, environment: selectedEnvironment });
+    return new CodexRuntime(transport, undefined, undefined, undefined, undefined, runtime.name);
+  }
+  const transport = new OpenCodeServerTransport({ executable: runtime.executable, serverArguments: runtime.serverArguments,
     requestTimeoutMs: runtime.requestTimeoutMs, environment: selectedEnvironment });
-  return new CodexRuntime(transport, undefined, undefined, undefined, undefined, runtime.name);
+  return new OpenCodeRuntime(transport, runtime.name);
 }
 
 async function executable(path: string, name: string): Promise<void> {

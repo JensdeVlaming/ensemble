@@ -68,6 +68,30 @@ test("CLI status remains machine-readable without configuration and diagnostic f
   assert.match(stderr.value, /only valid with inspect task/u);
 });
 
+test("CLI init selects OpenCode interactively or by flag without storing authentication", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ensemble-cli-opencode-"));
+  const create = async (name: string, arguments_: readonly string[], selectRuntime?: () => Promise<"codex" | "opencode">) => {
+    const config = join(home, `${name}.yaml`);
+    const environment = join(home, `${name}.env`);
+    const stdout = new Output(); const stderr = new Output();
+    const code = await runCli(["init", "--config", config, "--env-file", environment, ...arguments_], {
+      platform: "darwin", home, environment: { PATH: "/usr/bin:/usr/local/bin" }, io: { stdout, stderr },
+      ...(selectRuntime ? { selectRuntime } : {}),
+    });
+    return { code, config: await readFile(config, "utf8"), environment: await readFile(environment, "utf8"), stderr: stderr.value };
+  };
+  const interactive = await create("interactive", [], async () => "opencode");
+  assert.equal(interactive.code, 0);
+  assert.match(interactive.config, /type: opencode-server/u);
+  assert.match(interactive.config, /serverArguments: \[serve, --pure\]/u);
+  assert.doesNotMatch(interactive.environment, /CODEX_HOME|API_KEY|PASSWORD/u);
+  const automated = await create("flag", ["--runtime", "opencode"]);
+  assert.match(automated.config, /name: opencode/u);
+  assert.equal(automated.stderr, "");
+  assert.equal(await runCli(["start", "--runtime", "opencode"], { platform: "darwin", home,
+    io: { stdout: new Output(), stderr: new Output() } }), 1);
+});
+
 test("CLI rejects relative paths and unsupported service management without leaking input", async () => {
   const stdout = new Output();
   const stderr = new Output();

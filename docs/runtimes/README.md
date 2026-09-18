@@ -8,6 +8,7 @@ cancellation.
 Select the guide for the runtime registered by the Ensemble host:
 
 - [Codex App Server](CODEX_APP_SERVER.md)
+- [OpenCode Server](OPENCODE_SERVER.md)
 
 Runtime-specific executable paths, authentication, child environments,
 arguments and repository `runtime.config` fields belong in the runtime guide.
