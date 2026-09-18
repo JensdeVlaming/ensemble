@@ -1,0 +1,52 @@
+version: 1
+service:
+  startupTimeoutMs: 30000
+  stopTimeoutSeconds: 60
+  webhooks:
+    publicBaseUrl: https://ensemble.example.test
+    listenHost: 0.0.0.0
+    listenPort: 8787
+    maxBodyBytes: 65536
+    requestTimeoutMs: 10000
+    closeTimeoutMs: 5000
+logging:
+  level: info
+workspace:
+  root: /var/lib/ensemble/workspaces
+  preserve: true
+  gitExecutable: /usr/bin/git
+runtimes:
+  - name: codex
+    type: codex-app-server
+    executable: /usr/local/bin/codex
+    serverArguments: [app-server, --listen, stdio://]
+    requestTimeoutMs: 30000
+    environment:
+      inherit: [PATH, HOME, CODEX_HOME, TMPDIR, LANG, LC_ALL]
+repositories:
+  - id: ensemble
+    url: https://github.com/example/ensemble.git
+    branch: main
+    configurationPath: /srv/ensemble
+    provider:
+      type: azure-devops
+      organization: example-organization
+      project: Example Project
+      pat: $AZURE_DEVOPS_PAT
+      queryId: 00000000-0000-0000-0000-000000000000
+      stateField: Custom.EnsembleState
+      nativeStates:
+        ready: New
+        running: Active
+        blocked: Blocked
+        failed: Failed
+        completed: Closed
+      priorityField: Microsoft.VSTS.Common.Priority
+      requiredTags: [ensemble]
+      requiredAssignee: ensemble@example.test
+      blockerRelation: System.LinkTypes.Dependency-Reverse
+      acceptanceCriteriaField: Microsoft.VSTS.Common.AcceptanceCriteria
+      webhook:
+        routeId: ensemble
+        username: $AZURE_DEVOPS_WEBHOOK_USERNAME
+        password: $AZURE_DEVOPS_WEBHOOK_PASSWORD

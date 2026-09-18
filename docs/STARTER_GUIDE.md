@@ -25,6 +25,10 @@ workflow status. Ensemble does not replace the task tracker. It continuously
 polls the tracker, starts bounded workers, reconciles changed tasks, and writes
 durable execution results back through the provider adapter.
 
+Some providers can also send authenticated wake hints. A hint only asks the
+service to poll that repository sooner; it never supplies trusted task state,
+changes scheduling policy, or replaces periodic polling.
+
 There are two distinct configuration layers:
 
 | Layer | Purpose | Typical location |
@@ -564,6 +568,10 @@ repository.startup_succeeded
 service.running
 scheduler.tick_completed
 ```
+
+When an authenticated provider wake route is configured, startup also emits a
+`webhook.server_started` JSON record containing its public `endpoint`. Use that
+logged endpoint when configuring the provider; credentials are never logged.
 
 `candidateCount: 0` means the provider call succeeded but no task satisfied all
 eligibility rules. It is not itself a service error.

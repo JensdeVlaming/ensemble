@@ -1,7 +1,8 @@
 export const OPERATIONAL_EVENT_NAMES = Object.freeze([
   "observability.record_suppressed",
-  "service.starting", "service.running", "service.signal_received", "service.timer_scheduled",
+  "service.starting", "service.running", "service.signal_received", "service.timer_scheduled", "service.wake_requested",
   "service.shutdown_started", "service.shutdown_completed",
+  "webhook.server_started", "webhook.server_stopped", "webhook.request_accepted", "webhook.request_rejected",
   "repository.startup_started", "repository.startup_succeeded", "repository.startup_failed",
   "repository.shutdown_completed", "repository.shutdown_failed",
   "configuration.reload_started", "configuration.reload_installed", "configuration.reload_unchanged",

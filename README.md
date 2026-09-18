@@ -101,11 +101,12 @@ repositories:
       type: provider-specific
 ```
 
-The package also includes a Vikunja-and-Codex-based example at
-`examples/host-config.yaml` plus a non-secret
-`examples/ensemble.env.example` template. Follow the dedicated
-[Vikunja guide](docs/providers/VIKUNJA.md) and
-[Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md) for those adapter fields.
+The package includes a Vikunja example at `examples/host-config.yaml`, an Azure
+DevOps Services example at `examples/host-config.azure-devops.yaml`, and the
+non-secret `examples/ensemble.env.example` template. Follow the dedicated
+[Vikunja guide](docs/providers/VIKUNJA.md),
+[Azure DevOps guide](docs/providers/AZURE_DEVOPS.md), and
+[Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md) for exact adapter fields.
 
 Polling, worker, retry, turn, stall, cancellation, and drain bounds remain in
 the repository-owned workflow configuration so they hot-reload atomically with
@@ -141,7 +142,8 @@ src/
 ├── providers/
 │   ├── provider.ts         provider adapter contract
 │   ├── memory/             reference adapter
-│   └── vikunja/            production Vikunja API v1 adapter
+│   ├── vikunja/            production Vikunja API v1 adapter
+│   └── azure-devops/       production Azure DevOps Services adapter
 ├── orchestration/          deterministic scheduling policy
 ├── execution/              workspace and runtime lifecycle
 └── runtimes/
@@ -198,8 +200,9 @@ before the Scheduler allocates a workspace.
 
 Provider adapters have separate installation and task-preparation instructions.
 See the [task-provider guides](docs/providers/README.md), including the detailed
-[Vikunja guide](docs/providers/VIKUNJA.md). Provider-specific operational setup
-is kept out of the Starter Guide.
+[Vikunja](docs/providers/VIKUNJA.md) and
+[Azure DevOps](docs/providers/AZURE_DEVOPS.md) guides. Provider-specific
+operational setup is kept out of the Starter Guide.
 
 ## Repository retry policy
 

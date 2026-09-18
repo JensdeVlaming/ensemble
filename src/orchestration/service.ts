@@ -81,9 +81,15 @@ interface RegistrationState {
   initialized: boolean;
   startup?: Promise<void>;
   tick?: Promise<RepositoryTickReport>;
-  timer?: unknown;
+  timer?: TimerOwnership;
+  wakePending: boolean;
   lastError?: string;
   lastTick?: RepositoryTickReport;
+}
+
+interface TimerOwnership {
+  readonly delayMs: number;
+  handle?: unknown;
 }
 
 const nodeSignals: ServiceSignalSource = {
@@ -128,6 +134,7 @@ export class OrchestratorService {
       return {
         registration: Object.freeze({ ...registration }),
         initialized: false,
+        wakePending: false,
         operationalPolicy: Object.freeze({
           startupTimeoutMs: registration.startupTimeoutMs,
           pollIntervalMs: registration.pollIntervalMs,
@@ -189,6 +196,16 @@ export class OrchestratorService {
     return Object.freeze({ repositories: Object.freeze(reports) });
   }
 
+  requestWake(repositoryId: string): void {
+    if (isClosedState(this.#state)) throw new Error(`Cannot request wake while ${this.#state}`);
+    const state = this.#registrations.find((entry) => entry.registration.id === repositoryId);
+    if (!state) throw new Error(`Unknown orchestrator repository: ${repositoryId}`);
+    state.wakePending = true;
+    this.#increment("wake_requested_total");
+    this.#emit({ level: "debug", event: "service.wake_requested", repositoryId });
+    if (this.#state === "running" && !state.tick) this.#schedule(state, 0);
+  }
+
   shutdown(): Promise<OrchestratorShutdownReport> {
     this.#shutdown ??= this.#performShutdown();
     return this.#shutdown;
@@ -227,6 +244,7 @@ export class OrchestratorService {
 
   #tickRegistration(state: RegistrationState): Promise<RepositoryTickReport> {
     if (state.tick) return state.tick;
+    state.wakePending = false;
     const tick = (async (): Promise<RepositoryTickReport> => {
       try {
         this.#emit({ level: "debug", event: "tick.started", repositoryId: state.registration.id });
@@ -270,7 +288,9 @@ export class OrchestratorService {
     })();
     state.tick = tick;
     void tick.finally(() => {
-      if (state.tick === tick) state.tick = undefined;
+      if (state.tick !== tick) return;
+      state.tick = undefined;
+      if (this.#state === "running") this.#schedule(state, state.wakePending ? 0 : state.operationalPolicy.pollIntervalMs);
     }).catch(() => undefined);
     return tick;
   }
@@ -310,16 +330,28 @@ export class OrchestratorService {
     return startup;
   }
 
-  #schedule(state: RegistrationState): void {
-    if (this.#state !== "running" || state.timer !== undefined) return;
-    state.timer = this.#timers.set(state.operationalPolicy.pollIntervalMs, () => {
+  #schedule(state: RegistrationState, delayMs = state.operationalPolicy.pollIntervalMs): void {
+    if (this.#state !== "running" || state.tick) return;
+    if (state.timer !== undefined) {
+      if (delayMs !== 0 || state.timer.delayMs === 0) return;
+      this.#clearTimer(state);
+    }
+    const ownership: TimerOwnership = { delayMs };
+    state.timer = ownership;
+    ownership.handle = this.#timers.set(delayMs, () => {
+      if (state.timer !== ownership) return;
       state.timer = undefined;
-      void this.#tickRegistration(state).finally(() => {
-        if (this.#state === "running") this.#schedule(state);
-      }).catch(() => undefined);
+      if (this.#state !== "running") return;
+      void this.#tickRegistration(state).catch(() => undefined);
     });
     this.#emit({ level: "debug", event: "service.timer_scheduled", repositoryId: state.registration.id,
-      data: { pollIntervalMs: state.operationalPolicy.pollIntervalMs } });
+      data: { delayMs } });
+  }
+
+  #clearTimer(state: RegistrationState): void {
+    const timer = state.timer;
+    state.timer = undefined;
+    if (timer?.handle !== undefined) this.#timers.clear(timer.handle);
   }
 
   async #performShutdown(): Promise<OrchestratorShutdownReport> {
@@ -328,10 +360,8 @@ export class OrchestratorService {
     this.#emit({ level: "info", event: "service.shutdown_started" });
     this.#removeSignals();
     for (const state of this.#registrations) {
-      if (state.timer !== undefined) {
-        this.#timers.clear(state.timer);
-        state.timer = undefined;
-      }
+      state.wakePending = false;
+      this.#clearTimer(state);
     }
     const reports = await Promise.all(this.#registrations.map(async (state): Promise<RepositoryShutdownReport> => {
       try {

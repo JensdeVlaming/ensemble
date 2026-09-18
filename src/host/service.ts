@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto";
 import { access, mkdir, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
+import type { RepositoryRef } from "../domain/model.ts";
 import type { HostConfiguration, HostRuntimeConfiguration } from "./configuration.ts";
 import { runtimeEnvironment } from "./configuration.ts";
+import { WebhookServer } from "./webhook-server.ts";
+import type { WebhookServerStartReport } from "./webhook-server.ts";
 import { ConfigurationReloadError, HostSecretResolver, RepositoryConfigLoader,
   RepositoryConfigurationManager } from "../execution/repository.ts";
 import { ExecutionEngine } from "../execution/engine.ts";
@@ -14,6 +17,8 @@ import { OrchestratorService } from "../orchestration/service.ts";
 import type { ServiceSnapshot } from "../orchestration/service.ts";
 import type { OrchestratorRegistration } from "../orchestration/service.ts";
 import { Scheduler } from "../orchestration/scheduler.ts";
+import type { ProviderAdapter } from "../providers/provider.ts";
+import { AzureDevOpsProvider } from "../providers/azure-devops/adapter.ts";
 import { VikunjaProvider } from "../providers/vikunja/adapter.ts";
 import { RuntimeRegistry } from "../runtimes/runtime.ts";
 import { CodexAppServerTransport } from "../runtimes/codex/app-server-transport.ts";
@@ -27,25 +32,68 @@ export interface HostControllerOptions {
 }
 
 interface HostRepositoryRuntime {
-  readonly provider: VikunjaProvider;
+  readonly provider: HostedProvider;
   readonly configurations: RepositoryConfigurationManager;
   readonly scheduler: Scheduler;
 }
 
+type HostedProvider = ProviderAdapter & {
+  readonly repository: RepositoryRef;
+  validateConfiguration(): Promise<void>;
+};
+
+interface HostServiceLifecycle {
+  readonly state: OrchestratorService["state"];
+  start(): Promise<void>;
+  shutdown(): ReturnType<OrchestratorService["shutdown"]>;
+  snapshot(now?: () => Date): ServiceSnapshot;
+}
+
+interface HostWebhookIngress {
+  start(): Promise<WebhookServerStartReport>;
+  close(): Promise<void>;
+}
+
+interface HostSignalSource {
+  addListener(signal: "SIGINT" | "SIGTERM", listener: () => void): void;
+  removeListener(signal: "SIGINT" | "SIGTERM", listener: () => void): void;
+}
+
+const processSignals: HostSignalSource = {
+  addListener: (signal, listener) => { process.on(signal, listener); },
+  removeListener: (signal, listener) => { process.off(signal, listener); },
+};
+
+const ignoredServiceSignals = Object.freeze({
+  addListener: () => undefined,
+  removeListener: () => undefined,
+});
+
 export class HostController {
   readonly configuration: HostConfiguration;
-  readonly service: OrchestratorService;
+  readonly service: HostServiceLifecycle;
   readonly repositories: readonly HostRepositoryRuntime[];
   readonly runtimes: RuntimeRegistry;
   readonly secrets: HostSecretResolver;
   readonly #startupTimeoutMs: number;
+  readonly #webhook?: HostWebhookIngress;
+  readonly #signals: HostSignalSource;
+  readonly #interruptListener = (): void => { void this.shutdown().catch(() => undefined); };
+  readonly #terminateListener = (): void => { void this.shutdown().catch(() => undefined); };
+  #signalsInstalled = false;
+  #webhookReady = false;
+  #webhookClose?: Promise<void>;
+  #run?: Promise<void>;
+  #shutdown?: ReturnType<OrchestratorService["shutdown"]>;
 
   constructor(
     configuration: HostConfiguration,
-    service: OrchestratorService,
+    service: HostServiceLifecycle,
     repositories: readonly HostRepositoryRuntime[],
     runtimes: RuntimeRegistry,
     secrets: HostSecretResolver,
+    webhook?: HostWebhookIngress,
+    signals: HostSignalSource = processSignals,
   ) {
     this.configuration = configuration;
     this.service = service;
@@ -53,6 +101,8 @@ export class HostController {
     this.runtimes = runtimes;
     this.secrets = secrets;
     this.#startupTimeoutMs = configuration.service.startupTimeoutMs;
+    this.#webhook = webhook;
+    this.#signals = signals;
   }
 
   async validate(): Promise<void> {
@@ -62,11 +112,73 @@ export class HostController {
     })).then(() => undefined), this.#startupTimeoutMs, "Host validation timed out");
   }
 
-  run(): Promise<void> { return this.service.start(); }
-  shutdown() { return this.service.shutdown(); }
+  run(): Promise<void> {
+    this.#run ??= this.#runService();
+    return this.#run;
+  }
+
+  shutdown(): ReturnType<OrchestratorService["shutdown"]> {
+    this.#shutdown ??= this.#shutdownService();
+    return this.#shutdown;
+  }
   snapshot(now?: () => Date): ServiceSnapshot { return this.service.snapshot(now); }
   health(): boolean { return this.service.state !== "stopped"; }
-  readiness(): boolean { return this.service.snapshot().readiness; }
+  readiness(): boolean { return (!this.#webhook || this.#webhookReady) && this.service.snapshot().readiness; }
+
+  async #runService(): Promise<void> {
+    let primaryError: unknown;
+    try {
+      if (this.#webhook) {
+        await this.#webhook.start();
+        this.#webhookReady = true;
+      }
+      this.#installSignals();
+      await this.service.start();
+    } catch (error) {
+      primaryError = error;
+    }
+    this.#removeSignals();
+    try { await this.#closeWebhook(); }
+    catch (error) { if (primaryError === undefined) throw error; }
+    if (primaryError !== undefined) throw primaryError;
+  }
+
+  async #shutdownService(): ReturnType<OrchestratorService["shutdown"]> {
+    this.#removeSignals();
+    let closeError: unknown;
+    try { await this.#closeWebhook(); }
+    catch (error) { closeError = error; }
+    const report = await this.service.shutdown();
+    if (closeError !== undefined) throw closeError;
+    return report;
+  }
+
+  #closeWebhook(): Promise<void> {
+    this.#webhookReady = false;
+    this.#webhookClose ??= this.#webhook?.close() ?? Promise.resolve();
+    return this.#webhookClose;
+  }
+
+  #installSignals(): void {
+    if (this.#signalsInstalled) return;
+    let interruptInstalled = false;
+    try {
+      this.#signals.addListener("SIGINT", this.#interruptListener);
+      interruptInstalled = true;
+      this.#signals.addListener("SIGTERM", this.#terminateListener);
+      this.#signalsInstalled = true;
+    } catch (error) {
+      if (interruptInstalled) this.#signals.removeListener("SIGINT", this.#interruptListener);
+      throw error;
+    }
+  }
+
+  #removeSignals(): void {
+    if (!this.#signalsInstalled) return;
+    this.#signalsInstalled = false;
+    this.#signals.removeListener("SIGINT", this.#interruptListener);
+    this.#signals.removeListener("SIGTERM", this.#terminateListener);
+  }
 }
 
 export async function buildHostController(
@@ -75,10 +187,6 @@ export async function buildHostController(
 ): Promise<HostController> {
   const environment = options.environment ?? process.env;
   const secrets = new HostSecretResolver(environment);
-  const resolvedTokens = new Map(configuration.repositories.map((repository) => [
-    repository.id,
-    secrets.resolve(repository.provider.token, `repositories.${repository.id}.provider.token`),
-  ]));
   const logger = new StructuredLogger({
     serviceInstanceId: options.serviceInstanceId ?? randomUUID(),
     sink: new JsonLinesOperationalLogSink(options.writable ?? process.stdout),
@@ -97,17 +205,7 @@ export async function buildHostController(
       url: registration.url,
       ...(registration.branch ? { defaultBranch: registration.branch, branch: registration.branch } : {}),
     });
-    const provider = new VikunjaProvider({
-      baseUrl: registration.provider.baseUrl,
-      token: resolvedTokens.get(registration.id)!,
-      projectId: registration.provider.projectId,
-      viewId: registration.provider.viewId,
-      repository,
-      requiredLabels: registration.provider.requiredLabels,
-      ...(registration.provider.requiredAssignee ? { requiredAssignee: registration.provider.requiredAssignee } : {}),
-      ...(registration.provider.statusLabels ? { statusLabels: registration.provider.statusLabels } : {}),
-      operationalEvents: logger,
-    });
+    const provider = createProvider(registration, repository, secrets, logger);
     const configurations = new RepositoryConfigurationManager(
       repositoryLoader,
       repository,
@@ -142,8 +240,28 @@ export async function buildHostController(
       cancellationTimeoutMs: initial?.operationalPolicy.cancellationTimeoutMs ?? 10_000,
     });
   }
-  return new HostController(configuration, new OrchestratorService(registrations, undefined, undefined, logger),
-    repositories, runtimes, secrets);
+  const service = new OrchestratorService(registrations, ignoredServiceSignals, undefined, logger);
+  const listener = configuration.service.webhooks;
+  const webhook = listener ? new WebhookServer({
+    host: listener.listenHost,
+    port: listener.listenPort,
+    publicBaseUrl: listener.publicBaseUrl,
+    maxBodyBytes: listener.maxBodyBytes,
+    requestTimeoutMs: listener.requestTimeoutMs,
+    closeTimeoutMs: listener.closeTimeoutMs,
+    routes: configuration.repositories.flatMap((registration) => registration.provider.type === "azure-devops"
+      && registration.provider.webhook ? [{
+        path: webhookPath(registration.provider.webhook.routeId),
+        repositoryId: registration.id,
+        username: secrets.resolve(registration.provider.webhook.username,
+          `repositories.${registration.id}.provider.webhook.username`),
+        password: secrets.resolve(registration.provider.webhook.password,
+          `repositories.${registration.id}.provider.webhook.password`),
+      }] : []),
+    requestWake: (repositoryId) => { service.requestWake(repositoryId); },
+    events: logger,
+  }) : undefined;
+  return new HostController(configuration, service, repositories, runtimes, secrets, webhook);
 }
 
 export async function validateHostFilesystem(configuration: HostConfiguration): Promise<void> {
@@ -168,6 +286,47 @@ function createRuntime(
   const transport = new CodexAppServerTransport({ executable: runtime.executable, arguments: runtime.serverArguments,
     requestTimeoutMs: runtime.requestTimeoutMs, environment: selectedEnvironment });
   return new CodexRuntime(transport, undefined, undefined, undefined, undefined, runtime.name);
+}
+
+function createProvider(
+  registration: HostConfiguration["repositories"][number],
+  repository: { readonly id: string; readonly url: string; readonly defaultBranch?: string; readonly branch?: string },
+  secrets: HostSecretResolver,
+  operationalEvents: StructuredLogger,
+): HostedProvider {
+  const provider = registration.provider;
+  if (provider.type === "vikunja") {
+    return new VikunjaProvider({
+      baseUrl: provider.baseUrl,
+      token: secrets.resolve(provider.token, `repositories.${registration.id}.provider.token`),
+      projectId: provider.projectId,
+      viewId: provider.viewId,
+      repository,
+      requiredLabels: provider.requiredLabels,
+      ...(provider.requiredAssignee ? { requiredAssignee: provider.requiredAssignee } : {}),
+      ...(provider.statusLabels ? { statusLabels: provider.statusLabels } : {}),
+      operationalEvents,
+    });
+  }
+  return new AzureDevOpsProvider({
+    organization: provider.organization,
+    project: provider.project,
+    pat: secrets.resolve(provider.pat, `repositories.${registration.id}.provider.pat`),
+    queryId: provider.queryId,
+    stateField: provider.stateField,
+    nativeStates: provider.nativeStates,
+    repository,
+    requiredTags: provider.requiredTags,
+    ...(provider.priorityField ? { priorityField: provider.priorityField } : {}),
+    ...(provider.requiredAssignee ? { requiredAssignee: provider.requiredAssignee } : {}),
+    ...(provider.blockerRelation ? { blockerRelation: provider.blockerRelation } : {}),
+    ...(provider.acceptanceCriteriaField ? { acceptanceCriteriaField: provider.acceptanceCriteriaField } : {}),
+    operationalEvents,
+  });
+}
+
+function webhookPath(routeId: string): string {
+  return `/webhooks/v1/repositories/${encodeURIComponent(routeId)}`;
 }
 
 async function executable(path: string, name: string): Promise<void> {

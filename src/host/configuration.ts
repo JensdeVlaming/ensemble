@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import type { VikunjaStatusLabels } from "../providers/vikunja/adapter.ts";
+import type { AzureDevOpsNativeStates } from "../providers/azure-devops/adapter.ts";
 import type { OperationalLogLevel } from "../domain/observability.ts";
 import { parseSimpleYaml } from "../execution/repository.ts";
 
@@ -17,6 +18,16 @@ export interface HostPaths {
 export interface HostServiceConfiguration {
   readonly startupTimeoutMs: number;
   readonly stopTimeoutSeconds: number;
+  readonly webhooks?: HostWebhookListenerConfiguration;
+}
+
+export interface HostWebhookListenerConfiguration {
+  readonly publicBaseUrl: string;
+  readonly listenHost: string;
+  readonly listenPort: number;
+  readonly maxBodyBytes: number;
+  readonly requestTimeoutMs: number;
+  readonly closeTimeoutMs: number;
 }
 
 export interface HostLoggingConfiguration {
@@ -55,12 +66,36 @@ export interface HostVikunjaConfiguration {
   readonly statusLabels?: Partial<VikunjaStatusLabels>;
 }
 
+export interface HostAzureDevOpsWebhookConfiguration {
+  readonly routeId: string;
+  readonly username: string;
+  readonly password: string;
+}
+
+export interface HostAzureDevOpsConfiguration {
+  readonly type: "azure-devops";
+  readonly organization: string;
+  readonly project: string;
+  readonly pat: string;
+  readonly queryId: string;
+  readonly stateField: string;
+  readonly nativeStates: AzureDevOpsNativeStates;
+  readonly priorityField?: string;
+  readonly requiredTags: readonly string[];
+  readonly requiredAssignee?: string;
+  readonly blockerRelation?: string;
+  readonly acceptanceCriteriaField?: string;
+  readonly webhook?: HostAzureDevOpsWebhookConfiguration;
+}
+
+export type HostProviderConfiguration = HostVikunjaConfiguration | HostAzureDevOpsConfiguration;
+
 export interface HostRepositoryConfiguration {
   readonly id: string;
   readonly url: string;
   readonly branch?: string;
   readonly configurationPath: string;
-  readonly provider: HostVikunjaConfiguration;
+  readonly provider: HostProviderConfiguration;
 }
 
 export interface HostConfiguration {
@@ -80,6 +115,7 @@ export interface EnvironmentFileValidationOptions {
 
 const MAX_ENVIRONMENT_BYTES = 65_536;
 const MAX_ENVIRONMENT_VALUE_BYTES = 16_384;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const forbiddenRuntimeEnvironment = /(TOKEN|SECRET|PASSWORD|AUTHORIZATION|API_?KEY|VIKUNJA|AWS_|AZURE_|GOOGLE_)/u;
 
 export function defaultHostPaths(platform: NodeJS.Platform = process.platform, home = homedir()): HostPaths {
@@ -150,7 +186,7 @@ export function parseHostConfiguration(source: string): HostConfiguration {
   const version = integer(root.version, "version", 1);
   if (version !== 1) throw new Error(`Unsupported host configuration version: ${version}`);
   const service = mapping(root.service, "service", true);
-  exactKeys(service, ["startupTimeoutMs", "stopTimeoutSeconds"], "service");
+  exactKeys(service, ["startupTimeoutMs", "stopTimeoutSeconds", "webhooks"], "service");
   const logging = mapping(root.logging, "logging", false);
   exactKeys(logging, ["level"], "logging");
   const workspace = mapping(root.workspace, "workspace", true);
@@ -164,11 +200,18 @@ export function parseHostConfiguration(source: string): HostConfiguration {
   if (repositories.length === 0) throw new Error("At least one repository registration is required");
   const repositoryIds = unique(repositories.map((repository) => repository.id), "repository ID");
   if (repositoryIds.size !== repositories.length) throw new Error("Repository IDs must be unique");
+  const webhookRoutes = repositories.flatMap((repository) => repository.provider.type === "azure-devops"
+    && repository.provider.webhook ? [repository.provider.webhook.routeId] : []);
+  const webhooks = service.webhooks === undefined ? undefined : webhookListenerAt(service.webhooks, "service.webhooks");
+  if (webhookRoutes.length > 0 && !webhooks) throw new Error("service.webhooks is required when provider webhook routes are configured");
+  if (webhooks && webhookRoutes.length === 0) throw new Error("service.webhooks requires at least one provider webhook route");
+  if (unique(webhookRoutes, "webhook route ID").size !== webhookRoutes.length) throw new Error("Webhook route IDs must be unique");
   return deepFreeze({
     version: 1,
     service: {
       startupTimeoutMs: nonNegativeInteger(service.startupTimeoutMs, "service.startupTimeoutMs", 30_000),
       stopTimeoutSeconds: positiveInteger(service.stopTimeoutSeconds ?? 60, "service.stopTimeoutSeconds"),
+      ...(webhooks ? { webhooks } : {}),
     },
     logging: { level: loggingLevel(logging.level) },
     workspace: {
@@ -223,17 +266,46 @@ function repositoryAt(value: unknown, path: string): HostRepositoryConfiguration
   const repository = mapping(value, path, true);
   exactKeys(repository, ["id", "url", "branch", "configurationPath", "provider"], path);
   const provider = mapping(repository.provider, `${path}.provider`, true);
-  exactKeys(provider, ["type", "baseUrl", "token", "projectId", "viewId", "requiredAssignee", "requiredLabels", "statusLabels"], `${path}.provider`);
   const type = text(provider.type, `${path}.provider.type`);
-  if (type !== "vikunja") throw new Error(`Unsupported provider type at ${path}.provider.type: ${type}`);
-  const statusLabels = provider.statusLabels === undefined
-    ? undefined
-    : statusLabelsAt(provider.statusLabels, `${path}.provider.statusLabels`);
-  return {
+  const shared = {
     id: text(repository.id, `${path}.id`),
     url: url(repository.url, `${path}.url`),
     ...(repository.branch === undefined ? {} : { branch: text(repository.branch, `${path}.branch`) }),
     configurationPath: absolutePath(repository.configurationPath, `${path}.configurationPath`),
+  };
+  if (type === "azure-devops") {
+    exactKeys(provider, ["type", "organization", "project", "pat", "queryId", "stateField", "nativeStates",
+      "priorityField", "requiredTags", "requiredAssignee", "blockerRelation", "acceptanceCriteriaField", "webhook"],
+    `${path}.provider`);
+    const webhook = provider.webhook === undefined ? undefined : azureWebhookAt(provider.webhook, `${path}.provider.webhook`);
+    return {
+      ...shared,
+      provider: {
+        type,
+        organization: segment(provider.organization, `${path}.provider.organization`),
+        project: segment(provider.project, `${path}.provider.project`),
+        pat: secretReference(provider.pat, `${path}.provider.pat`),
+        queryId: text(provider.queryId, `${path}.provider.queryId`),
+        stateField: text(provider.stateField, `${path}.provider.stateField`),
+        nativeStates: nativeStatesAt(provider.nativeStates, `${path}.provider.nativeStates`),
+        ...(provider.priorityField === undefined ? {} : { priorityField: text(provider.priorityField, `${path}.provider.priorityField`) }),
+        requiredTags: stringList(provider.requiredTags, `${path}.provider.requiredTags`, []),
+        ...(provider.requiredAssignee === undefined ? {} : { requiredAssignee: text(provider.requiredAssignee, `${path}.provider.requiredAssignee`) }),
+        ...(provider.blockerRelation === undefined ? {} : { blockerRelation: text(provider.blockerRelation, `${path}.provider.blockerRelation`) }),
+        ...(provider.acceptanceCriteriaField === undefined ? {} : {
+          acceptanceCriteriaField: text(provider.acceptanceCriteriaField, `${path}.provider.acceptanceCriteriaField`),
+        }),
+        ...(webhook ? { webhook } : {}),
+      },
+    };
+  }
+  if (type !== "vikunja") throw new Error(`Unsupported provider type at ${path}.provider.type: ${type}`);
+  exactKeys(provider, ["type", "baseUrl", "token", "projectId", "viewId", "requiredAssignee", "requiredLabels", "statusLabels"], `${path}.provider`);
+  const statusLabels = provider.statusLabels === undefined
+    ? undefined
+    : statusLabelsAt(provider.statusLabels, `${path}.provider.statusLabels`);
+  return {
+    ...shared,
     provider: {
       type,
       baseUrl: url(provider.baseUrl, `${path}.provider.baseUrl`),
@@ -244,6 +316,43 @@ function repositoryAt(value: unknown, path: string): HostRepositoryConfiguration
       requiredLabels: stringList(provider.requiredLabels, `${path}.provider.requiredLabels`, []),
       ...(statusLabels ? { statusLabels } : {}),
     },
+  };
+}
+
+function webhookListenerAt(value: unknown, path: string): HostWebhookListenerConfiguration {
+  const listener = mapping(value, path, true);
+  exactKeys(listener, ["publicBaseUrl", "listenHost", "listenPort", "maxBodyBytes", "requestTimeoutMs", "closeTimeoutMs"], path);
+  return {
+    publicBaseUrl: httpsUrl(listener.publicBaseUrl, `${path}.publicBaseUrl`),
+    listenHost: text(listener.listenHost ?? "0.0.0.0", `${path}.listenHost`),
+    listenPort: boundedInteger(listener.listenPort ?? 8_787, 1, 65_535, `${path}.listenPort`),
+    maxBodyBytes: positiveInteger(listener.maxBodyBytes ?? 65_536, `${path}.maxBodyBytes`),
+    requestTimeoutMs: boundedInteger(listener.requestTimeoutMs ?? 10_000, 1, MAX_TIMER_DELAY_MS, `${path}.requestTimeoutMs`),
+    closeTimeoutMs: boundedInteger(listener.closeTimeoutMs ?? 5_000, 1, MAX_TIMER_DELAY_MS, `${path}.closeTimeoutMs`),
+  };
+}
+
+function azureWebhookAt(value: unknown, path: string): HostAzureDevOpsWebhookConfiguration {
+  const webhook = mapping(value, path, true);
+  exactKeys(webhook, ["routeId", "username", "password"], path);
+  const routeId = text(webhook.routeId, `${path}.routeId`);
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(routeId)) throw new Error(`Expected safe opaque segment: ${path}.routeId`);
+  return {
+    routeId,
+    username: secretReference(webhook.username, `${path}.username`),
+    password: secretReference(webhook.password, `${path}.password`),
+  };
+}
+
+function nativeStatesAt(value: unknown, path: string): AzureDevOpsNativeStates {
+  const states = mapping(value, path, true);
+  exactKeys(states, ["ready", "running", "blocked", "failed", "completed"], path);
+  return {
+    ready: text(states.ready, `${path}.ready`),
+    running: text(states.running, `${path}.running`),
+    blocked: text(states.blocked, `${path}.blocked`),
+    failed: text(states.failed, `${path}.failed`),
+    completed: text(states.completed, `${path}.completed`),
   };
 }
 
@@ -299,6 +408,19 @@ function url(value: unknown, path: string): string {
   catch { throw new Error(`Expected absolute URL: ${path}`); }
 }
 
+function httpsUrl(value: unknown, path: string): string {
+  const parsed = new URL(url(value, path));
+  if (parsed.protocol !== "https:") throw new Error(`Expected absolute HTTPS URL: ${path}`);
+  if (parsed.username || parsed.password) throw new Error(`HTTPS URL must not contain credentials: ${path}`);
+  return parsed.toString();
+}
+
+function segment(value: unknown, path: string): string {
+  const source = text(value, path);
+  if (source !== source.trim() || /[/?#\\]/u.test(source)) throw new Error(`Expected URL segment: ${path}`);
+  return source;
+}
+
 function absolutePath(value: unknown, path: string): string {
   const source = text(value, path);
   if (!isAbsolute(source)) throw new Error(`Expected absolute path: ${path}`);
@@ -313,6 +435,13 @@ function secretReference(value: unknown, path: string): string {
 
 function positiveInteger(value: unknown, path: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new Error(`Expected positive safe integer: ${path}`);
+  return value as number;
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number, path: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new Error(`Expected safe integer from ${minimum} through ${maximum}: ${path}`);
+  }
   return value as number;
 }
 

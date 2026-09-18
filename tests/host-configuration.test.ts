@@ -49,7 +49,10 @@ function host(overrides: readonly string[] = []): string {
 test("host configuration is strict, immutable, and keeps runtime selection operator-owned", () => {
   const configuration = parseHostConfiguration(host());
   assert.equal(configuration.version, 1);
-  assert.equal(configuration.repositories[0]?.provider.projectId, 3);
+  const provider = configuration.repositories[0]?.provider;
+  assert.equal(provider?.type, "vikunja");
+  if (provider?.type !== "vikunja") throw new Error("Expected Vikunja configuration");
+  assert.equal(provider.projectId, 3);
   assert.equal(configuration.runtimes[0]?.name, "codex");
   assert.equal(configuration.runtimes[0]?.type, "codex-app-server");
   assert.deepEqual(configuration.runtimes[0]?.serverArguments, ["app-server", "--listen", "stdio://"]);
@@ -57,7 +60,7 @@ test("host configuration is strict, immutable, and keeps runtime selection opera
   assert.equal(configuration.logging.level, "info");
   assert.equal(configuration.service.stopTimeoutSeconds, 60);
   assert.equal(Object.isFrozen(configuration), true);
-  assert.equal(Object.isFrozen(configuration.repositories[0]?.provider.requiredLabels), true);
+  assert.equal(Object.isFrozen(provider.requiredLabels), true);
 
   assert.throws(() => parseHostConfiguration(`${host()}\nunexpected: true`), /Unknown host configuration key/u);
   assert.throws(() => parseHostConfiguration(host().replace("/srv/ensemble", "relative")), /absolute path/u);
@@ -66,6 +69,99 @@ test("host configuration is strict, immutable, and keeps runtime selection opera
     /Forbidden runtime environment variable/u);
   assert.throws(() => parseHostConfiguration(host().replace("- name: codex", "- name: codex\n  - name: codex")), /type|unique/u);
   assert.throws(() => parseHostConfiguration(host().replace("level: info", "level: trace")), /logging\.level/u);
+});
+
+test("host configuration parses Azure DevOps Services and webhook listener defaults", () => {
+  const source = host([
+    "      type: azure-devops",
+    "      organization: example-org",
+    "      project: Example Project",
+    "      pat: $AZURE_DEVOPS_PAT",
+    "      queryId: 01234567-89ab-cdef-0123-456789abcdef",
+    "      stateField: Custom.EnsembleState",
+    "      nativeStates:",
+    "        ready: New",
+    "        running: Active",
+    "        blocked: Blocked",
+    "        failed: Failed",
+    "        completed: Closed",
+    "      priorityField: Microsoft.VSTS.Common.Priority",
+    "      requiredTags: [ensemble, ready]",
+    "      requiredAssignee: agent@example.test",
+    "      blockerRelation: System.LinkTypes.Dependency-Reverse",
+    "      acceptanceCriteriaField: Microsoft.VSTS.Common.AcceptanceCriteria",
+    "      webhook:",
+    "        routeId: azure-main",
+    "        username: $AZURE_WEBHOOK_USERNAME",
+    "        password: $AZURE_WEBHOOK_PASSWORD",
+  ]).replace(
+    "  stopTimeoutSeconds: 60",
+    [
+      "  stopTimeoutSeconds: 60",
+      "  webhooks:",
+      "    publicBaseUrl: https://ensemble.example.test",
+    ].join("\n"),
+  ).replace([
+    "      type: vikunja",
+    "      baseUrl: https://vikunja.example.test",
+    "      token: $VIKUNJA_API_TOKEN",
+    "      projectId: 3",
+    "      viewId: 9",
+    "      requiredLabels: [ensemble:ready]",
+  ].join("\n"), "");
+  const configuration = parseHostConfiguration(source);
+  const provider = configuration.repositories[0]?.provider;
+  assert.equal(provider?.type, "azure-devops");
+  if (provider?.type !== "azure-devops") throw new Error("Expected Azure DevOps configuration");
+  assert.equal(provider.organization, "example-org");
+  assert.deepEqual(provider.nativeStates, {
+    ready: "New", running: "Active", blocked: "Blocked", failed: "Failed", completed: "Closed",
+  });
+  assert.deepEqual(configuration.service.webhooks, {
+    publicBaseUrl: "https://ensemble.example.test/",
+    listenHost: "0.0.0.0",
+    listenPort: 8_787,
+    maxBodyBytes: 65_536,
+    requestTimeoutMs: 10_000,
+    closeTimeoutMs: 5_000,
+  });
+  assert.equal(Object.isFrozen(provider.requiredTags), true);
+});
+
+test("host configuration cross-validates Azure webhook listener and routes", () => {
+  const azure = host().replace([
+    "      type: vikunja",
+    "      baseUrl: https://vikunja.example.test",
+    "      token: $VIKUNJA_API_TOKEN",
+    "      projectId: 3",
+    "      viewId: 9",
+    "      requiredLabels: [ensemble:ready]",
+  ].join("\n"), [
+    "      type: azure-devops",
+    "      organization: example",
+    "      project: ensemble",
+    "      pat: $AZURE_DEVOPS_PAT",
+    "      queryId: query",
+    "      stateField: Custom.EnsembleState",
+    "      nativeStates:",
+    "        ready: New",
+    "        running: Active",
+    "        blocked: Blocked",
+    "        failed: Failed",
+    "        completed: Closed",
+    "      webhook:",
+    "        routeId: main",
+    "        username: $AZURE_WEBHOOK_USERNAME",
+    "        password: $AZURE_WEBHOOK_PASSWORD",
+  ].join("\n"));
+  assert.throws(() => parseHostConfiguration(azure), /service\.webhooks is required/u);
+  assert.throws(() => parseHostConfiguration(host().replace("  stopTimeoutSeconds: 60", [
+    "  stopTimeoutSeconds: 60", "  webhooks:", "    publicBaseUrl: https://ensemble.example.test",
+  ].join("\n"))), /requires at least one provider webhook route/u);
+  assert.throws(() => parseHostConfiguration(azure.replace("routeId: main", "routeId: unsafe/path")), /safe opaque segment/u);
+  assert.throws(() => parseHostConfiguration(azure.replace("stopTimeoutSeconds: 60", [
+    "stopTimeoutSeconds: 60", "  webhooks:", "    publicBaseUrl: http://ensemble.example.test",
+  ].join("\n"))), /HTTPS URL/u);
 });
 
 test("host configuration rejects the removed Codex CLI runtime", () => {

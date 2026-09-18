@@ -104,6 +104,7 @@ The scheduler should never know which runtime is executing work.
 Ensemble MUST NOT depend on:
 
 * Vikunja
+* Azure DevOps
 * ClickUp
 * GitHub Issues
 * Linear
@@ -190,6 +191,7 @@ Responsibilities:
 * validate host and repository configuration before dispatch
 * schedule recurring ticks without overlapping the same tick
 * ask the Scheduler to reconcile, recover, retry, and dispatch work
+* accept optional authenticated provider wake hints and request an earlier tick
 * expose structured logs and immutable runtime snapshots
 * accept shutdown and reload signals
 * stop intake and drain or cancel workers during bounded graceful shutdown
@@ -197,6 +199,15 @@ Responsibilities:
 The Service MUST NOT select roles, interpret provider metadata, calculate retry
 eligibility, or invoke a Runtime directly. Those decisions remain behind the
 Scheduler and Execution Engine boundaries.
+
+A provider wake hint MUST be treated only as a request to run the repository's
+normal tick sooner. It MUST NOT carry trusted task state, bypass provider reads,
+alter candidate ordering or eligibility, or replace bounded periodic polling.
+Wake requests received during a tick MAY be coalesced, but MUST cause a later
+tick without creating overlapping ticks or an unbounded callback backlog.
+Provider-specific ingress authentication, route mapping, payload handling, and
+response behavior belong to the host and Provider Adapter integration, not the
+Scheduler, Execution Engine, or Runtime.
 
 At startup the Service MUST validate host configuration, load an initial valid
 repository configuration for every configured repository it can resolve,
@@ -447,6 +458,48 @@ production Provider Adapter. A production adapter MUST demonstrate:
 
 Additional adapters MAY live in separate packages, but at least one supported
 profile MUST be runnable without downstream adapter implementation work.
+
+### Azure DevOps Services Production Adapter Profile
+
+The Azure DevOps production adapter supports Azure DevOps Services cloud REST
+7.1 only. Azure DevOps Server is outside this profile. All Azure-specific query,
+field, identity, relation, state, revision, authentication, and retry semantics
+MUST remain inside the adapter or host ingress; the Scheduler, Execution Engine,
+and Runtime MUST consume only portable contracts.
+
+The adapter MUST:
+
+* authenticate REST requests with a host-managed PAT using HTTP Basic auth
+* execute a configured saved flat work-item query as the complete managed
+  namespace, including terminal items needed for reconciliation and cleanup
+* require a configured custom work-item field whose Azure type is `plainText`
+  for repository-scoped durable execution state
+* map five distinct configured native states to portable ready, running,
+  blocked, failed, and completed states
+* apply configured tag, assignee, priority, acceptance-criteria, and blocker
+  mappings without exposing Azure metadata outside the adapter
+* discover repository-owned durable state with a bounded state-field WIQL read
+  so active executions remain recoverable after saved-query or status drift
+* guard every work-item lifecycle patch with the observed work-item revision and
+  never blindly retry a write
+* retry only safe reads on bounded transient transport, timeout, rate-limit, and
+  server failures, while honoring provider retry hints
+* expose bounded, active-claim-guarded runtime tools through the portable tool
+  contract without exposing the PAT
+
+The Azure adapter MAY use authenticated Azure Service Hook notifications as
+wake hints in addition to polling. The supported subscriptions are
+`workitem.created` and `workitem.updated`; their bodies are not authoritative
+task input. Each repository route MUST use independently configured HTTP Basic
+credentials. The host listener MUST require an HTTPS `publicBaseUrl` for route
+publication, MUST expose the public route through credential-free structured
+startup logs, and MUST assume TLS is terminated outside Ensemble. Unless
+explicitly overridden, it listens on `0.0.0.0:8787`. Ingress waits, body sizes,
+shutdown, and error responses MUST remain bounded.
+
+This profile concerns Azure Boards work items only. It MUST NOT imply ownership
+of Azure Repos, Pipelines, builds, releases, deployments, or agent-produced
+source-control changes.
 
 ---
 

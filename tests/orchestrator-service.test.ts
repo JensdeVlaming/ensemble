@@ -39,6 +39,7 @@ class ControlledScheduler implements OrchestratorScheduler {
   tickCalls = 0;
   startupFailures = 0;
   startupGate?: Deferred<void>;
+  shutdownGate?: Deferred<void>;
   readonly reloadResults: Array<SchedulerConfigurationReloadReport | Error> = [];
   readonly tickGates: Deferred<void>[] = [];
 
@@ -71,6 +72,7 @@ class ControlledScheduler implements OrchestratorScheduler {
   async shutdown(options: SchedulerShutdownOptions): Promise<SchedulerShutdownReport> {
     this.events.push("shutdown");
     this.shutdownOptions.push(options);
+    await this.shutdownGate?.promise;
     return { drained: true, cancelledTaskIds: [], remainingTaskIds: [] };
   }
 }
@@ -102,16 +104,26 @@ class FakeSignals implements ServiceSignalSource {
 class FakeTimers implements ServiceTimerSource {
   readonly pending = new Map<object, () => void>();
   readonly delays: number[] = [];
+  readonly cleared: Array<() => void> = [];
 
   set(delayMs: number, callback: () => void): unknown {
-    const handle = {};
+    const handle = { delayMs };
     this.delays.push(delayMs);
     this.pending.set(handle, callback);
     return handle;
   }
 
   clear(handle: unknown): void {
+    const callback = this.pending.get(handle as object);
+    if (callback) this.cleared.push(callback);
     this.pending.delete(handle as object);
+  }
+
+  fire(delayMs: number): void {
+    const entry = [...this.pending.entries()].find(([handle]) => (handle as { delayMs?: number }).delayMs === delayMs);
+    if (!entry) throw new Error(`No ${delayMs}ms timer pending`);
+    this.pending.delete(entry[0]);
+    entry[1]();
   }
 
   fireAll(): void {
@@ -228,6 +240,71 @@ test("completion-relative recurrence never overlaps or accumulates timer backlog
   await service.shutdown();
   await started;
   assert.equal(timers.pending.size, 0);
+});
+
+test("repository wakes preempt only their idle poll and stale timer callbacks are inert", async () => {
+  const first = new ControlledScheduler();
+  const second = new ControlledScheduler();
+  const timers = new FakeTimers();
+  const service = new OrchestratorService([
+    registration("first", first),
+    registration("second", second),
+  ], new FakeSignals(), timers);
+
+  const started = service.start();
+  await waitFor(() => first.tickCalls === 1 && second.tickCalls === 1 && timers.pending.size === 2);
+  service.requestWake("first");
+  assert.equal(timers.pending.size, 2);
+  assert.equal(timers.cleared.length, 1);
+  assert.equal(timers.delays.at(-1), 0);
+
+  timers.cleared[0]!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(first.tickCalls, 1);
+  assert.equal(second.tickCalls, 1);
+
+  timers.fire(0);
+  await waitFor(() => first.tickCalls === 2);
+  assert.equal(second.tickCalls, 1);
+  await service.shutdown();
+  await started;
+});
+
+test("wakes during a tick coalesce into one trailing-edge tick", async () => {
+  const scheduler = new ControlledScheduler();
+  const active = deferred<void>();
+  scheduler.tickGates.push(active);
+  const timers = new FakeTimers();
+  const service = new OrchestratorService([registration("repository", scheduler)], new FakeSignals(), timers);
+
+  const started = service.start();
+  await waitFor(() => scheduler.tickCalls === 1);
+  service.requestWake("repository");
+  service.requestWake("repository");
+  service.requestWake("repository");
+  assert.equal(timers.pending.size, 0);
+  active.resolve();
+  await waitFor(() => timers.pending.size === 1);
+  assert.equal(timers.delays.at(-1), 0);
+  timers.fire(0);
+  await waitFor(() => scheduler.tickCalls === 2 && timers.pending.size === 1);
+  assert.equal(timers.delays.at(-1), 10);
+
+  await service.shutdown();
+  await started;
+});
+
+test("wake requests reject unknown repositories and closed intake", async () => {
+  const scheduler = new ControlledScheduler();
+  scheduler.shutdownGate = deferred<void>();
+  const service = new OrchestratorService([registration("repository", scheduler)],
+    new FakeSignals(), new FakeTimers());
+  assert.throws(() => service.requestWake("missing"), /Unknown orchestrator repository/u);
+  const shutdown = service.shutdown();
+  assert.throws(() => service.requestWake("repository"), /while draining/u);
+  scheduler.shutdownGate.resolve();
+  await shutdown;
+  assert.throws(() => service.requestWake("repository"), /while stopped/u);
 });
 
 test("failed startup retries on the next host-timed cycle rather than immediately", async () => {
