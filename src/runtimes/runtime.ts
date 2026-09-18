@@ -57,10 +57,10 @@ export function validateRuntimeTools(tools: readonly import("../domain/model.ts"
     if (typeof tool.invoke !== "function") throw new Error(`Runtime tool invocation is required: ${tool.name}`);
     return Object.freeze({ name: tool.name, description: tool.description,
       inputSchema: schema,
-      invoke: async (input: unknown) => {
+      invoke: async (input: unknown, context?: import("../domain/model.ts").RuntimeToolInvocationContext) => {
         const normalized = clonePortableJson(input, "Runtime tool input", 131_072);
         validateSchemaValue(schema, normalized);
-        return validatePortableToolResult(await tool.invoke(normalized));
+        return validatePortableToolResult(await tool.invoke(normalized, context));
       } });
   }));
 }

@@ -152,7 +152,11 @@ export interface RuntimeTool {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, PortableJsonValue>>;
-  invoke(input: unknown): Promise<PortableJsonValue>;
+  invoke(input: unknown, context?: RuntimeToolInvocationContext): Promise<PortableJsonValue>;
+}
+
+export interface RuntimeToolInvocationContext {
+  readonly signal: AbortSignal;
 }
 
 export interface BlockingRequest {

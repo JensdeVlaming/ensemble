@@ -34,17 +34,26 @@ test("OpenCode tool bridge exposes scoped MCP tools and revokes the capability o
   await assert.rejects(fetch(bridge.url, { method: "POST", body: "{}" }));
 });
 
-test("OpenCode tool bridge closes without waiting for a non-cooperative callback", async () => {
+test("OpenCode tool bridge aborts an accepted callback when the capability is revoked", async () => {
   let started!: () => void;
   const invoked = new Promise<void>((resolve) => { started = resolve; });
+  let observedSignal: AbortSignal | undefined;
   const bridge = await startOpenCodeToolBridge([{
-    name: "wait_forever", description: "Never returns", inputSchema: { type: "object" },
-    invoke: async () => { started(); return new Promise<never>(() => undefined); },
+    name: "wait_until_cancelled", description: "Waits for cancellation", inputSchema: { type: "object" },
+    invoke: async (_input, context) => {
+      observedSignal = context?.signal;
+      started();
+      await new Promise<void>((resolve) => context?.signal.addEventListener("abort", () => resolve(), { once: true }));
+      context?.signal.throwIfAborted();
+      return {};
+    },
   }]);
-  const pending = rpc(bridge.url, 1, "tools/call", { name: "wait_forever", arguments: {} }).catch(() => undefined);
+  const pending = rpc(bridge.url, 1, "tools/call", { name: "wait_until_cancelled", arguments: {} }).catch(() => undefined);
   await invoked;
-  await bridge.close();
+  bridge.deactivate();
+  assert.equal(observedSignal?.aborted, true);
   await pending;
+  await bridge.close();
 });
 
 async function rpc(url: string, id: number, method: string, params: unknown): Promise<RpcResponse> {

@@ -37,6 +37,14 @@ OpenCode binds only to loopback on a runtime-selected ephemeral port. Ensemble
 does not pass API keys or provider credentials to the child. It generates a
 one-time server password for each process and authenticates every local HTTP
 and event-stream request; the password is never persisted or logged.
+Repository-local OpenCode configuration, plugins, prompts and skills are
+disabled. Every child also receives an isolated temporary `HOME` and
+`XDG_CONFIG_HOME`, so user-global instructions, plugins, tools and MCP servers
+cannot enter an execution. Authentication remains available through the original
+OpenCode data directory, pinned separately as `XDG_DATA_HOME`. Ensemble also
+forces session sharing off and denies external-directory
+access; accepted repository instructions are supplied through Ensemble's validated
+runtime context instead.
 
 ## Select the model and policy
 
@@ -63,8 +71,14 @@ After a durable claim, Ensemble starts a random-capability MCP endpoint on
 `127.0.0.1` and dynamically registers it with that execution's OpenCode server.
 Tool callbacks and provider credentials remain in the Ensemble parent process.
 Closing, cancelling or losing the execution closes the bridge and revokes the
-capability. The per-execution OpenCode process prevents registrations leaking
+capability, including cancellation signals for already accepted callbacks. The
+per-execution OpenCode process is fully terminated before Ensemble exposes
+terminal completion, preventing registrations or workspace access from leaking
 between tasks.
+
+The runtime currently supports macOS and Linux. It fails closed on Windows
+because Node.js cannot provide the process-tree ownership needed to prove that
+OpenCode tool processes have terminated before workspace cleanup.
 
 ## Validate and run
 

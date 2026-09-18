@@ -80,6 +80,13 @@ export class ExecutionCancelledError extends Error {
   }
 }
 
+class RuntimeStartTimeoutError extends Error {
+  constructor() {
+    super("Runtime start timed out");
+    this.name = "RuntimeStartTimeoutError";
+  }
+}
+
 export interface ExecutionEnvironment {
   readonly configuration: RepositoryConfiguration;
   start(request: RuntimeExecutionRequest): Promise<RunningExecution>;
@@ -328,7 +335,7 @@ export class ExecutionEngine implements TaskExecutionService {
       });
     } catch (error) {
       this.#emit(request.task, { ...contextEvent(request, "runtime.failed", "error"), data: { errorCategory: "runtime" } });
-      let safeToContinue = !(error instanceof ProcessTerminationUnconfirmedError);
+      let safeToContinue = !(error instanceof ProcessTerminationUnconfirmedError || error instanceof RuntimeStartTimeoutError);
       if (safeToContinue && attemptStarted && configuration.workspace?.hooks?.afterRun) {
         await finishAttempt().catch((hookError: unknown) => { safeToContinue = !(hookError instanceof ProcessTerminationUnconfirmedError); });
       }
@@ -399,16 +406,16 @@ async function startRuntimeWithin(runtime: Runtime, prepared: Parameters<Runtime
   const starting = runtime.start(prepared);
   if (timeoutMs === 0) {
     void starting.then((late) => runtime.cancel(late)).catch(() => undefined);
-    throw new Error("Runtime start timed out");
+    throw new RuntimeStartTimeoutError();
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       starting,
-      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Runtime start timed out")), timeoutMs); }),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new RuntimeStartTimeoutError()), timeoutMs); }),
     ]);
   } catch (error) {
-    if (error instanceof Error && error.message === "Runtime start timed out") {
+    if (error instanceof RuntimeStartTimeoutError) {
       void starting.then((late) => runtime.cancel(late)).catch(() => undefined);
     }
     throw error;
@@ -463,6 +470,7 @@ class LiveRunningExecution implements RunningExecution {
   #cancelCompletion?: Promise<void>;
   #cleanupStarted = false;
   #blockingObserved = false;
+  #safeToCleanup = true;
 
   constructor(options: LiveRunningExecutionOptions) {
     this.#options = options;
@@ -474,11 +482,11 @@ class LiveRunningExecution implements RunningExecution {
     this.#blocking = new Promise((resolve) => { this.#resolveBlocking = resolve; });
     this.#resultOutcome = options.session.result.then(validateRuntimeResult).then(
       (result): ResultOutcome => ({ kind: "result", result }),
-      (error: unknown): ResultOutcome => ({ kind: "runtime_error", error }),
+      (error: unknown): ResultOutcome => { this.#observeRuntimeSafety(error); return { kind: "runtime_error", error }; },
     );
     this.#eventOutcome = this.#pumpEvents().then(
       (): EventOutcome => ({ kind: "events_done" }),
-      (error: unknown): EventOutcome => ({ kind: "event_error", error }),
+      (error: unknown): EventOutcome => { this.#observeRuntimeSafety(error); return { kind: "event_error", error }; },
     );
     this.result = this.#settle().then(
       (value) => { this.#finish(value.kind === "blocked" ? "blocked" : "completed"); return value; },
@@ -616,18 +624,25 @@ class LiveRunningExecution implements RunningExecution {
   #cancelRuntimeBounded(): Promise<void> {
     this.#runtimeCancellation ??= Promise.race([
       Promise.resolve().then(() => this.#options.runtime.cancel(this.#options.session)).then(
-        () => undefined,
-        () => undefined,
+        () => ({ kind: "settled" as const }),
+        (error: unknown) => ({ kind: "rejected" as const, error }),
       ),
-      delay(this.#options.cancellationMs),
-    ]).then(() => undefined);
+      delay(this.#options.cancellationMs).then(() => ({ kind: "timeout" as const })),
+    ]).then((outcome) => {
+      if (outcome.kind === "timeout") this.#safeToCleanup = false;
+      else if (outcome.kind === "rejected") this.#observeRuntimeSafety(outcome.error);
+    });
     return this.#runtimeCancellation;
+  }
+
+  #observeRuntimeSafety(error: unknown): void {
+    if (error instanceof ProcessTerminationUnconfirmedError) this.#safeToCleanup = false;
   }
 
   #finish(state: "completed" | "blocked" | "failed" | "cancelled"): void {
     this.#state = state;
     this.#finishedAt = this.#options.now();
-    this.#beginCleanup();
+    if (this.#safeToCleanup) this.#beginCleanup();
     this.#emit(state === "completed" ? "runtime.completed" : state === "blocked" ? "runtime.blocked" : "runtime.failed",
       state === "completed" ? "info" : state === "blocked" ? "warn" : "error",
       state === "completed" ? { success: true } : state === "blocked" ? { reason: "operator" }

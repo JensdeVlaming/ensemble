@@ -397,6 +397,24 @@ test("Vikunja tools are revoked when the durable lease owner changes", async () 
   await assert.rejects(read.invoke({}), /Vikunja tool task_read failed/u);
 });
 
+test("Vikunja comment tools stop before writing when their runtime capability is cancelled", async () => {
+  const api = new FakeVikunjaApi([task(1, "Cancelled tool", [1], 1)]);
+  const provider = providerFor(api, "execution-cancelled-tool");
+  const active = await provider.beginExecution("1", "implementation", "running", leaseClaim(undefined, "worker-1"));
+  const add = validateRuntimeTools(await provider.getRuntimeTools("1", active.id, active.ownerId!))
+    .find((tool) => tool.name === "task_comment_add")!;
+  let release!: () => void;
+  api.commentReadGate = new Promise<void>((resolve) => { release = resolve; });
+  const controller = new AbortController();
+  const invocation = add.invoke({ body: "Must not be written", idempotencyKey: "cancelled" }, { signal: controller.signal });
+  while (api.maxConcurrentCommentReads === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(invocation, /Vikunja tool task_comment_add failed/u);
+  release();
+  assert.equal(api.commentWriteCount, 1);
+  assert.equal((api.comments.get(1) ?? []).some((comment) => String(comment.comment).includes("Must not be written")), false);
+});
+
 test("Vikunja terminal writers fold concurrent duplicates into one semantic result", async () => {
   const api = new FakeVikunjaApi([task(1, "Concurrent finish", [1], 1)]);
   const provider = providerFor(api, "execution-concurrent");
@@ -839,7 +857,15 @@ class FakeVikunjaApi {
         this.#concurrentCommentReads += 1;
         this.maxConcurrentCommentReads = Math.max(this.maxConcurrentCommentReads, this.#concurrentCommentReads);
         try {
-          await this.commentReadGate;
+          if (this.commentReadGate) {
+            await Promise.race([
+              this.commentReadGate,
+              new Promise<never>((_resolve, reject) => {
+                if (init?.signal?.aborted) reject(init.signal.reason);
+                else init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+              }),
+            ]);
+          }
           return response(comments);
         } finally {
           this.#concurrentCommentReads -= 1;

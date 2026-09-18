@@ -19,6 +19,7 @@ import type {
   Workspace,
   WorkspaceManager,
 } from "../src/index.ts";
+import { ProcessTerminationUnconfirmedError } from "../src/execution/process.ts";
 
 const repository: RepositoryRef = { id: "running", url: "local://running" };
 
@@ -211,7 +212,7 @@ test("runtime startup is bounded and a late session is cancelled without retaini
     engine.withEnvironment(item, async (environment) => environment.start(request(item))),
     /Runtime start timed out/u,
   );
-  assert.equal(workspaces.cleaned, 1);
+  assert.equal(workspaces.cleaned, 0);
   startup.resolve({
     id: "late-session",
     events: (async function* (): AsyncIterable<RuntimeEvent> {})(),
@@ -261,11 +262,35 @@ test("cancellation is first-reason, idempotent, bounded, and observes detached f
     return true;
   });
   assert.equal(cancellations, 1);
-  assert.equal(workspaces.cleaned, 1);
+  assert.equal(workspaces.cleaned, 0);
   assert.equal(running.snapshot().state, "cancelled");
   assert.equal(running.snapshot().cancellationReason, "shutdown");
 
   runtimeResult.reject(new Error("late result rejection"));
   eventNext.reject(new Error("late event rejection"));
   await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("unconfirmed runtime termination suppresses workspace cleanup", async () => {
+  const root = await fixture();
+  const item = task("unsafe-termination");
+  const workspaces = new TrackingWorkspaces(root);
+  const termination = new ProcessTerminationUnconfirmedError("Runtime process group");
+  const runtime: Runtime = {
+    name: "controlled",
+    prepare: async (context) => ({ id: "prepared", context, payload: null }),
+    start: async () => ({
+      id: "runtime-session",
+      events: (async function* (): AsyncIterable<RuntimeEvent> { throw termination; })(),
+      result: Promise.reject(termination),
+    }),
+    resume: async (session) => session,
+    cancel: async () => { throw termination; },
+  };
+  const engine = new ExecutionEngine(new RuntimeRegistry([runtime]), workspaces,
+    new WorkspaceConfigurationResolver(new RepositoryConfigLoader(), root));
+
+  const running = await engine.withEnvironment(item, async (environment) => environment.start(request(item)));
+  await assert.rejects(running.result, ProcessTerminationUnconfirmedError);
+  assert.equal(workspaces.cleaned, 0);
 });

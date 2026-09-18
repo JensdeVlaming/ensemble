@@ -23,8 +23,9 @@ export async function startOpenCodeToolBridge(
   const available = new Map(tools.map((tool) => [tool.name, tool]));
   let active = true;
   let closed = false;
+  let invocations = new AbortController();
   const server = createServer((request, response) => {
-    void handleRequest(request, response, path, available, () => closed, () => active).catch(() => {
+    void handleRequest(request, response, path, available, () => closed, () => active, () => invocations.signal).catch(() => {
       if (!response.headersSent) response.writeHead(500, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "Ensemble tool bridge failed" }));
     });
@@ -41,12 +42,20 @@ export async function startOpenCodeToolBridge(
   return Object.freeze({
     name,
     url: `http://127.0.0.1:${address.port}${path}`,
-    activate: () => { if (!closed) active = true; },
-    deactivate: () => { active = false; },
+    activate: () => {
+      if (closed) return;
+      if (invocations.signal.aborted) invocations = new AbortController();
+      active = true;
+    },
+    deactivate: () => {
+      active = false;
+      invocations.abort();
+    },
     close: async () => {
       if (closed) return;
       closed = true;
       active = false;
+      invocations.abort();
       available.clear();
       const closing = new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeAllConnections();
@@ -62,6 +71,7 @@ async function handleRequest(
   tools: ReadonlyMap<string, RuntimeTool>,
   isClosed: () => boolean,
   isActive: () => boolean,
+  invocationSignal: () => AbortSignal,
 ): Promise<void> {
   if (request.url !== path || isClosed()) {
     response.writeHead(404).end();
@@ -118,7 +128,9 @@ async function handleRequest(
       return;
     }
     try {
-      const result = await tool.invoke(params?.arguments ?? {});
+      const signal = invocationSignal();
+      const result = await tool.invoke(params?.arguments ?? {}, { signal });
+      if (signal.aborted || isClosed() || !isActive()) throw new Error("Ensemble tool capability was revoked");
       writeJson(response, 200, rpcResult(id, {
         content: [{ type: "text", text: JSON.stringify(result) }],
         ...(isRecord(result) ? { structuredContent: result } : {}),

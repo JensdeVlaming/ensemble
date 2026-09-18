@@ -47,6 +47,10 @@ export interface VikunjaPaginationLimits {
   readonly maxItems: number;
 }
 
+export interface VikunjaRequestOptions {
+  readonly signal?: AbortSignal;
+}
+
 export class VikunjaApiError extends Error {
   readonly status: number;
   readonly code?: number;
@@ -108,17 +112,18 @@ export class VikunjaClient {
     return this.#lastObserverError;
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    return jsonResponse<T>(await this.#responseWithRetries(method, path, body));
+  async request<T>(method: string, path: string, body?: unknown, options: VikunjaRequestOptions = {}): Promise<T> {
+    return jsonResponse<T>(await this.#responseWithRetries(method, path, body, options.signal));
   }
 
-  async #responseWithRetries(method: string, path: string, body?: unknown): Promise<Response> {
+  async #responseWithRetries(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<Response> {
     const normalizedMethod = method.toUpperCase();
     let attempt = 1;
     while (true) {
       try {
-        return await this.#requestResponse(normalizedMethod, path, body);
+        return await this.#requestResponse(normalizedMethod, path, body, signal);
       } catch (error) {
+        if (signal?.aborted) throw error;
         const retryable = error instanceof VikunjaApiError && isRetryable(error.status);
         const willRetry = normalizedMethod === "GET" && retryable && attempt <= this.maxRetries;
         if (error instanceof VikunjaApiError && error.status === 429) {
@@ -160,7 +165,7 @@ export class VikunjaClient {
     }
   }
 
-  async #requestResponse(method: string, path: string, body?: unknown): Promise<Response> {
+  async #requestResponse(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
@@ -172,7 +177,7 @@ export class VikunjaClient {
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
       });
       if (response.ok) return response;
       const payload = await safeJson(response);
@@ -183,6 +188,7 @@ export class VikunjaClient {
     } catch (error) {
       if (error instanceof VikunjaApiError) throw error;
       if (controller.signal.aborted) throw new VikunjaApiError(`Vikunja ${method} ${path} timed out`, 408);
+      if (signal?.aborted) throw new VikunjaApiError(`Vikunja ${method} ${path} was cancelled`, 499);
       throw new VikunjaApiError(`Vikunja ${method} ${path} transport failed`, 0);
     } finally {
       clearTimeout(timeout);

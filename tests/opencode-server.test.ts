@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { access } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { Server, ServerResponse } from "node:http";
 import test from "node:test";
@@ -7,6 +8,7 @@ import type { OpenCodeServerLauncher, OpenCodeServerProcess } from "../src/index
 
 class FakeProcess implements OpenCodeServerProcess {
   readonly exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  readonly ready: Promise<string>;
   readonly server: Server;
   readonly requests: Array<{ path: string; body?: unknown; directory?: string; authorization?: string }> = [];
   eventResponse?: ServerResponse;
@@ -16,19 +18,34 @@ class FakeProcess implements OpenCodeServerProcess {
   readonly stallEvents: boolean;
   readonly connectMcp: boolean;
   mcpResult?: unknown;
+  running = true;
+  readonly killSignals: NodeJS.Signals[] = [];
+  readonly exitAfterHealth: boolean;
+  readonly oversizedHealth: boolean;
+  ignoreSigterm: boolean;
+  ignoreSigkill: boolean;
   #resolveExit!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
-  constructor(port: number, options: { emitIdle: boolean; messageDelayMs: number; stallEvents: boolean; connectMcp: boolean }) {
+  constructor(port: number, options: { emitIdle: boolean; messageDelayMs: number; stallEvents: boolean; connectMcp: boolean;
+    exitAfterHealth: boolean; oversizedHealth: boolean; ignoreSigterm: boolean; ignoreSigkill: boolean; unexpectedReady: boolean }) {
     this.emitIdle = options.emitIdle;
     this.messageDelayMs = options.messageDelayMs;
     this.stallEvents = options.stallEvents;
     this.connectMcp = options.connectMcp;
+    this.exitAfterHealth = options.exitAfterHealth;
+    this.oversizedHealth = options.oversizedHealth;
+    this.ignoreSigterm = options.ignoreSigterm;
+    this.ignoreSigkill = options.ignoreSigkill;
     this.exit = new Promise((resolve) => { this.#resolveExit = resolve; });
+    this.ready = Promise.resolve(`http://127.0.0.1:${port + (options.unexpectedReady ? 1 : 0)}`);
     this.server = createServer((request, response) => { void this.handle(request, response); });
     this.server.listen(port, "127.0.0.1");
   }
+  isRunning(): boolean { return this.running; }
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
-    if (this.killed) return;
+    this.killSignals.push(signal);
+    if (!this.running || (signal === "SIGTERM" && this.ignoreSigterm) || (signal === "SIGKILL" && this.ignoreSigkill)) return;
     this.killed = true;
+    this.running = false;
     this.eventResponse?.end();
     this.server.closeAllConnections();
     this.server.close();
@@ -45,7 +62,16 @@ class FakeProcess implements OpenCodeServerProcess {
     this.requests.push({ path, ...(body === undefined ? {} : { body }),
       ...(typeof request.headers["x-opencode-directory"] === "string" ? { directory: request.headers["x-opencode-directory"] } : {}),
       ...(typeof request.headers.authorization === "string" ? { authorization: request.headers.authorization } : {}) });
-    if (path === "/global/health") return json(response, { healthy: true, version: "1.18.31" });
+    if (path === "/global/health") {
+      if (this.oversizedHealth) {
+        response.writeHead(200, { "content-type": "application/json", "content-length": "1048577" });
+        response.end("x");
+        return;
+      }
+      json(response, { healthy: true, version: "1.18.31" });
+      if (this.exitAfterHealth) setImmediate(() => this.kill("SIGKILL"));
+      return;
+    }
     if (path === "/session") return json(response, { id: "session-1" });
     if (path === "/event") {
       if (this.stallEvents) return;
@@ -82,11 +108,18 @@ class FakeLauncher implements OpenCodeServerLauncher {
   messageDelayMs = 0;
   stallEvents = false;
   connectMcp = false;
+  exitAfterHealth = false;
+  oversizedHealth = false;
+  ignoreSigterm = false;
+  ignoreSigkill = false;
+  unexpectedReady = false;
   launch(executable: string, arguments_: readonly string[], options: { cwd: string; environment: Readonly<Record<string, string>> }): FakeProcess {
     this.executable = executable; this.arguments = arguments_; this.environment = options.environment;
     const port = Number(arguments_[arguments_.indexOf("--port") + 1]);
     const process = new FakeProcess(port, { emitIdle: this.emitIdle, messageDelayMs: this.messageDelayMs,
-      stallEvents: this.stallEvents, connectMcp: this.connectMcp });
+      stallEvents: this.stallEvents, connectMcp: this.connectMcp, exitAfterHealth: this.exitAfterHealth,
+      oversizedHealth: this.oversizedHealth, ignoreSigterm: this.ignoreSigterm, ignoreSigkill: this.ignoreSigkill,
+      unexpectedReady: this.unexpectedReady });
     this.processes.push(process); return process;
   }
 }
@@ -96,11 +129,19 @@ test("OpenCode server transport performs health-only diagnostics", async () => {
   const transport = new OpenCodeServerTransport({ launcher, executable: "/opencode", environment: { HOME: "/home" } });
   await transport.diagnose("/configuration");
   assert.deepEqual(launcher.arguments, ["serve", "--pure", "--hostname", "127.0.0.1", "--port", launcher.arguments?.at(-1)]);
-  assert.equal(launcher.environment?.HOME, "/home");
   assert.match(launcher.environment?.OPENCODE_SERVER_PASSWORD ?? "", /^[A-Za-z0-9_-]{43}$/u);
+  assert.equal(launcher.environment?.OPENCODE_DISABLE_PROJECT_CONFIG, "1");
+  assert.equal(launcher.environment?.OPENCODE_DISABLE_CLAUDE_CODE, "1");
+  const isolatedConfig = launcher.environment?.XDG_CONFIG_HOME;
+  assert.match(isolatedConfig ?? "", /ensemble-opencode-/u);
+  assert.equal(launcher.environment?.HOME, isolatedConfig);
+  assert.equal(launcher.environment?.XDG_DATA_HOME, "/home/.local/share");
+  assert.deepEqual(JSON.parse(launcher.environment?.OPENCODE_CONFIG_CONTENT ?? ""), { share: "disabled" });
+  assert.deepEqual(JSON.parse(launcher.environment?.OPENCODE_PERMISSION ?? ""), { external_directory: "deny" });
   assert.match(launcher.processes[0]?.requests[0]?.authorization ?? "", /^Basic /u);
   assert.deepEqual(launcher.processes[0]?.requests.map((request) => request.path), ["/global/health"]);
   assert.equal(launcher.processes[0]?.killed, true);
+  await assert.rejects(access(isolatedConfig!));
 });
 
 test("OpenCode server transport sends model/schema, streams correlated events, and cancels", async () => {
@@ -120,9 +161,8 @@ test("OpenCode server transport sends model/schema, streams correlated events, a
   assert.equal(body.format?.type, "json_schema");
   assert.equal(body.parts?.length, 1);
   assert.equal(prompt?.directory, "/workspace");
-  await transport.cancel(session);
-  assert.equal(launcher.processes[0]?.requests.some((request) => request.path.endsWith("/abort")), true);
   assert.equal(launcher.processes[0]?.killed, true);
+  assert.equal(launcher.processes[0]?.requests.some((request) => request.path.endsWith("/abort")), false);
 });
 
 test("OpenCode server configuration is strict and model selection is repository-owned", () => {
@@ -134,6 +174,10 @@ test("OpenCode server configuration is strict and model selection is repository-
   assert.throws(() => transport.validateConfiguration({ automaticApprovals: ["read"] }), /requires operatorRequests/u);
 });
 
+test("OpenCode fails closed on Windows where process-tree ownership is unavailable", () => {
+  assert.throws(() => new OpenCodeServerTransport({ platform: "win32" }), /unsupported on Windows/u);
+});
+
 test("OpenCode model turns outlive control requests and complete without session.idle", async () => {
   const launcher = new FakeLauncher();
   launcher.emitIdle = false;
@@ -142,7 +186,7 @@ test("OpenCode model turns outlive control requests and complete without session
   const session = await transport.start({ id: "run", cwd: "/workspace", prompt: "work", config: {}, tools: [] });
   await collect(session.messages);
   assert.equal((await session.result as { outcome: string }).outcome, "approved");
-  await transport.cancel(session);
+  assert.equal(launcher.processes[0]?.killed, true);
 });
 
 test("OpenCode bounds event-stream startup and cleans the child process", async () => {
@@ -166,7 +210,62 @@ test("OpenCode registers and invokes execution-scoped MCP tools", async () => {
   await session.result;
   assert.deepEqual(inputs, [{ id: "task-1" }]);
   assert.deepEqual((launcher.processes[0]?.mcpResult as { result?: { structuredContent?: unknown } }).result?.structuredContent, { ready: true });
+  assert.equal(launcher.processes[0]?.killed, true);
+});
+
+test("OpenCode cancels an active turn and escalates process-group termination", async () => {
+  const launcher = new FakeLauncher();
+  launcher.messageDelayMs = 5_000;
+  launcher.ignoreSigterm = true;
+  const transport = new OpenCodeServerTransport({ launcher, requestTimeoutMs: 2_000 });
+  const session = await transport.start({ id: "run", cwd: "/workspace", prompt: "work", config: {}, tools: [] });
   await transport.cancel(session);
+  assert.equal(launcher.processes[0]?.requests.some((request) => request.path.endsWith("/abort")), true);
+  assert.deepEqual(launcher.processes[0]?.killSignals, ["SIGTERM", "SIGKILL"]);
+  await assert.rejects(session.result, /cancelled/u);
+});
+
+test("OpenCode does not disclose execution context without child-confirmed listener ownership", async () => {
+  const launcher = new FakeLauncher();
+  launcher.unexpectedReady = true;
+  launcher.connectMcp = true;
+  const transport = new OpenCodeServerTransport({ launcher, requestTimeoutMs: 2_000 });
+  await assert.rejects(transport.start({ id: "run", cwd: "/workspace", prompt: "secret task", config: {}, tools: [{
+    name: "provider_context", description: "Read provider context", inputSchema: { type: "object" }, invoke: async () => ({}),
+  }] }), /unexpected listener endpoint/u);
+  assert.deepEqual(launcher.processes[0]?.requests, []);
+});
+
+test("OpenCode revokes startup before capability disclosure when the confirmed child exits", async () => {
+  const launcher = new FakeLauncher();
+  launcher.exitAfterHealth = true;
+  launcher.connectMcp = true;
+  const transport = new OpenCodeServerTransport({ launcher, requestTimeoutMs: 2_000 });
+  await assert.rejects(transport.start({ id: "run", cwd: "/workspace", prompt: "secret task", config: {}, tools: [{
+    name: "provider_context", description: "Read provider context", inputSchema: { type: "object" }, invoke: async () => ({}),
+  }] }), /exited during startup/u);
+  assert.deepEqual(launcher.processes[0]?.requests.map((request) => request.path), ["/global/health"]);
+});
+
+test("OpenCode rejects oversized responses before buffering them", async () => {
+  const launcher = new FakeLauncher();
+  launcher.oversizedHealth = true;
+  const transport = new OpenCodeServerTransport({ launcher, requestTimeoutMs: 100 });
+  await assert.rejects(transport.diagnose("/configuration"), /maximum size|health check timed out/u);
+  assert.equal(launcher.processes[0]?.killed, true);
+});
+
+test("OpenCode surfaces unconfirmed process-group termination", async () => {
+  const launcher = new FakeLauncher();
+  launcher.ignoreSigterm = true;
+  launcher.ignoreSigkill = true;
+  const transport = new OpenCodeServerTransport({ launcher, requestTimeoutMs: 2_000, processStopTimeoutMs: 20 });
+  const session = await transport.start({ id: "run", cwd: "/workspace", prompt: "work", config: {}, tools: [] });
+  await assert.rejects(collect(session.messages), /termination could not be confirmed/u);
+  await assert.rejects(session.result, /termination could not be confirmed/u);
+  launcher.processes[0]!.ignoreSigkill = false;
+  launcher.processes[0]!.ignoreSigterm = false;
+  launcher.processes[0]!.kill("SIGKILL");
 });
 
 function json(response: ServerResponse, value: unknown, status = 200): void {

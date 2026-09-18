@@ -1,15 +1,32 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { RuntimeTool } from "../../domain/model.ts";
+import { ProcessTerminationUnconfirmedError } from "../../execution/process.ts";
 import { startOpenCodeToolBridge } from "./tool-bridge.ts";
 import type { OpenCodeRunRequest, OpenCodeTransport, OpenCodeTransportSession } from "./runtime.ts";
 
 const MAX_RESPONSE_BYTES = 1_048_576;
 const MAX_BUFFERED_MESSAGES = 4_096;
+const PROCESS_STOP_GRACE_MS = 1_000;
+const MAX_STARTUP_OUTPUT_BYTES = 8_192;
+
+const controlledEnvironment = Object.freeze({
+  OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+  OPENCODE_DISABLE_CLAUDE_CODE: "1",
+  OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: "1",
+  OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
+  OPENCODE_CONFIG_CONTENT: JSON.stringify({ share: "disabled" }),
+  OPENCODE_PERMISSION: JSON.stringify({ external_directory: "deny" }),
+});
 
 export interface OpenCodeServerProcess {
   readonly exit: Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>;
+  readonly ready: Promise<string>;
+  isRunning(): boolean;
   kill(signal?: NodeJS.Signals): void;
 }
 
@@ -25,22 +42,58 @@ export class NodeOpenCodeServerLauncher implements OpenCodeServerLauncher {
     readonly cwd: string;
     readonly environment: Readonly<Record<string, string>>;
   }): OpenCodeServerProcess {
-    const ownsProcessGroup = process.platform !== "win32";
+    if (process.platform === "win32") throw new Error("OpenCode runtime requires POSIX process-group isolation");
+    const ownsProcessGroup = true;
     const child = spawn(executable, [...arguments_], {
       cwd: options.cwd,
       env: { ...options.environment },
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
       detached: ownsProcessGroup,
     });
     child.stderr.resume();
+    let startupOutput = "";
+    let resolveReady!: (baseUrl: string) => void;
+    let rejectReady!: (error: unknown) => void;
+    let readySettled = false;
+    const ready = new Promise<string>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      if (readySettled) return;
+      startupOutput += String(chunk);
+      if (Buffer.byteLength(startupOutput, "utf8") > MAX_STARTUP_OUTPUT_BYTES) {
+        readySettled = true;
+        rejectReady(new Error("OpenCode server startup output exceeded its limit"));
+        return;
+      }
+      const match = startupOutput.match(/https?:\/\/127\.0\.0\.1:\d+/u);
+      if (match) {
+        readySettled = true;
+        resolveReady(match[0]);
+      }
+    });
+    child.stdout.resume();
     const exit = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>((resolve, reject) => {
-      child.once("error", reject);
+      child.once("error", (error) => {
+        if (!readySettled) { readySettled = true; rejectReady(error); }
+        reject(error);
+      });
       child.once("close", (code, signal) => {
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(new Error("OpenCode server exited before confirming listener ownership"));
+        }
         if (code === 0 || signal === "SIGTERM") resolve({ code, signal });
         else reject(new Error(`OpenCode server failed (${signal ?? code ?? "unknown"})`));
       });
     });
-    return { exit, kill: (signal = "SIGTERM") => {
+    return { exit, ready, isRunning: () => {
+      if (!ownsProcessGroup || child.pid === undefined) return child.exitCode === null && child.signalCode === null;
+      try { process.kill(-child.pid, 0); return true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+        if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+        throw error;
+      }
+    }, kill: (signal = "SIGTERM") => {
       if (!ownsProcessGroup || child.pid === undefined) {
         child.kill(signal);
         return;
@@ -59,6 +112,8 @@ export interface OpenCodeServerTransportOptions {
   readonly environment?: Readonly<Record<string, string>>;
   readonly serverArguments?: readonly string[];
   readonly requestTimeoutMs?: number;
+  readonly processStopTimeoutMs?: number;
+  readonly platform?: NodeJS.Platform;
 }
 
 interface OpenCodeConfig {
@@ -80,10 +135,10 @@ interface ServerState {
   readonly sessionId: string;
   readonly config: OpenCodeConfig;
   readonly authorization: string;
+  readonly configDirectory: string;
   readonly eventsAbort: AbortController;
   readonly bridge?: Awaited<ReturnType<typeof startOpenCodeToolBridge>>;
   active?: ActiveTurn;
-  idleTimer?: ReturnType<typeof setTimeout>;
   closing?: Promise<void>;
   closed: boolean;
 }
@@ -94,14 +149,19 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
   readonly environment: Readonly<Record<string, string>>;
   readonly serverArguments: readonly string[];
   readonly requestTimeoutMs: number;
+  readonly processStopTimeoutMs: number;
   readonly #sessions = new WeakMap<OpenCodeTransportSession, ServerState>();
 
   constructor(options: OpenCodeServerTransportOptions = {}) {
+    if ((options.platform ?? process.platform) === "win32") {
+      throw new Error("OpenCode runtime is unsupported on Windows because process-tree termination cannot be guaranteed");
+    }
     this.executable = options.executable ?? "opencode";
     this.launcher = options.launcher ?? new NodeOpenCodeServerLauncher();
     this.environment = Object.freeze({ ...(options.environment ?? {}) });
     this.serverArguments = Object.freeze([...(options.serverArguments ?? ["serve", "--pure"])]);
     this.requestTimeoutMs = positiveInteger(options.requestTimeoutMs ?? 30_000, "OpenCode server request timeout");
+    this.processStopTimeoutMs = positiveInteger(options.processStopTimeoutMs ?? PROCESS_STOP_GRACE_MS, "OpenCode process stop timeout");
   }
 
   validateConfiguration(config: Readonly<Record<string, unknown>>): void { openCodeConfig(config); }
@@ -122,7 +182,6 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
     const state = this.#sessions.get(session);
     if (!state || state.closed) throw new Error("Cannot resume an unknown or closed OpenCode session");
     if (state.active) throw new Error("Cannot resume an active OpenCode turn");
-    if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = undefined; }
     return this.#startTurn(state, prompt);
   }
 
@@ -136,35 +195,61 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
 
   async #launch(cwd: string, config: OpenCodeConfig, tools: readonly RuntimeTool[], createSession = true): Promise<ServerState> {
     const port = await availablePort();
+    const configDirectory = await mkdtemp(join(tmpdir(), "ensemble-opencode-"));
     const password = randomBytes(32).toString("base64url");
     const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
     const arguments_ = [...this.serverArguments, "--hostname", "127.0.0.1", "--port", String(port)];
-    const process = this.launcher.launch(this.executable, arguments_, {
-      cwd,
-      environment: { ...this.environment, OPENCODE_SERVER_PASSWORD: password },
-    });
+    let process: OpenCodeServerProcess;
+    try {
+      const dataHome = this.environment.XDG_DATA_HOME
+        ?? (this.environment.HOME ? join(this.environment.HOME, ".local", "share") : undefined);
+      process = this.launcher.launch(this.executable, arguments_, {
+        cwd,
+        environment: {
+          ...this.environment,
+          ...controlledEnvironment,
+          HOME: configDirectory,
+          XDG_CONFIG_HOME: configDirectory,
+          ...(dataHome ? { XDG_DATA_HOME: dataHome } : {}),
+          OPENCODE_SERVER_PASSWORD: password,
+        },
+      });
+    } catch (error) {
+      await removeConfigDirectory(configDirectory);
+      throw error;
+    }
     void process.exit.catch(() => undefined);
+    const startupExit = process.exit.then<never>(
+      () => { throw new Error("OpenCode server exited during startup"); },
+      () => { throw new Error("OpenCode server failed during startup"); },
+    );
+    void startupExit.catch(() => undefined);
     const baseUrl = `http://127.0.0.1:${port}`;
     let bridge: Awaited<ReturnType<typeof startOpenCodeToolBridge>> | undefined;
     try {
+      const confirmedBaseUrl = await raceStartup(listenerWithin(process.ready, this.requestTimeoutMs), startupExit);
+      if (confirmedBaseUrl !== baseUrl) throw new Error("OpenCode confirmed an unexpected listener endpoint");
       await waitForHealth(baseUrl, authorization, this.requestTimeoutMs, process.exit);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      ensureRunning(process);
       if (tools.length) bridge = await startOpenCodeToolBridge(tools);
       if (bridge) {
-        const statuses = await requestJson(baseUrl, "/mcp", this.requestTimeoutMs, {
+        const statuses = await raceStartup(requestJson(baseUrl, "/mcp", this.requestTimeoutMs, {
           method: "POST",
           body: { name: bridge.name, config: { type: "remote", url: bridge.url, enabled: true, oauth: false, timeout: this.requestTimeoutMs } },
           authorization,
-        });
+        }), startupExit);
         const bridgeStatus = isRecord(statuses) ? statuses[bridge.name] : undefined;
         if (!isRecord(bridgeStatus) || bridgeStatus.status !== "connected") {
           throw new Error("OpenCode did not connect the Ensemble tool bridge");
         }
       }
       const created = createSession
-        ? await requestJson(baseUrl, "/session", this.requestTimeoutMs, { method: "POST", body: {}, authorization })
+        ? await raceStartup(requestJson(baseUrl, "/session", this.requestTimeoutMs, { method: "POST", body: {}, authorization }), startupExit)
         : undefined;
+      ensureRunning(process);
       const sessionId = createSession ? requiredString(isRecord(created) ? created.id : undefined, "OpenCode session ID") : "diagnostic";
-      const state: ServerState = { process, baseUrl, cwd, sessionId, config, authorization, eventsAbort: new AbortController(),
+      const state: ServerState = { process, baseUrl, cwd, sessionId, config, authorization, configDirectory, eventsAbort: new AbortController(),
         ...(bridge ? { bridge } : {}), closed: false };
       if (createSession) await this.#connectEvents(state);
       void process.exit.then(
@@ -174,7 +259,8 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
       return state;
     } catch (error) {
       await bridge?.close().catch(() => undefined);
-      await stopProcess(process);
+      await stopProcess(process, this.processStopTimeoutMs);
+      await removeConfigDirectory(configDirectory);
       throw error;
     }
   }
@@ -208,17 +294,17 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
       if (!info) throw new Error("OpenCode returned an invalid assistant response");
       if (info.error !== undefined) throw new Error(`OpenCode request failed; verify authentication with 'opencode auth login': ${errorName(info.error)}`);
       if (info.structured === undefined) throw new Error("OpenCode returned no structured output");
-      active.result.resolve(info.structured);
       await Promise.race([active.idle.promise, new Promise<void>((resolve) => setTimeout(resolve, 100))]);
-      active.messages.close();
       state.bridge?.deactivate();
       if (state.active === active) state.active = undefined;
-      this.#scheduleIdleClose(state);
+      await this.#close(state, false);
+      active.result.resolve(info.structured);
+      active.messages.close();
     } catch (error) {
       active.result.reject(error);
       active.messages.fail(error);
       state.active = undefined;
-      await this.#close(state, false);
+      await this.#close(state, false).catch(() => undefined);
     }
   }
 
@@ -253,10 +339,6 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
     if (!matchesSession(properties, state.sessionId)) return;
     if (value.type === "session.idle") {
       state.active.idle.resolve();
-      state.active.messages.close();
-      state.bridge?.deactivate();
-      state.active = undefined;
-      this.#scheduleIdleClose(state);
       return;
     }
     if (value.type === "session.status" && isRecord(properties.status) && properties.status.type === "retry") {
@@ -339,7 +421,7 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
     state.active?.messages.fail(error);
     state.active?.result.reject(error);
     state.active = undefined;
-    void this.#close(state, false);
+    void this.#close(state, false).catch(() => undefined);
   }
 
   async #close(state: ServerState, cancelled: boolean): Promise<void> {
@@ -350,7 +432,6 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
   }
 
   async #finishClose(state: ServerState, cancelled: boolean): Promise<void> {
-    if (state.idleTimer) clearTimeout(state.idleTimer);
     state.bridge?.deactivate();
     const abortRequest = cancelled
       ? requestJson(state.baseUrl, `/session/${encodeURIComponent(state.sessionId)}/abort`, Math.min(this.requestTimeoutMs, 250), {
@@ -364,13 +445,8 @@ export class OpenCodeServerTransport implements OpenCodeTransport {
     state.active = undefined;
     await abortRequest;
     await state.bridge?.close().catch(() => undefined);
-    await stopProcess(state.process);
-  }
-
-  #scheduleIdleClose(state: ServerState): void {
-    if (state.closed || state.active || state.idleTimer) return;
-    state.idleTimer = setTimeout(() => { state.idleTimer = undefined; void this.#close(state, false); }, 60_000);
-    state.idleTimer.unref?.();
+    await stopProcess(state.process, this.processStopTimeoutMs);
+    await removeConfigDirectory(state.configDirectory);
   }
 }
 
@@ -400,9 +476,31 @@ async function requestJson(baseUrl: string, path: string, timeoutMs: number | un
 }
 
 async function boundedResponse(response: Response): Promise<string> {
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) throw new Error("OpenCode response exceeds maximum size");
-  return text;
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
+    await response.body?.cancel();
+    throw new Error("OpenCode response exceeds maximum size");
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new Error("OpenCode response exceeds maximum size");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function waitForHealth(baseUrl: string, authorization: string, timeoutMs: number, exit: Promise<unknown>): Promise<void> {
@@ -420,15 +518,48 @@ async function waitForHealth(baseUrl: string, authorization: string, timeoutMs: 
   throw new Error("OpenCode server health check timed out", { cause: lastError });
 }
 
-async function stopProcess(process: OpenCodeServerProcess): Promise<void> {
+async function stopProcess(process: OpenCodeServerProcess, timeoutMs: number): Promise<void> {
+  if (!process.isRunning()) return;
   process.kill("SIGTERM");
-  const stopped = await Promise.race([
-    process.exit.then(() => true, () => true),
-    new Promise<false>((resolve) => setTimeout(() => resolve(false), 1_000)),
-  ]);
-  if (stopped) return;
+  if (await waitUntilStopped(process, timeoutMs)) return;
   process.kill("SIGKILL");
-  await Promise.race([process.exit.catch(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+  if (!await waitUntilStopped(process, timeoutMs)) {
+    throw new ProcessTerminationUnconfirmedError("OpenCode process group");
+  }
+}
+
+async function removeConfigDirectory(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true }).catch(() => undefined);
+}
+
+async function waitUntilStopped(process: OpenCodeServerProcess, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (process.isRunning() && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  return !process.isRunning();
+}
+
+async function listenerWithin(ready: Promise<string>, timeoutMs: number): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      ready,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("OpenCode listener ownership confirmation timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function raceStartup<T>(work: Promise<T>, exit: Promise<never>): Promise<T> {
+  return Promise.race([work, exit]);
+}
+
+function ensureRunning(process: OpenCodeServerProcess): void {
+  if (!process.isRunning()) throw new Error("OpenCode server exited during startup");
 }
 
 function questionSummary(properties: Record<string, unknown>): string {

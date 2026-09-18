@@ -340,15 +340,19 @@ export class VikunjaProvider implements ProviderAdapter {
           required: Object.freeze(["body", "idempotencyKey"]),
           additionalProperties: false,
         }),
-        invoke: async (input) => this.#invokeTool("task_comment_add", async () => {
+        invoke: async (input, context) => this.#invokeTool("task_comment_add", async () => {
           const values = toolCommentInput(input);
           return this.#serializeToolMutation(`${id}:${executionId}:${values.idempotencyKey}`, async () => {
-            await this.#assertActiveToolExecution(id, executionId, ownerId);
+            context?.signal.throwIfAborted();
+            await this.#assertActiveToolExecution(id, executionId, ownerId, context?.signal);
             const marker = agentToolMarker(executionId, values.idempotencyKey);
-            const existing = await this.#reconcileAgentComments(id, marker, values.body);
+            const existing = await this.#reconcileAgentComments(id, marker, values.body, context?.signal);
             if (existing) return boundedComment(existing);
-            await this.#createRawComment(id, `${marker}\n${values.body}`);
-            return boundedComment((await this.#reconcileAgentComments(id, marker, values.body))!);
+            context?.signal.throwIfAborted();
+            await this.#assertActiveToolExecution(id, executionId, ownerId, context?.signal);
+            context?.signal.throwIfAborted();
+            await this.#createRawComment(id, `${marker}\n${values.body}`, context?.signal);
+            return boundedComment((await this.#reconcileAgentComments(id, marker, values.body, context?.signal))!);
           });
         }),
       },
@@ -504,29 +508,29 @@ export class VikunjaProvider implements ProviderAdapter {
     await this.updateStatus(id, completion.status);
   }
 
-  async #comments(id: TaskId): Promise<readonly VikunjaComment[]> {
-    const comments = await this.client.request<unknown>("GET", `tasks/${taskNumber(id)}/comments?order_by=asc`);
+  async #comments(id: TaskId, signal?: AbortSignal): Promise<readonly VikunjaComment[]> {
+    const comments = await this.client.request<unknown>("GET", `tasks/${taskNumber(id)}/comments?order_by=asc`, undefined, { signal });
     if (!Array.isArray(comments)) throw new Error(`Vikunja comments for task ${id} are not an array`);
     return comments.map(validateComment);
   }
 
-  async #createRawComment(id: TaskId, body: string): Promise<VikunjaComment> {
-    return validateComment(await this.client.request<unknown>("PUT", `tasks/${taskNumber(id)}/comments`, { comment: body }));
+  async #createRawComment(id: TaskId, body: string, signal?: AbortSignal): Promise<VikunjaComment> {
+    return validateComment(await this.client.request<unknown>("PUT", `tasks/${taskNumber(id)}/comments`, { comment: body }, { signal }));
   }
 
   async #appendEvent(id: TaskId, event: ProviderEvent): Promise<void> {
     await this.#createRawComment(id, `${STATE_PREFIX}${JSON.stringify(event)}${STATE_SUFFIX}`);
   }
 
-  async #assertActiveToolExecution(id: TaskId, executionId: string, ownerId: string): Promise<void> {
-    const state = stateFromEvents(parseEvents(await this.#comments(id)));
+  async #assertActiveToolExecution(id: TaskId, executionId: string, ownerId: string, signal?: AbortSignal): Promise<void> {
+    const state = stateFromEvents(parseEvents(await this.#comments(id, signal)));
     if (state.active?.id !== executionId || state.active.ownerId !== ownerId) {
       throw new Error("Vikunja tool execution is no longer active");
     }
   }
 
-  async #reconcileAgentComments(id: TaskId, marker: string, body: string): Promise<TaskComment | undefined> {
-    const matches = (await this.#comments(id)).filter((comment) =>
+  async #reconcileAgentComments(id: TaskId, marker: string, body: string, signal?: AbortSignal): Promise<TaskComment | undefined> {
+    const matches = (await this.#comments(id, signal)).filter((comment) =>
       requiredString(comment.comment, "comment").startsWith(`${marker}\n`))
       .sort((left, right) => requiredNumber(left.id, "comment id") - requiredNumber(right.id, "comment id"));
     const winner = matches[0];

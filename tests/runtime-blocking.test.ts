@@ -157,24 +157,27 @@ async function start(root: string, runtime: Runtime, events?: (event: RuntimeEve
 
 test("portable tools are immutable, bounded, result-validated, and prompt serialization omits capabilities", async () => {
   const invoked: unknown[] = [];
+  const invocationSignals: Array<AbortSignal | undefined> = [];
   const secret = "provider-token-sentinel";
   const returned = { title: "safe" };
   const tool: RuntimeTool = {
     name: "task_read",
     description: "Read the current task",
     inputSchema: { type: "object", properties: { includeComments: { type: "boolean" } }, additionalProperties: false },
-    invoke: async (input) => { invoked.push(input); void secret; return returned; },
+    invoke: async (input, context) => { invoked.push(input); invocationSignals.push(context?.signal); void secret; return returned; },
   };
   const [validated] = validateRuntimeTools([tool]);
   assert.ok(validated);
   assert.equal(Object.isFrozen(validated), true);
   assert.equal(Object.isFrozen(validated.inputSchema), true);
-  const toolResult = await validated.invoke({ includeComments: true });
+  const invocation = new AbortController();
+  const toolResult = await validated.invoke({ includeComments: true }, { signal: invocation.signal });
   assert.deepEqual(toolResult, { title: "safe" });
   assert.equal(Object.isFrozen(toolResult), true);
   returned.title = "changed-after-validation";
   assert.deepEqual(toolResult, { title: "safe" });
   assert.deepEqual(invoked, [{ includeComments: true }]);
+  assert.deepEqual(invocationSignals, [invocation.signal]);
   await assert.rejects(validated.invoke({ includeComments: "yes" }), /does not match its schema/u);
   assert.equal(invoked.length, 1);
 
