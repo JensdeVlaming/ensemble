@@ -40,7 +40,9 @@ PAT's identity must also have project permissions to read the saved query and
 work items and to edit every managed work item's state, history, comments, and
 custom state field.
 
-Store the PAT in the protected Ensemble env file:
+Create the protected Ensemble env file from
+[`examples/azure-devops.env.example`](../../examples/azure-devops.env.example).
+Only the PAT is required when webhooks are disabled:
 
 ```text
 AZURE_DEVOPS_PAT=replace-with-a-real-pat

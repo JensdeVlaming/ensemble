@@ -103,7 +103,8 @@ repositories:
 
 The package includes a Vikunja example at `examples/host-config.yaml`, an Azure
 DevOps Services example at `examples/host-config.azure-devops.yaml`, and the
-non-secret `examples/ensemble.env.example` template. Follow the dedicated
+matching non-secret `examples/azure-devops.env.example` template. Follow the
+dedicated
 [Vikunja guide](docs/providers/VIKUNJA.md),
 [Azure DevOps guide](docs/providers/AZURE_DEVOPS.md), and
 [Codex App Server guide](docs/runtimes/CODEX_APP_SERVER.md) for exact adapter fields.
